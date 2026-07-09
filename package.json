@@ -1,0 +1,29 @@
+{
+  "name": "@morojs/engine-monorepo",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Build tree for @morojs/engine - MoroJS's native HTTP engine",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "build:all": "node tools/build.mjs --all",
+    "test": "npm run test:unit && npm run test:smoke && npm run test:conformance && npm run test:conformance-edge && npm run test:hardening && npm run test:regression && npm run test:ws-conformance && npm run test:limits && npm run test:tls && npm run test:tls-hardening && npm run test:ws-deflate",
+    "test:unit": "sh test/run-unit.sh",
+    "test:smoke": "node test/smoke.mjs",
+    "test:conformance": "node --test test/conformance.test.mjs",
+    "test:conformance-edge": "node --test test/conformance-edge.test.mjs",
+    "test:hardening": "node --test test/conformance-hardening.test.mjs",
+    "test:regression": "node --test test/conformance-regression.test.mjs",
+    "test:ws-conformance": "node --test test/ws-conformance.test.mjs",
+    "test:limits": "node --test test/limits-conformance.test.mjs",
+    "test:tls": "node --test test/tls-conformance.test.mjs",
+    "test:tls-hardening": "node --test test/tls-hardening.test.mjs",
+    "test:ws-deflate": "node --test test/ws-deflate-conformance.test.mjs",
+    "test:fuzz": "sh test/fuzz/run.sh",
+    "clean": "rm -rf build"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

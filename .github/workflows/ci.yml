@@ -1,0 +1,49 @@
+name: ci
+
+# Fast per-PR correctness gate: standalone C++ unit tests + the real engine
+# driven through the node:test conformance suites on the supported Node ABIs.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Keep the gate snappy: drop superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Pure-C++ parser + WebSocket unit tests. No Node/addon build needed:
+  # test/run-unit.sh compiles test/http-parser-unit.cpp and
+  # test/websocket-unit.cpp directly with clang++.
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: C++ unit tests
+        run: sh test/run-unit.sh
+
+  # Build the addon for the running Node's ABI, then run the conformance
+  # suites against the real built engine. Linux builds use g++ (build.mjs
+  # default), which ships on ubuntu-latest.
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Build engine for this Node ABI
+        run: node tools/build.mjs
+      # The engine's TLS links the OpenSSL exported by the host node binary;
+      # assert those exports exist on this leg before running the TLS suites.
+      - name: Assert node exports OpenSSL symbols
+        run: nm -D "$(command -v node)" | grep -q SSL_CTX_new
+      - name: Smoke + HTTP + WebSocket + limits + TLS + pmd conformance
+        run: npm run test:smoke && npm run test:conformance && npm run test:conformance-edge && npm run test:hardening && npm run test:regression && npm run test:ws-conformance && npm run test:limits && npm run test:tls && npm run test:tls-hardening && npm run test:ws-deflate

@@ -1,0 +1,30 @@
+{
+  "name": "@morojs/engine-linux-x64-musl",
+  "version": "1.0.0",
+  "description": "Prebuilt @morojs/engine native binaries for linux/x64 (musl, all supported Node ABIs).",
+  "license": "MIT",
+  "author": "CM Ventures Inc.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Moro-JS/engine.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "musl"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "*.node"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

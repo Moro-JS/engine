@@ -1,0 +1,27 @@
+{
+  "name": "@morojs/engine-darwin-arm64",
+  "version": "1.0.0",
+  "description": "Prebuilt @morojs/engine native binaries for darwin/arm64 (all supported Node ABIs).",
+  "license": "MIT",
+  "author": "CM Ventures Inc.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Moro-JS/engine.git"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "*.node"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

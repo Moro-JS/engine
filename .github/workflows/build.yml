@@ -1,0 +1,149 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Darwin: one arm64 host cross-targets both arches (build.mjs -target flag)
+  darwin:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node tools/build.mjs --all --arch arm64
+      - run: node tools/build.mjs --all --arch x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-darwin
+          path: build/*.node
+
+  linux-gnu:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04 # glibc 2.35 floor - do not raise casually
+            arch: x64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node tools/build.mjs --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-linux-${{ matrix.arch }}-gnu
+          path: build/*.node
+
+  linux-musl:
+    runs-on: ubuntu-22.04
+    container: node:24-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - run: apk add --no-cache build-base
+      - run: node tools/build.mjs --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-linux-x64-musl
+          path: build/*.node
+
+  # Windows (MSVC): build.mjs downloads the per-version node.lib
+  # (SHASUMS-verified) and compiles with cl.exe (/DELAYLOAD:node.exe + the
+  # delay-load hook so the addon binds to any host exe name).
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node tools/build.mjs --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-windows-x64
+          path: build/*.node
+
+  # Every published binary flavor must run on a real instance of its target:
+  # macos-14 = darwin-arm64, macos-13 = darwin-x64 (Intel), ubuntu = linux-gnu,
+  # alpine container = linux-musl. Binary filenames carry platform/arch/libc/abi,
+  # so merge-multiple cannot clobber across flavors.
+  smoke:
+    needs: [darwin, linux-gnu, linux-musl]
+    strategy:
+      matrix:
+        os: [macos-14, macos-13, ubuntu-22.04]
+        node: [20, 22, 24, 25, 26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: build/
+      - run: node test/smoke.mjs
+
+  smoke-musl:
+    needs: [linux-musl]
+    strategy:
+      matrix:
+        node: [20, 22, 24, 25, 26]
+    runs-on: ubuntu-22.04
+    container: node:${{ matrix.node }}-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-linux-*-musl
+          merge-multiple: true
+          path: build/
+      - run: node test/smoke.mjs
+
+  smoke-windows:
+    needs: [windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24, 25, 26]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries-windows-x64
+          path: build/
+      - run: node test/smoke.mjs
+
+  # Full conformance on Windows for the running ABI (loopback-timing-sensitive
+  # suites run here too; expand cautiously if flaky).
+  conformance-windows:
+    needs: [windows]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries-windows-x64
+          path: build/
+      - run: npm run test:conformance && npm run test:ws-conformance && npm run test:limits && npm run test:tls
+
+# Release flow lives in release.yml: on a version tag it rebuilds every
+# platform, assembles packages/engine-<platform>-*, and publishes with npm
+# provenance. Binaries ship ONLY from tagged CI runs - never from a developer
+# machine.

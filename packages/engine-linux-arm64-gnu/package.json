@@ -1,0 +1,30 @@
+{
+  "name": "@morojs/engine-linux-arm64-gnu",
+  "version": "1.0.0",
+  "description": "Prebuilt @morojs/engine native binaries for linux/arm64 (glibc, all supported Node ABIs).",
+  "license": "MIT",
+  "author": "CM Ventures Inc.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Moro-JS/engine.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "*.node"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

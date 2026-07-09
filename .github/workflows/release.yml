@@ -1,0 +1,120 @@
+name: release
+
+# Publish @morojs/engine on a version tag. Binaries ship ONLY from a tagged CI
+# run with npm provenance — never from a developer machine (CONTRIBUTING.md).
+#
+# Flow: rebuild every platform (same matrix as build.yml) -> collect the .node
+# artifacts -> assemble the per-platform packages + sync all versions
+# (tools/prepare-release.mjs) -> publish each platform package, then the meta
+# package LAST so its optionalDependencies already resolve.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write # npm provenance
+
+jobs:
+  darwin:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node tools/build.mjs --all --arch arm64
+      - run: node tools/build.mjs --all --arch x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-darwin
+          path: build/*.node
+
+  linux-gnu:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node tools/build.mjs --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-linux-${{ matrix.arch }}-gnu
+          path: build/*.node
+
+  linux-musl:
+    runs-on: ubuntu-22.04
+    container: node:24-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - run: apk add --no-cache build-base
+      - run: node tools/build.mjs --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-linux-x64-musl
+          path: build/*.node
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node tools/build.mjs --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-windows-x64
+          path: build/*.node
+
+  publish:
+    needs: [darwin, linux-gnu, linux-musl, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: build/
+
+      # Derive the release version from the tag (v1.2.3 -> 1.2.3) and assemble.
+      # --check fails the release if any published platform got zero binaries.
+      - name: Assemble packages
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Releasing version $VERSION"
+          node tools/prepare-release.mjs "$VERSION" --check
+
+      # Publish every per-platform package first, then the meta package LAST so
+      # its exact-pinned optionalDependencies already resolve on the registry.
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in packages/engine-*/; do
+            if ls "$dir"/*.node >/dev/null 2>&1; then
+              echo "publishing $dir"
+              npm publish "$dir" --provenance --access public
+            else
+              echo "skipping $dir (no binaries)"
+            fi
+          done
+
+      - name: Publish meta package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish packages/engine --provenance --access public

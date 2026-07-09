@@ -1,0 +1,68 @@
+name: fuzz
+
+# Sustained nightly fuzz campaign over the HTTP/1.1 and WebSocket parsers.
+# Runs the libFuzzer harnesses for a meaningful duration with a corpus that
+# accumulates coverage run-to-run. A finding fails the run (M5 hardening).
+on:
+  schedule:
+    - cron: '0 6 * * *' # 06:00 UTC nightly
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # One job per harness so nightlies parallelize; new fuzzers (h2) join
+        # this list as their phases land.
+        fuzzer: [http, ws, tls, pmd]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Stock Ubuntu clang ships the libFuzzer runtime (Apple clang does not),
+      # so ubuntu-latest is the right home for this job.
+      - name: Install clang (+ OpenSSL headers for the tls harness)
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev
+
+      # Persist the corpus so coverage accumulates. libFuzzer writes new
+      # coverage-expanding inputs back into test/fuzz/corpus/<fuzzer>. A unique
+      # key per run + a shared prefix restore-key means each run restores the
+      # newest corpus; the save step (below) writes back the grown one. Keys
+      # are per-fuzzer so parallel matrix legs never clobber each other.
+      - name: Restore fuzz corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: test/fuzz/corpus/${{ matrix.fuzzer }}
+          key: fuzz-corpus-${{ matrix.fuzzer }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.fuzzer }}-
+
+      # run.sh builds with -fsanitize=fuzzer,address,undefined
+      # -fno-sanitize-recover=all and runs the fuzzer for $FUZZ_SECONDS. A
+      # crash/leak/timeout is a non-zero exit -> the job fails.
+      - name: Fuzz ${{ matrix.fuzzer }}
+        run: FUZZ_SECONDS=300 sh test/fuzz/run.sh ${{ matrix.fuzzer }}
+
+      # Save the (possibly grown) corpus even when a finding fails the run, so
+      # the coverage-expanding inputs discovered this run are not lost.
+      - name: Save fuzz corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: test/fuzz/corpus/${{ matrix.fuzzer }}
+          key: fuzz-corpus-${{ matrix.fuzzer }}-${{ github.run_id }}
+
+      # libFuzzer drops crash-*/leak-*/timeout-*/oom-* in the working directory
+      # (repo root) on a finding. Capture them for triage; ignore when clean.
+      - name: Upload fuzz findings
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore

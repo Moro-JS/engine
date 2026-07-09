@@ -1,0 +1,3 @@
+GET /search?q=hello+world&page=2 HTTP/1.1
+Host: x
+

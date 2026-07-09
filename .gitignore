@@ -1,0 +1,15 @@
+build/
+node_modules/
+*.node
+.DS_Store
+# Fuzzer-generated files — keep only hand-written seeds
+test/fuzz/corpus/**
+!test/fuzz/corpus/**/
+!test/fuzz/corpus/**/*.raw
+!test/fuzz/corpus/**/*.frame
+crash-*
+leak-*
+timeout-*
+slow-unit-*
+# Per-machine perf baselines (recorded locally via bench/run.sh --record)
+bench/baselines.json

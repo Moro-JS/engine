@@ -1,0 +1,55 @@
+{
+  "name": "@morojs/engine",
+  "version": "1.0.0",
+  "description": "MoroJS native HTTP engine - Moro-authored C++ core with per-platform prebuilt binaries and automatic Node.js fallback in MoroJS",
+  "license": "MIT",
+  "author": "CM Ventures Inc.",
+  "homepage": "https://github.com/Moro-JS/engine#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Moro-JS/engine.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Moro-JS/engine/issues"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "index.mjs",
+    "index.d.ts",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "optionalDependencies": {
+    "@morojs/engine-darwin-arm64": "1.0.0",
+    "@morojs/engine-darwin-x64": "1.0.0",
+    "@morojs/engine-linux-x64-gnu": "1.0.0",
+    "@morojs/engine-linux-arm64-gnu": "1.0.0",
+    "@morojs/engine-linux-x64-musl": "1.0.0",
+    "@morojs/engine-win32-x64": "1.0.0"
+  },
+  "keywords": [
+    "morojs",
+    "http",
+    "server",
+    "native",
+    "performance"
+  ]
+}
