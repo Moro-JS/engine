@@ -89,9 +89,14 @@ class TlsContext {
       passphrase_ = std::move(other.passphrase_);
       alpnH2_ = other.alpnH2_;
       other.ctx_ = nullptr;
-      // The passwd callback userdata points at OUR passphrase_ string; re-aim
-      // it after the move so a later cert reload (none today) can't dangle.
-      if (ctx_) SSL_CTX_set_default_passwd_cb_userdata(ctx_, &passphrase_);
+      // Both SSL_CTX callbacks captured the moved-from object: the passwd cb's
+      // userdata is our passphrase_ string, and the ALPN select cb's is `this`.
+      // Re-aim both at the moved-to object, or a later handshake dereferences
+      // the old (often stack-allocated) TlsContext — a use-after-return.
+      if (ctx_) {
+        SSL_CTX_set_default_passwd_cb_userdata(ctx_, &passphrase_);
+        SSL_CTX_set_alpn_select_cb(ctx_, alpnSelectCb, this);
+      }
     }
     return *this;
   }

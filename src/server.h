@@ -281,14 +281,20 @@ class Server {
       liveHandles_++;  // the sweep timer is now a live uv handle
     }
 
-    // Resolve the actual bound port (supports port 0)
+    // Resolve the actual bound port (supports port 0). Read the big-endian port
+    // bytes directly instead of ntohs(), which would drag ws2_32.lib (Winsock)
+    // into the Windows link for a trivial byte swap.
+    auto bePort = [](uint16_t netOrder) -> uint16_t {
+      const uint8_t* b = reinterpret_cast<const uint8_t*>(&netOrder);
+      return static_cast<uint16_t>((static_cast<uint16_t>(b[0]) << 8) | b[1]);
+    };
     struct sockaddr_storage bound;
     int len = sizeof(bound);
     if (uv_tcp_getsockname(&tcp_, reinterpret_cast<sockaddr*>(&bound), &len) == 0) {
       if (bound.ss_family == AF_INET)
-        return ntohs(reinterpret_cast<sockaddr_in*>(&bound)->sin_port);
+        return bePort(reinterpret_cast<sockaddr_in*>(&bound)->sin_port);
       if (bound.ss_family == AF_INET6)
-        return ntohs(reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port);
+        return bePort(reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port);
     }
     return port;
   }
