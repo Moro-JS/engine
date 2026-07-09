@@ -23,6 +23,13 @@
 namespace moro {
 namespace engine {
 
+// Win32 <winnt.h> (pulled in transitively by the Node headers under MSVC)
+// #defines DELETE as an access-right constant, which would textually mangle the
+// Method::DELETE enumerator below. The engine never uses the Win32 macro.
+#ifdef DELETE
+#undef DELETE
+#endif
+
 // Method table shared with the JS binding (index -> name). Keep in sync with
 // docs/API.md METHODS and the adapter's METHODS array.
 enum class Method : uint8_t {

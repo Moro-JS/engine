@@ -95,14 +95,15 @@ static bool extractBytes(Isolate* iso, Local<Context> ctx, Local<Value> v,
   }
   if (v->IsArrayBuffer()) {
     Local<ArrayBuffer> ab = v.As<ArrayBuffer>();
-    auto bs = ab->GetBackingStore();
-    out.assign(static_cast<const char*>(bs->Data()), bs->ByteLength());
+    // ab->Data() rather than GetBackingStore()->Data(): the latter materializes
+    // a std::shared_ptr<BackingStore> whose control block was created inside the
+    // Node binary, and UBSan's cross-DSO vptr check trips on its destruction.
+    out.assign(static_cast<const char*>(ab->Data()), ab->ByteLength());
     return true;
   }
   if (v->IsTypedArray() || v->IsDataView()) {
     Local<v8::ArrayBufferView> view = v.As<v8::ArrayBufferView>();
-    auto bs = view->Buffer()->GetBackingStore();
-    const char* base = static_cast<const char*>(bs->Data()) + view->ByteOffset();
+    const char* base = static_cast<const char*>(view->Buffer()->Data()) + view->ByteOffset();
     out.assign(base, view->ByteLength());
     return true;
   }
@@ -278,7 +279,7 @@ static void cbOnWsMessage(void* user, Connection* c, const char* data,
   Local<Value> payload;
   if (isBinary) {
     Local<ArrayBuffer> ab = ArrayBuffer::New(iso, len);
-    if (len) memcpy(ab->GetBackingStore()->Data(), data, len);
+    if (len) memcpy(ab->Data(), data, len);
     payload = ab;
   } else {
     payload = String::NewFromUtf8(iso, data, v8::NewStringType::kNormal,
@@ -605,7 +606,7 @@ static void GetBody(const FunctionCallbackInfo<Value>& args) {
     return;
   }
   Local<ArrayBuffer> ab = ArrayBuffer::New(iso, c->body.size());
-  memcpy(ab->GetBackingStore()->Data(), c->body.data(), c->body.size());
+  memcpy(ab->Data(), c->body.data(), c->body.size());
   args.GetReturnValue().Set(ab);
 }
 

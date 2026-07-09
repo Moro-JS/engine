@@ -191,7 +191,15 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null }) {
   let cmd;
   let args;
   if (platform === 'darwin') {
-    cmd = 'clang++';
+    // Honor CXX (as the linux path does). Node 25/26's V8 headers use braced-
+    // init template arguments (P2308) that need clang 18+, newer than the Apple
+    // clang on GitHub's macOS runners — CI points CXX at Homebrew LLVM. Local
+    // dev defaults to Apple clang.
+    cmd = process.env.CXX || 'clang++';
+    // Point the compiler at the macOS SDK. Homebrew clang otherwise uses its own
+    // libc++, which clashes with the system C library (unresolved ldiv_t etc.);
+    // Apple clang already uses the SDK, so this is a harmless explicit there.
+    const sdk = execFileSync('xcrun', ['--show-sdk-path'], { encoding: 'utf8' }).trim();
     args = [
       ...common,
       '-fPIC',
@@ -199,6 +207,8 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null }) {
       'dynamic_lookup',
       '-target',
       `${arch === 'arm64' ? 'arm64' : 'x86_64'}-apple-macos12`,
+      '-isysroot',
+      sdk,
     ];
   } else if (platform === 'linux') {
     cmd = process.env.CXX || 'g++';

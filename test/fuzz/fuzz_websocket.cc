@@ -23,8 +23,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   limits.maxMessageSize = 1 * 1024 * 1024;
   WsParser parser(limits);
 
-  auto onMessage = [](std::string_view payload, bool isBinary) {
-    volatile size_t s = payload.size() + (isBinary ? 1 : 0);
+  auto onMessage = [](std::string_view payload, bool isBinary, bool isCompressed) {
+    volatile size_t s = payload.size() + (isBinary ? 1 : 0) + (isCompressed ? 2 : 0);
     (void)s;
   };
   auto onControl = [](WsOpcode op, std::string_view payload) {

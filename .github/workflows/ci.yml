@@ -146,9 +146,15 @@ jobs:
 
   # Darwin: one arm64 host cross-targets both arches (build.mjs --arch flag).
   darwin:
-    runs-on: macos-14
+    # Node 25/26's V8 headers use braced-init template args (P2308) that need
+    # clang 18+; the runner's Apple clang is older, so build with Homebrew LLVM.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
+        run: |
+          brew list llvm >/dev/null 2>&1 || brew install llvm
+          echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v4
         with:
           node-version: 24
