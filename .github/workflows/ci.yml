@@ -1,7 +1,14 @@
 name: ci
 
-# Fast per-PR correctness gate: standalone C++ unit tests + the real engine
-# driven through the node:test conformance suites on the supported Node ABIs.
+# One per-commit gate. Everything that decides "is this commit good" lives here:
+# C++ unit tests, the addon driven through the conformance/hardening suites, the
+# full cross-platform build + smoke matrix, ASan/UBSan, and a fuzz-harness smoke.
+# Branch protection should require ONLY the `ci-success` job at the bottom — it
+# goes green iff every job here passed.
+#
+# Deliberately NOT here: the sustained fuzz campaign (fuzz.yml, nightly — slow,
+# corpus-accumulating discovery, not a pass/fail gate) and publishing to npm
+# (release.yml, on a version tag).
 on:
   push:
     branches: [main]
@@ -13,6 +20,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── Fast correctness ────────────────────────────────────────────────────────
+
   # Pure-C++ parser + WebSocket unit tests. No Node/addon build needed:
   # test/run-unit.sh compiles test/http-parser-unit.cpp and
   # test/websocket-unit.cpp directly with clang++.
@@ -47,3 +56,255 @@ jobs:
         run: nm -D "$(command -v node)" | grep -q SSL_CTX_new
       - name: Smoke + HTTP + WebSocket + limits + TLS + pmd conformance
         run: npm run test:smoke && npm run test:conformance && npm run test:conformance-edge && npm run test:hardening && npm run test:regression && npm run test:ws-conformance && npm run test:limits && npm run test:tls && npm run test:tls-hardening && npm run test:ws-deflate
+
+  # ── Sanitizers ──────────────────────────────────────────────────────────────
+
+  # ASan + UBSan over the standalone C++ unit tests. A sanitizer finding is a
+  # release blocker (CONTRIBUTING.md).
+  asan-ubsan:
+    runs-on: ubuntu-latest
+    env:
+      # Belt-and-suspenders with -fno-sanitize-recover=all: abort with a trace
+      # on the first sanitizer error.
+      ASAN_OPTIONS: abort_on_error=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+      # test/run-unit.sh hardcodes -O2 with no CXXFLAGS/sanitizer hook, so
+      # compile the two pure-C++ unit tests directly with the sanitizers.
+      # -fno-sanitize-recover=all makes any finding a non-zero exit.
+      - name: HTTP parser unit tests (ASan/UBSan)
+        run: |
+          clang++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            test/http-parser-unit.cpp -o /tmp/moro_hp_asan
+          /tmp/moro_hp_asan
+      - name: WebSocket unit tests (ASan/UBSan)
+        run: |
+          clang++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            test/websocket-unit.cpp -o /tmp/moro_ws_asan
+          /tmp/moro_ws_asan
+      - name: permessage-deflate unit tests (ASan/UBSan)
+        run: |
+          sudo apt-get update && sudo apt-get install -y zlib1g-dev
+          clang++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            test/ws-deflate-unit.cpp -lz -o /tmp/moro_pmd_asan
+          /tmp/moro_pmd_asan
+
+  # The unit tests above cover the pure parsers; this job covers what they
+  # can't: server.h's connection/timeout/framing state machine and binding.cpp,
+  # which own buffers across async lifetimes (the use-after-free territory).
+  # The addon is built with ASan/UBSan and the full conformance + hardening +
+  # WS suites run against it under a preloaded sanitizer runtime.
+  asan-addon:
+    runs-on: ubuntu-latest
+    env:
+      # detect_leaks=0: Node itself reports benign leaks at exit that would
+      # drown real findings; ASan's memory-error detection is unaffected.
+      ASAN_OPTIONS: abort_on_error=1:halt_on_error=1:detect_leaks=0
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build addon with ASan/UBSan
+        run: node tools/build.mjs --sanitize
+      - name: Conformance suites against the sanitized addon
+        run: |
+          export LD_PRELOAD="$(g++ -print-file-name=libasan.so) $(g++ -print-file-name=libubsan.so)"
+          node --test test/conformance.test.mjs
+          node --test test/conformance-edge.test.mjs
+          node --test test/conformance-hardening.test.mjs
+          node --test test/ws-conformance.test.mjs
+          node --test test/limits-conformance.test.mjs
+          node --test test/tls-conformance.test.mjs
+          node --test test/tls-hardening.test.mjs
+          node --test test/ws-deflate-conformance.test.mjs
+
+  # ── Fuzz-harness smoke (the sustained campaign is nightly in fuzz.yml) ───────
+
+  # Prove the libFuzzer harnesses still BUILD and survive a short run on their
+  # seed corpus — catches a parser signature change breaking a harness or an
+  # instantly-reproducing crash. This is a smoke, NOT the deep campaign
+  # (fuzz.yml). No corpus cache: a smoke needs no accumulated coverage.
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fuzzer: [http, ws, tls, pmd]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang (+ OpenSSL/zlib headers for the tls/pmd harnesses)
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev zlib1g-dev
+      - name: Fuzz-smoke ${{ matrix.fuzzer }} (20s)
+        run: FUZZ_SECONDS=20 sh test/fuzz/run.sh ${{ matrix.fuzzer }}
+
+  # ── Cross-platform build + smoke (every published binary flavor) ────────────
+
+  # Darwin: one arm64 host cross-targets both arches (build.mjs --arch flag).
+  darwin:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node tools/build.mjs --all --arch arm64
+      - run: node tools/build.mjs --all --arch x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-darwin
+          path: build/*.node
+
+  linux-gnu:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04 # glibc 2.35 floor - do not raise casually
+            arch: x64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node tools/build.mjs --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-linux-${{ matrix.arch }}-gnu
+          path: build/*.node
+
+  linux-musl:
+    runs-on: ubuntu-22.04
+    container: node:24-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - run: apk add --no-cache build-base
+      - run: node tools/build.mjs --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-linux-x64-musl
+          path: build/*.node
+
+  # Windows (MSVC): build.mjs downloads the per-version node.lib
+  # (SHASUMS-verified) and compiles with cl.exe (/DELAYLOAD:node.exe + the
+  # delay-load hook so the addon binds to any host exe name).
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node tools/build.mjs --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-windows-x64
+          path: build/*.node
+
+  # Every published binary flavor must run on a real instance of its target:
+  # macos-14 = darwin-arm64, macos-13 = darwin-x64 (Intel), ubuntu = linux-gnu,
+  # alpine container = linux-musl. Binary filenames carry platform/arch/libc/abi,
+  # so merge-multiple cannot clobber across flavors.
+  smoke:
+    needs: [darwin, linux-gnu, linux-musl]
+    strategy:
+      matrix:
+        os: [macos-14, macos-13, ubuntu-22.04]
+        node: [20, 22, 24, 25, 26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: build/
+      - run: node test/smoke.mjs
+
+  smoke-musl:
+    needs: [linux-musl]
+    strategy:
+      matrix:
+        node: [20, 22, 24, 25, 26]
+    runs-on: ubuntu-22.04
+    container: node:${{ matrix.node }}-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-linux-*-musl
+          merge-multiple: true
+          path: build/
+      - run: node test/smoke.mjs
+
+  smoke-windows:
+    needs: [windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24, 25, 26]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries-windows-x64
+          path: build/
+      - run: node test/smoke.mjs
+
+  # Full conformance on Windows for the running ABI (loopback-timing-sensitive
+  # suites run here too; expand cautiously if flaky).
+  conformance-windows:
+    needs: [windows]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries-windows-x64
+          path: build/
+      - run: npm run test:conformance && npm run test:ws-conformance && npm run test:limits && npm run test:tls
+
+  # ── Single required gate ────────────────────────────────────────────────────
+
+  # The one check branch protection should require. Goes green iff every job
+  # above passed; a failure or cancellation (including a build whose dependent
+  # smoke leg was therefore skipped) turns it red.
+  ci-success:
+    if: always()
+    needs:
+      - unit
+      - integration
+      - asan-ubsan
+      - asan-addon
+      - fuzz-smoke
+      - darwin
+      - linux-gnu
+      - linux-musl
+      - windows
+      - smoke
+      - smoke-musl
+      - smoke-windows
+      - conformance-windows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all jobs passed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: echo "One or more CI jobs did not pass." && exit 1
+      - run: echo "All CI jobs passed ✅"
