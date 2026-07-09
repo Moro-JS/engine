@@ -107,20 +107,40 @@ jobs:
 
       # Publish every per-platform package first, then the meta package LAST so
       # its exact-pinned optionalDependencies already resolve on the registry.
+      #
+      # NOTE the leading `./` on every publish path: `npm publish packages/foo`
+      # is parsed as a GitHub shorthand (owner/repo), NOT a local directory, and
+      # fails trying to SSH-clone it. `./packages/foo` forces the folder reading.
+      #
+      # Each publish is idempotent — it skips a version already on the registry —
+      # so if a later step fails mid-release, re-running completes it cleanly
+      # instead of erroring on "cannot publish over previously published version".
       - name: Publish platform packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for dir in packages/engine-*/; do
-            if ls "$dir"/*.node >/dev/null 2>&1; then
-              echo "publishing $dir"
-              npm publish "$dir" --provenance --access public
-            else
+            if ! ls "$dir"/*.node >/dev/null 2>&1; then
               echo "skipping $dir (no binaries)"
+              continue
+            fi
+            name=$(node -p "require('./$dir/package.json').name")
+            ver=$(node -p "require('./$dir/package.json').version")
+            if npm view "$name@$ver" version >/dev/null 2>&1; then
+              echo "skip $name@$ver (already on registry)"
+            else
+              echo "publishing $name@$ver"
+              npm publish "./$dir" --provenance --access public
             fi
           done
 
       - name: Publish meta package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish packages/engine --provenance --access public
+        run: |
+          ver=$(node -p "require('./packages/engine/package.json').version")
+          if npm view "@morojs/engine@$ver" version >/dev/null 2>&1; then
+            echo "@morojs/engine@$ver already published"
+          else
+            npm publish ./packages/engine --provenance --access public
+          fi
