@@ -214,15 +214,17 @@ jobs:
           name: binaries-windows-x64
           path: build/*.node
 
-  # Every published binary flavor must run on a real instance of its target:
-  # macos-14 = darwin-arm64, macos-13 = darwin-x64 (Intel), ubuntu = linux-gnu,
-  # alpine container = linux-musl. Binary filenames carry platform/arch/libc/abi,
-  # so merge-multiple cannot clobber across flavors.
+  # Smoke every published binary flavor on a real instance of its target:
+  # macos-14 = darwin-arm64, ubuntu = linux-gnu, alpine container = linux-musl.
+  # darwin-x64 is still BUILT (Intel Macs) but not load-smoked here: GitHub's
+  # Intel macOS runners (macos-13) are scarce and being retired, so queueing on
+  # them stalls the gate. Binary filenames carry platform/arch/libc/abi, so
+  # merge-multiple cannot clobber across flavors.
   smoke:
     needs: [darwin, linux-gnu, linux-musl]
     strategy:
       matrix:
-        os: [macos-14, macos-13, ubuntu-22.04]
+        os: [macos-14, ubuntu-22.04]
         node: [20, 22, 24, 25, 26]
     runs-on: ${{ matrix.os }}
     steps:
