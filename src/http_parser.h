@@ -59,39 +59,25 @@ struct HttpLimits {
   size_t maxHeadSize = 64 * 1024;  // request line + all headers
   size_t maxHeaders = 100;
   size_t maxBodySize = 10 * 1024 * 1024;
-  // Close a connection after this many ms with no bytes received while not
-  // actively running a handler (slowloris defense + keep-alive reuse cap).
-  // 0 disables the idle timeout.
+  // Close a connection after this many ms with no bytes received while not actively running a handler (slowloris defense + keep-alive reuse cap). 0 disables the idle timeout.
   size_t idleTimeoutMs = 120000;
-  // Budget for receiving one complete request (head + body), measured from its
-  // first byte. Unlike idleTimeoutMs this does NOT reset on activity, so a
-  // slow-drip client trickling one byte per idle window is still bounded
-  // (slowloris defense; the equivalent of Node's server.requestTimeout, and
-  // the same 300s default). Expiry answers 408 and closes. 0 disables.
+  // Budget for receiving one complete request (head + body), measured from its first byte. Unlike idleTimeoutMs this does NOT reset on activity, so a slow-drip client trickling one byte per idle window is still bounded (slowloris defense; the equivalent of Node's server.requestTimeout, and the same 300s default). Expiry answers 408 and closes. 0 disables.
   size_t requestTimeoutMs = 300000;
-  // Max simultaneous connections; new accepts beyond this are dropped
-  // immediately (backpressure against connection floods). 0 = unlimited.
+  // Max simultaneous connections; new accepts beyond this are dropped immediately (backpressure against connection floods). 0 = unlimited.
   size_t maxConnections = 0;
-  // Cap on bytes buffered for a single connection while its response is in
-  // flight (pipelined-request flood defense). 0 = use maxHeadSize + maxBodySize.
+  // Cap on bytes buffered for a single connection while its response is in flight (pipelined-request flood defense). 0 = use maxHeadSize + maxBodySize.
   size_t maxPendingBytes = 0;
-  // Bind with SO_REUSEPORT so several engine instances (worker threads or
-  // processes) can listen on one port and the kernel load-balances accepts.
-  // POSIX only; a no-op on Windows, which has no equivalent semantics.
+  // Bind with SO_REUSEPORT so several engine instances (worker threads or processes) can listen on one port and the kernel load-balances accepts. POSIX only; a no-op on Windows, which has no equivalent semantics.
   bool reusePort = false;
   // WebSocket: cap on a complete (reassembled) message payload.
   size_t wsMaxMessageSize = 16 * 1024 * 1024;
-  // WebSocket send backpressure: if a slow consumer lets the write queue grow
-  // past this, the connection is shed with 1013 rather than buffering without
-  // bound (a send-backpressure defense). 0 = unlimited.
+  // WebSocket send backpressure: if a slow consumer lets the write queue grow past this, the connection is shed with 1013 rather than buffering without bound (a send-backpressure defense). 0 = unlimited.
   size_t wsBackpressureLimit = 1024 * 1024;
-  // Write-queue level above which write()/wsSend() report "not writable" and
-  // onWritable is armed (HTTP streaming and WS sends share it).
+  // Write-queue level above which write()/wsSend() report "not writable" and onWritable is armed (HTTP streaming and WS sends share it).
   size_t writeHighWaterMark = 256 * 1024;
   // TCP listen backlog handed to uv_listen.
   int backlog = 512;
-  // WebSocket permessage-deflate (RFC 7692), opt-in. Off by default preserves
-  // the "compression declined" posture; enabling it is an app decision.
+  // WebSocket permessage-deflate (RFC 7692), opt-in. Off by default preserves the "compression declined" posture; enabling it is an app decision.
   PmdOptions wsDeflate{};
 };
 
@@ -112,33 +98,25 @@ class HttpParser {
   std::string body;
   bool keepAlive = true;
 
-  // When ParseStatus::Error is returned, the status to send back before
-  // closing the connection (400, 413, 431, 501, 505).
+  // When ParseStatus::Error is returned, the status to send back before closing the connection (400, 413, 431, 501, 505).
   int errorStatus = 400;
 
-  // Feed newly received bytes. Consumes from an internal accumulation buffer;
-  // callers append to inbound() or pass data here. Returns the parse status;
-  // on Complete, bytesConsumed() tells how many bytes of the input formed this
-  // request (the remainder is a pipelined follow-up request).
+  // Feed newly received bytes. Consumes from an internal accumulation buffer; callers append to inbound() or pass data here. Returns the parse status; on Complete, bytesConsumed() tells how many bytes of the input formed this request (the remainder is a pipelined follow-up request).
   ParseStatus parse(const char* data, size_t len);
 
   size_t bytesConsumed() const { return consumed_; }
 
-  // True once the request line + headers are fully parsed (body may still be
-  // pending). Used to answer Expect: 100-continue before the body arrives.
+  // True once the request line + headers are fully parsed (body may still be pending). Used to answer Expect: 100-continue before the body arrives.
   bool headParsed() const {
     return state_ != State::RequestLine && state_ != State::Headers;
   }
 
-  // True while a request is partially received (some bytes buffered or the
-  // head parsed but the body incomplete). Drives the request-timeout sweep:
-  // an idle keep-alive connection with no buffered bytes is NOT mid-request.
+  // True while a request is partially received (some bytes buffered or the head parsed but the body incomplete). Drives the request-timeout sweep: an idle keep-alive connection with no buffered bytes is NOT mid-request.
   bool midRequest() const { return headParsed() || buf_.size() > consumed_; }
 
   const char* findHeader(std::string_view lowercaseName) const;
 
-  // Reset for the next request on a keep-alive connection, preserving any
-  // already-buffered pipelined bytes.
+  // Reset for the next request on a keep-alive connection, preserving any already-buffered pipelined bytes.
   void reset();
 
   // Remaining buffered bytes not yet consumed (the start of the next request).
@@ -166,6 +144,8 @@ class HttpParser {
   size_t consumed_ = 0;
   size_t scanPos_ = 0;      // where line scanning resumes within buf_
   State state_ = State::RequestLine;
+  // headers[0..headerCount_) belong to the CURRENT request; slots past it are retained from a previous request purely as assignment targets (their string capacities are reused - see parseHeaderLine). The vector is trimmed to headerCount_ when the head completes, before any consumer reads it.
+  size_t headerCount_ = 0;
 
   // Body framing resolved after headers
   bool chunked_ = false;
@@ -250,8 +230,11 @@ inline void HttpParser::reset() {
   path.clear();
   query.clear();
   minorVersion = 1;
-  headers.clear();
+  // Do NOT clear headers: keep the vector and its strings as assignment targets for the next request (parseHeaderLine reuses their capacities).
+  headerCount_ = 0;
   body.clear();
+  // A huge body's capacity must not stay pinned to an idle keep-alive connection; small (typical) bodies keep theirs for reuse.
+  if (body.capacity() > 65536) body.shrink_to_fit();
   keepAlive = true;
   errorStatus = 400;
   chunked_ = false;
@@ -321,30 +304,38 @@ inline bool HttpParser::parseHeaderLine(std::string_view line) {
   if (colon == std::string_view::npos || colon == 0) return false;
 
   std::string_view name = line.substr(0, colon);
-  // No whitespace allowed between field name and colon (RFC 9112 §5.1 -
-  // reject to prevent request smuggling / header injection)
+  // No whitespace allowed between field name and colon (RFC 9112 §5.1 - reject to prevent request smuggling / header injection)
   for (char c : name) {
     if (!isTokenChar(static_cast<unsigned char>(c))) return false;
   }
 
   std::string_view value = trimOWS(line.substr(colon + 1));
 
-  Header h;
-  h.name.reserve(name.size());
-  for (char c : name) {
-    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    h.name.push_back(c);
+  // Reuse a slot (and its strings' heap capacities) from a previous request when one is available - header parsing is allocation-free on a warm keep-alive connection.
+  if (headerCount_ < headers.size()) {
+    Header& h = headers[headerCount_];
+    h.name.clear();
+    for (char c : name) {
+      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+      h.name.push_back(c);
+    }
+    h.value.assign(value.data(), value.size());
+  } else {
+    Header h;
+    h.name.reserve(name.size());
+    for (char c : name) {
+      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+      h.name.push_back(c);
+    }
+    h.value.assign(value);
+    headers.push_back(std::move(h));
   }
-  h.value.assign(value);
-  headers.push_back(std::move(h));
+  ++headerCount_;
   return true;
 }
 
 inline bool HttpParser::finalizeHeaders() {
-  // Connection handling (RFC 9110 §7.6.1). The field is a comma-separated list
-  // of connection options; tokenize every Connection header so "keep-alive,
-  // close" or "close, foo" are honored. A "close" token anywhere wins over
-  // "keep-alive"; otherwise a "keep-alive" token overrides the version default.
+  // Connection handling (RFC 9110 §7.6.1). The field is a comma-separated list of connection options; tokenize every Connection header so "keep-alive, close" or "close, foo" are honored. A "close" token anywhere wins over "keep-alive"; otherwise a "keep-alive" token overrides the version default.
   bool sawClose = false, sawKeepAlive = false;
   for (const auto& h : headers) {
     if (h.name != "connection") continue;
@@ -363,9 +354,7 @@ inline bool HttpParser::finalizeHeaders() {
   if (sawClose) keepAlive = false;
   else if (sawKeepAlive) keepAlive = true;
 
-  // Count Transfer-Encoding headers: RFC 9112 §6.1 requires the FINAL coding to
-  // be chunked. The engine only supports a lone "chunked", so more than one TE
-  // header (e.g. "chunked" then "cow") is a smuggling vector and is rejected.
+  // Count Transfer-Encoding headers: RFC 9112 §6.1 requires the FINAL coding to be chunked. The engine only supports a lone "chunked", so more than one TE header (e.g. "chunked" then "cow") is a smuggling vector and is rejected.
   const char* te = nullptr;
   size_t teCount = 0;
   for (const auto& h : headers) {
@@ -461,7 +450,10 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
       if (line.empty()) {  // blank line terminates the head
         headEnd_ = nextScan;
         scanPos_ = nextScan;
-        if (headers.size() > limits_.maxHeaders) {
+        // Trim stale reuse-slots from a prior, larger request BEFORE any
+        // consumer can iterate the vector.
+        headers.resize(headerCount_);
+        if (headerCount_ > limits_.maxHeaders) {
           errorStatus = 431;
           return ParseStatus::Error;
         }
@@ -469,7 +461,7 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
         state_ = chunked_ ? State::ChunkSize : State::Body;
         break;
       }
-      if (headers.size() >= limits_.maxHeaders) {
+      if (headerCount_ >= limits_.maxHeaders) {
         errorStatus = 431;
         return ParseStatus::Error;
       }

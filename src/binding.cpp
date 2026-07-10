@@ -404,11 +404,7 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
     }
   }
 
-  // options.ssl -> in-process TLS termination. Both MoroJS shapes are
-  // accepted: file paths (key_file_name/cert_file_name/ca_file_name) and
-  // inline PEM (key/cert/ca as string|Buffer|ArrayBuffer); inline wins when
-  // both are present. Config errors THROW from serve() - a misconfigured TLS
-  // server must never silently boot as plaintext.
+  // options.ssl -> in-process TLS termination. Both MoroJS shapes are accepted: file paths (key_file_name/cert_file_name/ca_file_name) and inline PEM (key/cert/ca as string|Buffer|ArrayBuffer); inline wins when both are present. Config errors THROW from serve() - a misconfigured TLS server must never silently boot as plaintext.
   SslConfig ssl;
   bool sslRequested = false;
   if (args.Length() >= 2 && args[1]->IsObject()) {
@@ -458,8 +454,7 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
     }
   }
 
-  // Validate the TLS material BEFORE constructing the Server, so a config
-  // error throws cleanly with nothing to tear down.
+  // Validate the TLS material BEFORE constructing the Server, so a config error throws cleanly with nothing to tear down.
   TlsContext tlsCtx;
   if (sslRequested) {
     if (!ssl.complete()) {
@@ -535,8 +530,7 @@ static void Listen(const FunctionCallbackInfo<Value>& args) {
 // close(serverId)
 static void Close(const FunctionCallbackInfo<Value>& args) {
   JsServer* js = serverFrom(args);
-  // close() is idempotent and, once every uv handle is reaped, deletes the
-  // Server and invokes freeJsServer(js) to release this server's JS state.
+  // close() is idempotent and, once every uv handle is reaped, deletes the Server and invokes freeJsServer(js) to release this server's JS state.
   if (js && js->server) js->server->close(freeJsServer, js);
 }
 
@@ -586,8 +580,7 @@ static void GetHeader(const FunctionCallbackInfo<Value>& args) {
   if (!c || args.Length() < 2) return;
   String::Utf8Value name(iso, args[1]);
   if (*name == nullptr) return;
-  const char* v = c->parser.findHeader(std::string_view(*name, name.length()));
-  // Note: parser was reset for keep-alive; use the snapshot instead.
+  // The snapshot (c->headers) is the source of truth; the parser has already moved its fields out and may have been reset for the next request.
   for (const auto& h : c->headers) {
     if (h.name.size() == static_cast<size_t>(name.length()) &&
         iequals(h.name, std::string_view(*name, name.length()))) {
@@ -595,7 +588,6 @@ static void GetHeader(const FunctionCallbackInfo<Value>& args) {
       return;
     }
   }
-  (void)v;
 }
 
 static void GetBody(const FunctionCallbackInfo<Value>& args) {
@@ -747,10 +739,7 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
 #else
   set("arch", str(iso, "x64"));
 #endif
-  // Feature flags for consumers (MoroJS) to gate option passing on, instead
-  // of version-sniffing. Flip as each capability ships: tls (M3/E2), http2
-  // (E4), wsDeflate (E5). "limits" = the full serve() limit surface
-  // (maxHeadSize/maxHeaders/ws*/writeHighWaterMark/backlog) is parsed.
+  // Feature flags for consumers (MoroJS) to gate option passing on, instead of version-sniffing. Flip as each capability ships: tls (M3/E2), http2 (E4), wsDeflate (E5). "limits" = the full serve() limit surface (maxHeadSize/maxHeaders/ws*/writeHighWaterMark/backlog) is parsed.
   Local<Object> caps = Object::New(iso);
   auto setCap = [&](const char* k, bool v) {
     caps->Set(ctx, str(iso, k), v8::Boolean::New(iso, v)).Check();

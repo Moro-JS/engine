@@ -21,6 +21,9 @@
     "test:tls-hardening": "node --test test/tls-hardening.test.mjs",
     "test:ws-deflate": "node --test test/ws-deflate-conformance.test.mjs",
     "test:fuzz": "sh test/fuzz/run.sh",
+    "release:patch": "node tools/release.mjs patch",
+    "release:minor": "node tools/release.mjs minor",
+    "release:major": "node tools/release.mjs major",
     "clean": "rm -rf build"
   },
   "engines": {

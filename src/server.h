@@ -1,14 +1,8 @@
 // TCP + HTTP/1.1 connection engine for @morojs/engine.
 //
-// Owns the libuv listener and per-connection state machine: accept, read,
-// drive the HttpParser, and write responses. One request is in flight per
-// connection at a time (RFC 9112 §9.3 - responses are returned in request
-// order), so pipelining is handled structurally: the next buffered request
-// is not surfaced until the current response ends.
+// Owns the libuv listener and per-connection state machine: accept, read, drive the HttpParser, and write responses. One request is in flight per connection at a time (RFC 9112 §9.3 - responses are returned in request order), so pipelining is handled structurally: the next buffered request is not surfaced until the current response ends.
 //
-// No V8 here - the binding layer (binding.cpp) supplies callbacks and reads
-// request data / issues responses by reqId. Original-code policy applies
-// (CONTRIBUTING.md).
+// No V8 here - the binding layer (binding.cpp) supplies callbacks and reads request data / issues responses by reqId. Original-code policy applies (CONTRIBUTING.md).
 
 #pragma once
 
@@ -88,9 +82,7 @@ inline const char* reasonPhrase(int status) {
 class Server;
 struct Connection;
 
-// Globally-unique request id counter + registry, so the V8 binding can map a
-// reqId (its only handle) back to a Connection regardless of which Server owns
-// it.
+// Globally-unique request id counter + registry, so the V8 binding can map a reqId (its only handle) back to a Connection regardless of which Server owns it.
 inline uint32_t& globalReqCounter() {
   static uint32_t counter = 0;
   return counter;
@@ -100,8 +92,7 @@ inline std::unordered_map<uint32_t, Connection*>& globalRequests() {
   return map;
 }
 
-// WebSocket connections get their own id space + registry (a wsId outlives the
-// reqId that created it).
+// WebSocket connections get their own id space + registry (a wsId outlives the reqId that created it).
 inline uint32_t& globalWsCounter() {
   static uint32_t counter = 0;
   return counter;
@@ -119,8 +110,7 @@ struct Connection {
   std::string readBuf;         // reused alloc target
   std::string pending;         // bytes received while a response is in flight
 
-  // Snapshot of the request currently surfaced to JS (valid for the reqId's
-  // lifetime; the parser is reset for the next request).
+  // Snapshot of the request currently surfaced to JS (valid for the reqId's lifetime; the parser is reset for the next request).
   uint32_t reqId = 0;
   Method method = Method::OTHER;
   std::string methodStr;
@@ -136,9 +126,7 @@ struct Connection {
   bool responseEnded = false;
   bool chunkedResponse = false;
   bool bodylessStatus = false;   // 1xx/204/304: body bytes are suppressed
-  // Fixed-length streaming bookkeeping (writeHead with a Content-Length):
-  // ending short of the declared length forces Connection: close so the client
-  // sees truncation instead of consuming the next response's bytes as body.
+  // Fixed-length streaming bookkeeping (writeHead with a Content-Length): ending short of the declared length forces Connection: close so the client sees truncation instead of consuming the next response's bytes as body.
   long long declaredLen = -1;    // -1: chunked/no declared Content-Length
   unsigned long long bodyBytesSent = 0;
   bool sentContinue = false;
@@ -148,25 +136,31 @@ struct Connection {
   int pendingWrites = 0;       // outstanding uv_write_t
   bool closeAfterFlush = false;
 
+  // Pipelined-response corking (see dispatchBatch): while `corked`, response bytes accumulate in corkBuf and are flushed with a single write once the buffered input drains - one syscall per pipelined batch instead of one per response. batchClose records a Connection: close response inside the batch (the flush-then-close is handled by the batch loop's tail).
+  std::string corkBuf;
+  bool corked = false;
+  bool batchClose = false;
+
+  // Reusable response-build buffer: respond()/writeHead()/write()/end() build
+  // frames here instead of a fresh local string, so a warm connection writes
+  // responses with zero allocations (see writeOutView). Oversized capacity is
+  // released after use so one huge response can't stay pinned per connection.
+  std::string scratch;
+
   // WebSocket state (after a successful Upgrade)
   bool isWebSocket = false;
   uint32_t wsId = 0;
   WsParser* wsParser = nullptr;
   bool wsClosing = false;
-  // permessage-deflate context (RFC 7692); null unless negotiated for this
-  // connection at upgrade time.
+  // permessage-deflate context (RFC 7692); null unless negotiated for this connection at upgrade time.
   PmdContext* pmd = nullptr;
 
-  // TLS transform when the server terminates TLS; null on plaintext servers
-  // (the hot path pays exactly one null check).
+  // TLS transform when the server terminates TLS; null on plaintext servers (the hot path pays exactly one null check).
   TlsSession* tls = nullptr;
 
-  // Idle-sweep bookkeeping: reset to 0 on every read, incremented each sweep
-  // while not actively running a handler; closed when it exceeds the limit.
+  // Idle-sweep bookkeeping: reset to 0 on every read, incremented each sweep while not actively running a handler; closed when it exceeds the limit.
   uint32_t idleTicks = 0;
-  // Request-timeout bookkeeping: incremented each sweep while a request is
-  // partially received; NOT reset by activity (slow-drip defense), only when
-  // the request completes or the connection goes back to idle keep-alive.
+  // Request-timeout bookkeeping: incremented each sweep while a request is partially received; NOT reset by activity (slow-drip defense), only when the request completes or the connection goes back to idle keep-alive.
   uint32_t requestTicks = 0;
 
   ~Connection() {
@@ -183,8 +177,7 @@ struct WriteReq {
   bool terminal;   // this write completes the response
 };
 
-// Callbacks into the binding layer. reqId is opaque; the binding maps it back
-// to JS handlers.
+// Callbacks into the binding layer. reqId is opaque; the binding maps it back to JS handlers.
 struct ServerCallbacks {
   void* user = nullptr;
   void (*onRequest)(void* user, Connection* c) = nullptr;
@@ -208,26 +201,20 @@ class Server {
                                           : limits_.maxHeadSize + limits_.maxBodySize;
   }
 
-  // Turn on TLS termination with an already-validated context (the binding
-  // builds and validates it BEFORE constructing the Server, so a config error
-  // throws from serve() instead of leaving a half-built server behind).
+  // Turn on TLS termination with an already-validated context (the binding builds and validates it BEFORE constructing the Server, so a config error throws from serve() instead of leaving a half-built server behind).
   void adoptTls(TlsContext&& tctx) {
     tlsCtx_ = std::move(tctx);
     tlsEnabled_ = tlsCtx_.valid();
   }
   bool tlsEnabled() const { return tlsEnabled_; }
 
-  // Returns the bound port, or 0 on failure. On failure, *uvErr (when non-null)
-  // receives the libuv error code (e.g. UV_EADDRINUSE) so the caller can throw a
-  // precise, code-bearing Error.
+  // Returns the bound port, or 0 on failure. On failure, *uvErr (when non-null) receives the libuv error code (e.g. UV_EADDRINUSE) so the caller can throw a precise, code-bearing Error.
   int listen(const char* host, int port, int* uvErr = nullptr) {
     auto fail = [&](int code) {
       if (uvErr) *uvErr = code;
       return 0;
     };
-    // uv_ip4_addr/uv_ip6_addr parse numeric addresses only, not hostnames.
-    // Map the common names callers pass (Node's default host is 'localhost')
-    // to their loopback address; an empty host binds all interfaces.
+    // uv_ip4_addr/uv_ip6_addr parse numeric addresses only, not hostnames. Map the common names callers pass (Node's default host is 'localhost') to their loopback address; an empty host binds all interfaces.
     std::string h = host ? host : "";
     if (h.empty() || h == "0.0.0.0" || h == "*") {
       h = "0.0.0.0";
@@ -244,8 +231,7 @@ class Server {
     }
 #if !defined(_WIN32)
     if (limits_.reusePort) {
-      // uv_tcp_bind creates its socket lazily, so to set SO_REUSEPORT before
-      // bind we create + configure one explicitly and hand it to libuv.
+      // uv_tcp_bind creates its socket lazily, so to set SO_REUSEPORT before bind we create + configure one explicitly and hand it to libuv.
       int fd = ::socket(addr.ss_family, SOCK_STREAM, 0);
       if (fd >= 0) {
         int on = 1;
@@ -259,11 +245,7 @@ class Server {
     r = uv_listen(reinterpret_cast<uv_stream_t*>(&tcp_), limits_.backlog, onConnection);
     if (r != 0) return fail(r);
 
-    // Start the idle-connection sweep. Granularity adapts to the configured
-    // timeout (capped at 4s, floored at 250ms) so short timeouts still fire
-    // promptly while the common 120s default sweeps cheaply. Unref'd so the
-    // timer alone never keeps the process alive - the listener (and any active
-    // connection) does that.
+    // Start the idle-connection sweep. Granularity adapts to the configured timeout (capped at 4s, floored at 250ms) so short timeouts still fire promptly while the common 120s default sweeps cheaply. Unref'd so the timer alone never keeps the process alive - the listener (and any active connection) does that.
     if ((limits_.idleTimeoutMs > 0 || limits_.requestTimeoutMs > 0) &&
         !sweepActive_) {
       // Granularity follows the shortest enabled timeout.
@@ -281,9 +263,7 @@ class Server {
       liveHandles_++;  // the sweep timer is now a live uv handle
     }
 
-    // Resolve the actual bound port (supports port 0). Read the big-endian port
-    // bytes directly instead of ntohs(), which would drag ws2_32.lib (Winsock)
-    // into the Windows link for a trivial byte swap.
+    // Resolve the actual bound port (supports port 0). Read the big-endian port bytes directly instead of ntohs(), which would drag ws2_32.lib (Winsock) into the Windows link for a trivial byte swap.
     auto bePort = [](uint16_t netOrder) -> uint16_t {
       const uint8_t* b = reinterpret_cast<const uint8_t*>(&netOrder);
       return static_cast<uint16_t>((static_cast<uint16_t>(b[0]) << 8) | b[1]);
@@ -299,13 +279,7 @@ class Server {
     return port;
   }
 
-  // Shut down: stop accepting, close the sweep timer and every live
-  // connection, and - once all uv handles are actually reaped (async) -
-  // delete this Server and invoke onClosed(user) so the binding can free its
-  // per-server JS state. Idempotent.
-  // Stop accepting new connections while existing ones keep being served -
-  // the first half of a graceful shutdown (drain in-flight work, then
-  // close()). Idempotent; close() remains the full teardown.
+  // Shut down: stop accepting, close the sweep timer and every live connection, and - once all uv handles are actually reaped (async) - delete this Server and invoke onClosed(user) so the binding can free its per-server JS state. Idempotent. Stop accepting new connections while existing ones keep being served - the first half of a graceful shutdown (drain in-flight work, then close()). Idempotent; close() remains the full teardown.
   void stopListening() {
     if (closeRequested_ || listenerClosed_) return;
     listening_ = false;
@@ -357,15 +331,12 @@ class Server {
 
   // ---- response API (called by the binding, by reqId->Connection) ----
 
-  // Responses that MUST NOT carry a body or Content-Length (RFC 9110 §6.4.1,
-  // §15.3.5): 1xx informational, 204 No Content, 304 Not Modified.
+  // Responses that MUST NOT carry a body or Content-Length (RFC 9110 §6.4.1, §15.3.5): 1xx informational, 204 No Content, 304 Not Modified.
   static bool isBodyless(int status) {
     return status == 204 || status == 304 || (status >= 100 && status < 200);
   }
 
-  // Single-shot terminal response (the fast path). customCL is an
-  // app-supplied Content-Length value, or -1 when none was given; the header
-  // block itself never contains Content-Length (the binding strips it).
+  // Single-shot terminal response (the fast path). customCL is an app-supplied Content-Length value, or -1 when none was given; the header block itself never contains Content-Length (the binding strips it).
   void respond(Connection* c, int status, const std::string& headersBlock,
                long long customCL, const char* body, size_t bodyLen) {
     if (!c || c->responseEnded || c->closing) return;
@@ -373,18 +344,15 @@ class Server {
     const bool bodyless = isBodyless(status);
     if (bodyless) bodyLen = 0;  // never emit a body for these statuses
 
-    std::string out;
+    std::string& out = c->scratch;
+    out.clear();
     out.reserve(bodyLen + headersBlock.size() + 128);
     appendStatusLine(out, status);
     out += "Date: ";
     out += httpDate();
     out += "\r\n";
     out += headersBlock;
-    // Framing belongs to the engine: a body-carrying response always declares
-    // the ACTUAL body size (an app-supplied mismatch would desync every
-    // follow-up response on a keep-alive connection). HEAD and bodyless
-    // statuses legitimately declare the would-be entity length (RFC 9110
-    // §8.6), so the app-supplied value is honored there.
+    // Framing belongs to the engine: a body-carrying response always declares the ACTUAL body size (an app-supplied mismatch would desync every follow-up response on a keep-alive connection). HEAD and bodyless statuses legitimately declare the would-be entity length (RFC 9110 §8.6), so the app-supplied value is honored there.
     if (!bodyless) {
       const unsigned long long cl =
           (c->isHead && customCL >= 0)
@@ -404,7 +372,17 @@ class Server {
 
     c->responseStarted = true;
     c->responseEnded = true;
-    writeOut(c, std::move(out), /*terminal=*/true);
+    writeOutView(c, out, /*terminal=*/true);
+    releaseScratch(c);
+  }
+
+  // One huge response must not pin its capacity to an idle connection; small
+  // (typical) responses keep theirs so the next build is allocation-free.
+  static void releaseScratch(Connection* c) {
+    if (c->scratch.capacity() > 65536) {
+      c->scratch.clear();
+      c->scratch.shrink_to_fit();
+    }
   }
 
   void writeHead(Connection* c, int status, const std::string& headersBlock,
@@ -414,8 +392,7 @@ class Server {
     c->bodylessStatus = isBodyless(status);
     c->bodyBytesSent = 0;
     if (c->bodylessStatus) {
-      // No body framing at all; an app-supplied Content-Length (the would-be
-      // entity length, e.g. on a 304) is honored verbatim.
+      // No body framing at all; an app-supplied Content-Length (the would-be entity length, e.g. on a 304) is honored verbatim.
       c->chunkedResponse = false;
       c->declaredLen = 0;
     } else {
@@ -423,7 +400,8 @@ class Server {
       c->declaredLen = customCL;
     }
 
-    std::string out;
+    std::string& out = c->scratch;
+    out.clear();
     appendStatusLine(out, status);
     out += "Date: ";
     out += httpDate();
@@ -444,20 +422,20 @@ class Server {
     }
     out += connectionHeader(c);
     out += "\r\n";
-    writeOut(c, std::move(out), /*terminal=*/false);
+    writeOutView(c, out, /*terminal=*/false);
+    releaseScratch(c);
   }
 
   // Streaming chunk. Returns false on backpressure (wait for onWritable).
   bool write(Connection* c, const char* data, size_t len) {
     if (!c || c->responseEnded || c->closing) return false;
-    // write() without writeHead(): synthesize an implicit 200 chunked head
-    // (Node behavior). Raw body bytes with no status line would corrupt this
-    // response and desync every follow-up response on a keep-alive socket.
+    // write() without writeHead(): synthesize an implicit 200 chunked head (Node behavior). Raw body bytes with no status line would corrupt this response and desync every follow-up response on a keep-alive socket.
     if (!c->responseStarted) writeHead(c, 200, std::string(), -1);
     // HEAD / 1xx / 204 / 304: suppress body bytes
     if (c->isHead || c->bodylessStatus || len == 0) return true;
 
-    std::string out;
+    std::string& out = c->scratch;
+    out.clear();
     if (c->chunkedResponse) {
       char sizeLine[24];
       int n = snprintf(sizeLine, sizeof(sizeLine), "%zx\r\n", len);
@@ -465,8 +443,7 @@ class Server {
       out.append(data, len);
       out += "\r\n";
     } else {
-      // Fixed-length response: never let body bytes overflow the declared
-      // Content-Length - excess would be parsed as the next response.
+      // Fixed-length response: never let body bytes overflow the declared Content-Length - excess would be parsed as the next response.
       if (c->declaredLen >= 0) {
         const unsigned long long declared =
             static_cast<unsigned long long>(c->declaredLen);
@@ -477,7 +454,8 @@ class Server {
       c->bodyBytesSent += len;
       out.append(data, len);
     }
-    writeOut(c, std::move(out), /*terminal=*/false);
+    writeOutView(c, out, /*terminal=*/false);
+    releaseScratch(c);
     bool ok = uv_stream_get_write_queue_size(reinterpret_cast<uv_stream_t*>(
                   &c->handle)) < limits_.writeHighWaterMark;
     if (!ok) c->wantDrain = true;
@@ -487,7 +465,8 @@ class Server {
   void end(Connection* c, const char* data, size_t len) {
     if (!c || c->responseEnded || c->closing) return;
 
-    std::string out;
+    std::string& out = c->scratch;
+    out.clear();
     if (!c->responseStarted) {
       // end() without writeHead(): a 200 with the given body as the full payload
       appendStatusLine(out, 200);
@@ -508,9 +487,7 @@ class Server {
         out.append(data, len);
         out += "\r\n";
       }
-      // RFC 9110 §9.3.2: a HEAD response carries NO body — not even the chunked
-      // terminator. Emitting "0\r\n\r\n" here would be parsed by the client as
-      // the start of the next pipelined response, desyncing keep-alive.
+      // RFC 9110 §9.3.2: a HEAD response carries NO body — not even the chunked terminator. Emitting "0\r\n\r\n" here would be parsed by the client as the start of the next pipelined response, desyncing keep-alive.
       if (!c->isHead) out += "0\r\n\r\n";  // last chunk (RFC 9112 §7.1)
     } else {
       if (!c->isHead && !c->bodylessStatus && len) {
@@ -526,10 +503,7 @@ class Server {
         c->bodyBytesSent += len;
         if (len) out.append(data, len);
       }
-      // Ending short of the declared Content-Length: the bytes owed can never
-      // arrive, so force the connection closed - the client then sees a
-      // truncated response (an error) instead of silently consuming the NEXT
-      // response's bytes as the remainder of this body.
+      // Ending short of the declared Content-Length: the bytes owed can never arrive, so force the connection closed - the client then sees a truncated response (an error) instead of silently consuming the NEXT response's bytes as the remainder of this body.
       if (!c->isHead && c->declaredLen >= 0 &&
           c->bodyBytesSent < static_cast<unsigned long long>(c->declaredLen)) {
         c->reqKeepAlive = false;
@@ -537,7 +511,8 @@ class Server {
     }
     c->responseStarted = true;
     c->responseEnded = true;
-    writeOut(c, std::move(out), /*terminal=*/true);
+    writeOutView(c, out, /*terminal=*/true);
+    releaseScratch(c);
   }
 
   static Connection* lookupWs(uint32_t wsId) {
@@ -546,12 +521,10 @@ class Server {
     return it == map.end() ? nullptr : it->second;
   }
 
-  // Upgrade the request's connection to a WebSocket (RFC 6455 §4.2.2). Returns
-  // the new wsId, or 0 if the request is not a valid upgrade.
+  // Upgrade the request's connection to a WebSocket (RFC 6455 §4.2.2). Returns the new wsId, or 0 if the request is not a valid upgrade.
   uint32_t upgradeToWebSocket(Connection* c) {
     if (!c || c->responseStarted || c->closing) return 0;
-    // Validate the upgrade (RFC 6455 §4.2.1): Upgrade: websocket,
-    // Connection: Upgrade, a Sec-WebSocket-Key, Version 13.
+    // Validate the upgrade (RFC 6455 §4.2.1): Upgrade: websocket, Connection: Upgrade, a Sec-WebSocket-Key, Version 13.
     const std::string* key = nullptr;
     const std::string* extensions = nullptr;
     bool hasUpgrade = false, hasConnUpgrade = false, ver13 = false;
@@ -602,9 +575,7 @@ class Server {
     c->reqKeepAlive = true;  // the socket stays open as a WS
     c->wsParser = new WsParser(
         WsParser::Limits{limits_.wsMaxMessageSize, /*pmdNegotiated=*/c->pmd != nullptr});
-    // Skip any id still bound to a live connection: the uint32 counter wraps
-    // after 2^32 upgrades/requests, and a collision with a long-lived stream
-    // would silently rebind it to this connection.
+    // Skip any id still bound to a live connection: the uint32 counter wraps after 2^32 upgrades/requests, and a collision with a long-lived stream would silently rebind it to this connection.
     auto& wsMap = globalWebSockets();
     do {
       c->wsId = ++globalWsCounter();
@@ -617,19 +588,14 @@ class Server {
 
     const uint32_t wsId = c->wsId;
     if (cb_.onWsOpen) cb_.onWsOpen(cb_.user, c, c->path);
-    // Frames the client sent in the same TCP segment as the handshake are
-    // already buffered in the HTTP parser - hand them to the WebSocket parser
-    // (copied out first: feedWebSocket may tear the connection down on a
-    // protocol error, after which c and its parser must not be touched).
+    // Frames the client sent in the same TCP segment as the handshake are already buffered in the HTTP parser - hand them to the WebSocket parser (copied out first: feedWebSocket may tear the connection down on a protocol error, after which c and its parser must not be touched).
     std::string early(c->parser.leftover());
     c->parser = HttpParser(limits_);  // HTTP is done on this connection
     if (!early.empty()) feedWebSocket(c, early.data(), early.size());
     return wsId;
   }
 
-  // Send a WebSocket data frame (server frames are never masked, §5.1).
-  // permessage-deflate: when negotiated and the message is at least the
-  // configured threshold, compress it and set RSV1 (RFC 7692 §7.2.1).
+  // Send a WebSocket data frame (server frames are never masked, §5.1). permessage-deflate: when negotiated and the message is at least the configured threshold, compress it and set RSV1 (RFC 7692 §7.2.1).
   bool wsSend(Connection* c, const char* data, size_t len, bool isBinary) {
     if (!c || !c->isWebSocket || c->closing || c->wsClosing) return false;
     std::string out;
@@ -646,9 +612,7 @@ class Server {
     writeOut(c, std::move(out), /*terminal=*/false);
     size_t q = uv_stream_get_write_queue_size(reinterpret_cast<uv_stream_t*>(&c->handle));
     if (limits_.wsBackpressureLimit && q > limits_.wsBackpressureLimit) {
-      // Slow/stalled consumer - shed it (1013 Try Again Later) so its queued
-      // frames can't grow memory without bound (limits_.wsBackpressureLimit,
-      // 0 = unlimited; maxBackpressure defense).
+      // Slow/stalled consumer - shed it (1013 Try Again Later) so its queued frames can't grow memory without bound (limits_.wsBackpressureLimit, 0 = unlimited; maxBackpressure defense).
       wsClose(c, 1013, "", 0);
       return false;
     }
@@ -659,9 +623,7 @@ class Server {
   void wsClose(Connection* c, uint16_t code, const char* reason, size_t rlen) {
     if (!c || !c->isWebSocket || c->wsClosing) return;
     c->wsClosing = true;
-    // Notify JS exactly once. The wsClosing guard above + the check in
-    // feedWebSocket/onRead means no client-side or EOF path re-fires it, so
-    // server-initiated closes (disconnect/kick) no longer leak the JS wrapper.
+    // Notify JS exactly once. The wsClosing guard above + the check in feedWebSocket/onRead means no client-side or EOF path re-fires it, so server-initiated closes (disconnect/kick) no longer leak the JS wrapper.
     if (cb_.onWsClose) cb_.onWsClose(cb_.user, c, code);
     std::string payload;
     encodeClosePayload(payload, code, std::string_view(reason, rlen));
@@ -676,8 +638,16 @@ class Server {
 
  private:
   void appendStatusLine(std::string& out, int status) {
-    // Clamp to the three-digit range the status line grammar allows
-    // (RFC 9112 §4): anything else would corrupt the wire format.
+    // Hot statuses append a prebuilt literal (skips int formatting entirely).
+    switch (status) {
+      case 200: out += "HTTP/1.1 200 OK\r\n"; return;
+      case 201: out += "HTTP/1.1 201 Created\r\n"; return;
+      case 204: out += "HTTP/1.1 204 No Content\r\n"; return;
+      case 304: out += "HTTP/1.1 304 Not Modified\r\n"; return;
+      case 404: out += "HTTP/1.1 404 Not Found\r\n"; return;
+      default: break;
+    }
+    // Clamp to the three-digit range the status line grammar allows (RFC 9112 §4): anything else would corrupt the wire format.
     if (status < 100 || status > 999) status = 500;
     out += "HTTP/1.1 ";
     out += std::to_string(status);
@@ -686,15 +656,13 @@ class Server {
     out += "\r\n";
   }
 
-  std::string connectionHeader(Connection* c) {
+  // String literal, not std::string: the keep-alive variant is one byte past libc++'s SSO cap, so returning by value was a heap alloc per response.
+  const char* connectionHeader(Connection* c) {
     return c->reqKeepAlive ? "Connection: keep-alive\r\n"
                            : "Connection: close\r\n";
   }
 
-  // Frame-level write: response/frame bytes from the HTTP/WS machinery. On a
-  // TLS connection the plaintext is encrypted first; `terminal` rides the
-  // (single) ciphertext buffer so the flush-then-finish semantics
-  // (onWrite -> finishResponse) are identical on both transports.
+  // Frame-level write: response/frame bytes from the HTTP/WS machinery. On a TLS connection the plaintext is encrypted first; `terminal` rides the (single) ciphertext buffer so the flush-then-finish semantics (onWrite -> finishResponse) are identical on both transports.
   void writeOut(Connection* c, std::string&& data, bool terminal) {
     if (c->closing) return;
     if (data.empty() && !terminal) return;
@@ -702,8 +670,7 @@ class Server {
       std::string cipher;
       if (!data.empty() &&
           !c->tls->writePlain(data.data(), data.size(), cipher)) {
-        // Encrypting failed (session torn down / pre-handshake write): the
-        // response can never reach the peer - drop the connection.
+        // Encrypting failed (session torn down / pre-handshake write): the response can never reach the peer - drop the connection.
         doClose(c);
         return;
       }
@@ -713,27 +680,22 @@ class Server {
     transportWrite(c, std::move(data), terminal);
   }
 
-  // Transport-level write: bytes go to the socket verbatim (ciphertext on
-  // TLS connections, plaintext otherwise).
+  // Transport-level write: bytes go to the socket verbatim (ciphertext on TLS connections, plaintext otherwise).
   //
-  // Fast path (the "cork" equivalent): when nothing is already queued,
-  // hand the bytes straight to the kernel with uv_try_write - for a small
-  // response on a non-backpressured socket (the overwhelmingly common case)
-  // this skips the WriteReq heap allocation, libuv's write-request queue, AND
-  // the deferred completion callback entirely. Ordering is safe because the
-  // fast path only runs with an empty write queue (pendingWrites == 0;
-  // uv_try_write itself also refuses to interleave with queued data).
+  // Fast path (the "cork" equivalent): when nothing is already queued, hand the bytes straight to the kernel with uv_try_write - for a small response on a non-backpressured socket (the overwhelmingly common case) this skips the WriteReq heap allocation, libuv's write-request queue, AND the deferred completion callback entirely. Ordering is safe because the fast path only runs with an empty write queue (pendingWrites == 0; uv_try_write itself also refuses to interleave with queued data).
   //
-  // A TERMINAL write completed synchronously must also complete the response
-  // (finishResponse - previously always deferred to onWrite). That is only
-  // taken when no pipelined bytes are buffered (c->pending and the parser's
-  // leftover are empty), so finishResponse just resets per-request state and
-  // cannot re-enter a JS handler from inside the current respond()/end()
-  // crossing. With buffered pipelined data the write falls through to the
-  // queued path and completes on a clean stack, exactly as before.
+  // A TERMINAL write completed synchronously must also complete the response (finishResponse - previously always deferred to onWrite). That is only taken when no pipelined bytes are buffered (c->pending and the parser's leftover are empty), so finishResponse just resets per-request state and cannot re-enter a JS handler from inside the current respond()/end() crossing. With buffered pipelined data the write falls through to the queued path and completes on a clean stack, exactly as before.
   void transportWrite(Connection* c, std::string&& data, bool terminal) {
     if (c->closing) return;
     if (data.empty() && !terminal) return;
+
+    // Corked (inside dispatchBatch): accumulate instead of writing. A terminal write completes the response's bookkeeping synchronously - safe because the batch loop surfaces the NEXT request only after the current handler returns, so this never re-enters JS from inside a respond()/end() crossing. The buffer is bounded: it flushes at the write high-water mark.
+    if (c->corked) {
+      if (!data.empty()) c->corkBuf += data;
+      if (terminal) completeCorkedResponse(c);
+      if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
+      return;
+    }
 
     if (c->pendingWrites == 0) {
       const bool canFinishSync =
@@ -751,15 +713,61 @@ class Server {
           return;
         }
         if (n > 0) {
-          // Partial write: queue only the remainder (ordering preserved -
-          // nothing else was queued).
+          // Partial write: queue only the remainder (ordering preserved - nothing else was queued).
           data.erase(0, static_cast<size_t>(n));
         }
-        // n == UV_EAGAIN or an error: fall through to the queued path (a
-        // real socket error then surfaces through uv_write/onWrite as before).
+        // n == UV_EAGAIN or an error: fall through to the queued path (a real socket error then surfaces through uv_write/onWrite as before).
       }
     }
+    queueWrite(c, std::move(data), terminal);
+  }
 
+  // View-based frame write: the caller retains ownership of the bytes
+  // (typically Connection::scratch, whose capacity is reused across
+  // responses). The fast path writes straight from the view - zero copies,
+  // zero allocations; only a queued/backpressured remainder is copied.
+  void writeOutView(Connection* c, std::string_view data, bool terminal) {
+    if (c->closing) return;
+    if (data.empty() && !terminal) return;
+    if (c->tls) {
+      std::string cipher;
+      if (!data.empty() &&
+          !c->tls->writePlain(data.data(), data.size(), cipher)) {
+        doClose(c);
+        return;
+      }
+      transportWrite(c, std::move(cipher), terminal);
+      return;
+    }
+    if (c->corked) {
+      if (!data.empty()) c->corkBuf.append(data);
+      if (terminal) completeCorkedResponse(c);
+      if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
+      return;
+    }
+    if (c->pendingWrites == 0) {
+      const bool canFinishSync =
+          !terminal || (c->pending.empty() && c->parser.leftover().empty());
+      if (canFinishSync) {
+        if (data.empty()) {
+          finishResponse(c);  // terminal with no bytes owed
+          return;
+        }
+        uv_buf_t b = uv_buf_init(const_cast<char*>(data.data()),
+                                 static_cast<unsigned>(data.size()));
+        int n = uv_try_write(reinterpret_cast<uv_stream_t*>(&c->handle), &b, 1);
+        if (n == static_cast<int>(data.size())) {
+          if (terminal) finishResponse(c);
+          return;
+        }
+        if (n > 0) data.remove_prefix(static_cast<size_t>(n));
+      }
+    }
+    queueWrite(c, std::string(data), terminal);
+  }
+
+  // Queued (owned) write: WriteReq holds the bytes until uv flushes them.
+  void queueWrite(Connection* c, std::string&& data, bool terminal) {
     WriteReq* wr = new WriteReq{};
     wr->conn = c;
     wr->data = std::move(data);
@@ -803,8 +811,7 @@ class Server {
     if (c->closeAfterFlush && c->pendingWrites == 0) s->doClose(c);
   }
 
-  // Response for the active request is fully flushed: either close or move on
-  // to the next pipelined request.
+  // Response for the active request is fully flushed: either close or move on to the next pipelined request.
   void finishResponse(Connection* c) {
     if (c->closing) return;
     uint32_t oldId = c->reqId;
@@ -836,7 +843,75 @@ class Server {
     } else {
       st = c->parser.parse(nullptr, 0);
     }
-    handleParse(c, st);
+    dispatchBatch(c, st);
+  }
+
+  // Corked variant of finishResponse: same per-request bookkeeping, but no write happened yet (the bytes sit in corkBuf) and the next pipelined request is surfaced by dispatchBatch's loop, not from here. A Connection: close response just flags the batch; the loop's tail closes after the flush.
+  void completeCorkedResponse(Connection* c) {
+    globalRequests().erase(c->reqId);
+    c->active = false;
+    if (!c->reqKeepAlive) {
+      c->batchClose = true;
+      return;
+    }
+    c->responseStarted = false;
+    c->responseEnded = false;
+    c->chunkedResponse = false;
+    c->bodylessStatus = false;
+    c->declaredLen = -1;
+    c->bodyBytesSent = 0;
+    c->sentContinue = false;
+    c->wantDrain = false;
+    c->abortNotified = false;
+    c->parser.reset();
+  }
+
+  // Flush the accumulated batch with one write. Tries synchronously straight from corkBuf (a full write keeps the buffer's capacity for the next batch); only a partial/backpressured remainder is copied out and queued.
+  void flushCork(Connection* c) {
+    if (c->corkBuf.empty() || c->closing) return;
+    if (c->pendingWrites == 0) {
+      uv_buf_t b =
+          uv_buf_init(&c->corkBuf[0], static_cast<unsigned>(c->corkBuf.size()));
+      int n = uv_try_write(reinterpret_cast<uv_stream_t*>(&c->handle), &b, 1);
+      if (n == static_cast<int>(c->corkBuf.size())) {
+        c->corkBuf.clear();
+        return;
+      }
+      if (n > 0) c->corkBuf.erase(0, static_cast<size_t>(n));
+      // UV_EAGAIN / error: queue the remainder below (a real socket error surfaces through uv_write/onWrite exactly as on the uncorked path).
+    }
+    std::string out;
+    out.swap(c->corkBuf);
+    const bool was = c->corked;
+    c->corked = false;  // the queued path, not the cork branch
+    transportWrite(c, std::move(out), /*terminal=*/false);
+    c->corked = was;
+  }
+
+  // Dispatch parsed input, corking synchronous pipelined responses into one batched write (uWS-style): while complete requests are buffered and each handler responds before returning, responses accumulate in corkBuf and hit the socket as a single write when the input drains. Re-entrancy-safe by construction: request N+1 is surfaced HERE, below cb_.onRequest in the stack, only after handler N has returned - never from inside a respond()/end() crossing. Async handlers, upgrades, errors, and Connection: close all exit the loop and preserve their existing paths.
+  void dispatchBatch(Connection* c, ParseStatus st) {
+    c->corked = true;
+    c->batchClose = false;
+    for (;;) {
+      handleParse(c, st);
+      if (c->closing || c->isWebSocket || c->batchClose) break;
+      if (c->active) break;  // handler went async; respond() completes later
+      if (st != ParseStatus::Complete) break;  // NeedMore: await more bytes
+      // Response corked and completed synchronously - surface the next buffered pipelined request (completeCorkedResponse already reset the parser; reads cannot interleave while this loop runs).
+      if (!c->pending.empty()) {
+        std::string p;
+        p.swap(c->pending);
+        st = c->parser.parse(p.data(), p.size());
+      } else {
+        st = c->parser.parse(nullptr, 0);
+      }
+    }
+    c->corked = false;
+    if (!c->closing) flushCork(c);
+    if (c->batchClose && !c->closing) {
+      if (c->pendingWrites == 0) doClose(c);
+      else c->closeAfterFlush = true;
+    }
   }
 
   // ---- read path ----
@@ -854,8 +929,7 @@ class Server {
       uv_close(reinterpret_cast<uv_handle_t*>(&c->handle), onCloseFree);
       return;
     }
-    // Connection-flood defense: over the cap, accept then immediately close
-    // (libuv gives no way to refuse the accept itself).
+    // Connection-flood defense: over the cap, accept then immediately close (libuv gives no way to refuse the accept itself).
     if (s->limits_.maxConnections && s->conns_.size() >= s->limits_.maxConnections) {
       uv_close(reinterpret_cast<uv_handle_t*>(&c->handle), onCloseFree);
       return;
@@ -880,8 +954,7 @@ class Server {
     if (nread < 0) {
       // EOF or error.
       if (c->isWebSocket) {
-        // Fire onWsClose exactly once: set wsClosing before the impending
-        // doClose so its own 1006 guard can't re-fire it.
+        // Fire onWsClose exactly once: set wsClosing before the impending doClose so its own 1006 guard can't re-fire it.
         if (!c->wsClosing && s->cb_.onWsClose)
           s->cb_.onWsClose(s->cb_.user, c, 1006);  // abnormal closure (§7.1.5)
         c->wsClosing = true;
@@ -898,10 +971,7 @@ class Server {
     c->idleTicks = 0;  // activity: reset the idle sweep counter
 
     if (c->tls) {
-      // Ciphertext: pump through the TLS transform; decrypted bytes re-enter
-      // the exact plaintext path below via dispatchPlaintext. Outbound
-      // ciphertext (handshake flights, key updates, alerts) must go to the
-      // wire even when the pump reports failure.
+      // Ciphertext: pump through the TLS transform; decrypted bytes re-enter the exact plaintext path below via dispatchPlaintext. Outbound ciphertext (handshake flights, key updates, alerts) must go to the wire even when the pump reports failure.
       std::string cipherOut;
       bool ok = c->tls->onCiphertext(
           buf->base, static_cast<size_t>(nread),
@@ -912,8 +982,7 @@ class Server {
       if (!c->closing && !cipherOut.empty())
         s->transportWrite(c, std::move(cipherOut), /*terminal=*/false);
       if (!ok && !c->closing) {
-        // Fatal TLS error or clean close_notify: same bookkeeping as EOF -
-        // notify an in-flight request/WS exactly once, then tear down.
+        // Fatal TLS error or clean close_notify: same bookkeeping as EOF - notify an in-flight request/WS exactly once, then tear down.
         if (c->isWebSocket) {
           if (!c->wsClosing && s->cb_.onWsClose)
             s->cb_.onWsClose(s->cb_.user, c, 1006);
@@ -927,20 +996,14 @@ class Server {
     s->dispatchPlaintext(c, buf->base, static_cast<size_t>(nread));
   }
 
-  // Plaintext ingestion - identical for direct TCP reads and decrypted TLS
-  // records. May tear the connection down (doClose sets c->closing; the
-  // Connection object itself stays alive until uv's close callback).
+  // Plaintext ingestion - identical for direct TCP reads and decrypted TLS records. May tear the connection down (doClose sets c->closing; the Connection object itself stays alive until uv's close callback).
   void dispatchPlaintext(Connection* c, const char* data, size_t len) {
     if (c->isWebSocket) {
       feedWebSocket(c, data, len);
       return;
     }
     if (c->active) {
-      // A response is in flight; buffer bytes for after it completes. Cap the
-      // buffer so a client can't pipeline unbounded requests and exhaust
-      // memory while we're busy (the parser enforces per-request limits, but
-      // this bounds the not-yet-parsed backlog). A response is already in
-      // flight, so we can't inject an error status - hard-close the flood.
+      // A response is in flight; buffer bytes for after it completes. Cap the buffer so a client can't pipeline unbounded requests and exhaust memory while we're busy (the parser enforces per-request limits, but this bounds the not-yet-parsed backlog). A response is already in flight, so we can't inject an error status - hard-close the flood.
       if (c->pending.size() + len > maxPending_) {
         doClose(c);
         return;
@@ -949,20 +1012,18 @@ class Server {
       return;
     }
     ParseStatus st = c->parser.parse(data, len);
-    handleParse(c, st);
+    dispatchBatch(c, st);
   }
 
   void feedWebSocket(Connection* c, const char* data, size_t len) {
     if (c->wsClosing || !c->wsParser) return;
-    // Set when an inbound message fails inflate/UTF-8 (RFC 7692/6455): the
-    // parser itself succeeds, so surface the close code out-of-band.
+    // Set when an inbound message fails inflate/UTF-8 (RFC 7692/6455): the parser itself succeeds, so surface the close code out-of-band.
     uint16_t pmdFail = 0;
     bool ok = c->wsParser->consume(
         reinterpret_cast<const uint8_t*>(data), len,
         [&](std::string_view payload, bool isBinary, bool compressed) {
           if (compressed && c->pmd) {
-            // Inflate (hard output cap = zip-bomb defense), then UTF-8-validate
-            // text post-inflate (the parser skipped it for compressed frames).
+            // Inflate (hard output cap = zip-bomb defense), then UTF-8-validate text post-inflate (the parser skipped it for compressed frames).
             std::string inflated;
             if (!c->pmd->inflateMessage(payload, inflated)) {
               pmdFail = 1009;  // over the decompressed cap or corrupt stream
@@ -987,9 +1048,7 @@ class Server {
               std::string out;
               encodeFrame(out, WsOpcode::Pong, payload);
               writeOut(c, std::move(out), /*terminal=*/false);
-              // Bound the outgoing queue: a peer flooding Pings while never
-              // reading our Pongs would otherwise grow libuv's write buffer
-              // without limit (OOM). Shed it, same as wsSend's backpressure cap.
+              // Bound the outgoing queue: a peer flooding Pings while never reading our Pongs would otherwise grow libuv's write buffer without limit (OOM). Shed it, same as wsSend's backpressure cap.
               size_t q = uv_stream_get_write_queue_size(
                   reinterpret_cast<uv_stream_t*>(&c->handle));
               if (limits_.wsBackpressureLimit && q > limits_.wsBackpressureLimit)
@@ -999,8 +1058,7 @@ class Server {
             case WsOpcode::Pong:
               break;  // unsolicited pong allowed (§5.5.3)
             case WsOpcode::Close: {
-              // Fire onWsClose + echo exactly once (guard against two Close
-              // frames arriving in a single read).
+              // Fire onWsClose + echo exactly once (guard against two Close frames arriving in a single read).
               if (!c->wsClosing) {
                 c->wsClosing = true;
                 uint16_t code = parseCloseCode(payload);
@@ -1018,22 +1076,10 @@ class Server {
           }
         });
     if (!ok) {
-      // Protocol failure: fail the connection WITH a Close frame first
-      // (§7.1.7 SHOULD) carrying the parser's failure code - 1009 for an
-      // oversized message, 1007 for invalid UTF-8, 1002 otherwise. wsClose
-      // sets wsClosing, fires onWsClose once, erases the ws registry entry,
-      // and terminal-writes the Close frame - the flush-then-close machinery
-      // (finishResponse -> !reqKeepAlive -> doClose) tears the TCP
-      // connection down right after it drains. The parser's failed latch
-      // plus the wsClosing early-return above stop any already-buffered
-      // bytes from being re-fed. If wsClosing was already set (violation
-      // raced a close handshake in flight) this is a no-op and the pending
-      // terminal write finishes the job.
+      // Protocol failure: fail the connection WITH a Close frame first (§7.1.7 SHOULD) carrying the parser's failure code - 1009 for an oversized message, 1007 for invalid UTF-8, 1002 otherwise. wsClose sets wsClosing, fires onWsClose once, erases the ws registry entry, and terminal-writes the Close frame - the flush-then-close machinery (finishResponse -> !reqKeepAlive -> doClose) tears the TCP connection down right after it drains. The parser's failed latch plus the wsClosing early-return above stop any already-buffered bytes from being re-fed. If wsClosing was already set (violation raced a close handshake in flight) this is a no-op and the pending terminal write finishes the job.
       wsClose(c, c->wsParser->failCode(), "", 0);
     } else if (pmdFail && !c->wsClosing) {
-      // Inflate/UTF-8 failure on a compressed message: close with the RFC 7692
-      // /6455 code (1009 too-big, 1007 bad UTF-8) via the same flush-then-close
-      // machinery as a parser failure.
+      // Inflate/UTF-8 failure on a compressed message: close with the RFC 7692/6455 code (1009 too-big, 1007 bad UTF-8) via the same flush-then-close machinery as a parser failure.
       wsClose(c, pmdFail, "", 0);
     }
   }
@@ -1041,9 +1087,7 @@ class Server {
   void handleParse(Connection* c, ParseStatus st) {
     if (c->closing) return;
 
-    // Answer Expect: 100-continue before the (already fully-buffered) body -
-    // the parser reads the whole body before Complete, so on NeedMore with the
-    // head parsed we know a body is pending.
+    // Answer Expect: 100-continue before the (already fully-buffered) body - the parser reads the whole body before Complete, so on NeedMore with the head parsed we know a body is pending.
     if (!c->sentContinue && c->parser.headParsed()) {
       const char* exp = c->parser.findHeader("expect");
       if (exp && iequals(trimOWS(std::string_view(exp)), "100-continue")) {
@@ -1066,20 +1110,18 @@ class Server {
   }
 
   void surfaceRequest(Connection* c) {
-    // Snapshot the request so the reqId stays valid across async responses.
-    // Skip ids still bound to live requests: the uint32 counter wraps after
-    // 2^32 requests (~12h at 100k rps) and a collision with a still-open
-    // long-lived request (e.g. an SSE stream) would silently rebind it.
+    // Snapshot the request so the reqId stays valid across async responses. Skip ids still bound to live requests: the uint32 counter wraps after 2^32 requests (~12h at 100k rps) and a collision with a still-open long-lived request (e.g. an SSE stream) would silently rebind it.
     auto& reqMap = globalRequests();
     do {
       c->reqId = ++globalReqCounter();
     } while (c->reqId == 0 || reqMap.count(c->reqId));
     c->method = c->parser.method;
-    c->methodStr = c->parser.methodStr;
-    c->path = c->parser.path;
-    c->query = c->parser.query;
-    c->headers = c->parser.headers;
-    c->body = std::move(c->parser.body);
+    // Swap, don't copy: the parser is reset before its next request anyway (reset() clears every swapped-in field, keeping its heap capacity), so the previous snapshot's buffers become the parser's scratch for the NEXT request - snapshots are allocation-free on a warm connection.
+    c->methodStr.swap(c->parser.methodStr);
+    c->path.swap(c->parser.path);
+    c->query.swap(c->parser.query);
+    c->headers.swap(c->parser.headers);
+    c->body.swap(c->parser.body);
     c->isHead = (c->method == Method::HEAD);
     c->reqKeepAlive = c->parser.keepAlive;
     c->active = true;
@@ -1091,28 +1133,24 @@ class Server {
 
   void sendErrorAndClose(Connection* c, int status) {
     c->reqKeepAlive = false;
-    std::string out;
+    std::string& out = c->scratch;
+    out.clear();
     appendStatusLine(out, status);
     out += "Date: ";
     out += httpDate();
     out += "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     c->responseEnded = true;
-    writeOut(c, std::move(out), /*terminal=*/true);
+    writeOutView(c, out, /*terminal=*/true);
   }
 
   void abortConnection(Connection* c) {
-    // Hard teardown (read error/EOF/write error): drop the socket now. Any
-    // in-flight writes reference WriteReq buffers, not the connection body,
-    // and their completion callbacks tolerate a closing handle.
+    // Hard teardown (read error/EOF/write error): drop the socket now. Any in-flight writes reference WriteReq buffers, not the connection body, and their completion callbacks tolerate a closing handle.
     doClose(c);
   }
 
   void doClose(Connection* c) {
     if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&c->handle))) return;
-    // Best-effort close_notify on an established TLS session (truncation
-    // detection for the peer). uv_try_write: synchronous, non-blocking, no
-    // bookkeeping - if the kernel buffer is full the alert is simply lost,
-    // which is exactly the semantics "best effort" means here.
+    // Best-effort close_notify on an established TLS session (truncation detection for the peer). uv_try_write: synchronous, non-blocking, no bookkeeping - if the kernel buffer is full the alert is simply lost, which is exactly the semantics "best effort" means here.
     if (c->tls && !c->closing) {
       std::string bye;
       c->tls->shutdown(bye);
@@ -1122,19 +1160,14 @@ class Server {
       }
     }
     c->closing = true;
-    // An HTTP request that was surfaced to a handler and never answered owes
-    // JS exactly one onAborted (server shutdown, timeout sweep, write error),
-    // or 'close' listeners and their resources (SSE intervals, monitors) leak.
-    // closing is already set, so a re-entrant respond() from JS is a no-op.
+    // An HTTP request that was surfaced to a handler and never answered owes JS exactly one onAborted (server shutdown, timeout sweep, write error), or 'close' listeners and their resources (SSE intervals, monitors) leak. closing is already set, so a re-entrant respond() from JS is a no-op.
     if (c->active && !c->isWebSocket && !c->abortNotified) {
       c->abortNotified = true;
       if (cb_.onAborted) cb_.onAborted(cb_.user, c);
     }
     globalRequests().erase(c->reqId);
     if (c->isWebSocket) {
-      // A WebSocket torn down without an explicit wsClose (server shutdown,
-      // socket error) still owes JS exactly one onWsClose so wrappers/handlers
-      // don't leak. wsClosing guards against a double-fire.
+      // A WebSocket torn down without an explicit wsClose (server shutdown, socket error) still owes JS exactly one onWsClose so wrappers/handlers don't leak. wsClosing guards against a double-fire.
       if (!c->wsClosing && cb_.onWsClose) {
         c->wsClosing = true;
         cb_.onWsClose(cb_.user, c, 1006);  // abnormal closure (§7.1.5)
@@ -1162,10 +1195,7 @@ class Server {
     s->checkFullyClosed();
   }
 
-  // When a shutdown was requested AND every uv handle has been reaped, the
-  // Server is safe to delete. Frees the C++ object and notifies the binding
-  // (which then releases its per-server JS handles) - no leak across
-  // serve()/close() cycles.
+  // When a shutdown was requested AND every uv handle has been reaped, the Server is safe to delete. Frees the C++ object and notifies the binding (which then releases its per-server JS handles) - no leak across serve()/close() cycles.
   void checkFullyClosed() {
     if (!closeRequested_ || liveHandles_ > 0) return;
     void (*cb)(void*) = onClosed_;
@@ -1174,10 +1204,7 @@ class Server {
     if (cb) cb(user);
   }
 
-  // Periodic sweep enforcing the two receive timeouts. WebSocket connections
-  // are exempt (they legitimately idle between messages; RFC 6455 ping/pong or
-  // the app's own idle policy governs them), as are connections whose request
-  // is surfaced to a handler (response time is the app's business).
+  // Periodic sweep enforcing the two receive timeouts. WebSocket connections are exempt (they legitimately idle between messages; RFC 6455 ping/pong or the app's own idle policy governs them), as are connections whose request is surfaced to a handler (response time is the app's business).
   //  - idleTimeoutMs: no bytes at all for the window -> hard close.
   //  - requestTimeoutMs: one request has been arriving for longer than the
   //    budget, however slowly -> 408 + close (slow-drip slowloris defense;
@@ -1197,9 +1224,7 @@ class Server {
         continue;
       }
       if (s->limits_.requestTimeoutMs) {
-        // A TLS handshake in progress counts as mid-request: the same
-        // requestTimeoutMs budget bounds handshake slow-drip (a stalled or
-        // byte-trickled ClientHello) with no extra knob.
+        // A TLS handshake in progress counts as mid-request: the same requestTimeoutMs budget bounds handshake slow-drip (a stalled or byte-trickled ClientHello) with no extra knob.
         bool mid = c->parser.midRequest() || (c->tls && !c->tls->handshakeDone());
         if (!mid)
           c->requestTicks = 0;
@@ -1207,8 +1232,7 @@ class Server {
           overdue.push_back(c);
       }
     }
-    // Mutations deferred: sendErrorAndClose/doClose can erase from conns_
-    // (synchronously on a uv_write failure), which would invalidate the loop.
+    // Mutations deferred: sendErrorAndClose/doClose can erase from conns_ (synchronously on a uv_write failure), which would invalidate the loop.
     for (Connection* c : stale) s->doClose(c);
     for (Connection* c : overdue) {
       // No usable channel for a 408 before the handshake finished.
@@ -1228,8 +1252,7 @@ class Server {
   ServerCallbacks cb_;
   HttpLimits limits_;
   size_t maxPending_ = 0;  // per-connection not-yet-parsed backlog cap
-  // Deferred-shutdown bookkeeping: the Server outlives close() until every uv
-  // handle it owns (listener + sweep timer + each connection) is reaped.
+  // Deferred-shutdown bookkeeping: the Server outlives close() until every uv handle it owns (listener + sweep timer + each connection) is reaped.
   int liveHandles_ = 0;
   bool closeRequested_ = false;
   bool listenerClosed_ = false;  // stopListening() already closed the listener
