@@ -1,15 +1,19 @@
 name: release
 
-# Publish @morojs/engine on a version tag. Binaries ship ONLY from a tagged CI
-# run with npm provenance — never from a developer machine (CONTRIBUTING.md).
+# Publish @morojs/engine when a GitHub Release is PUBLISHED (the human step:
+# tools/release.mjs pushes the vX.Y.Z tag, then someone drafts the Release for
+# that tag with the release notes and clicks Publish — that click is the launch
+# button). Binaries ship ONLY from this CI run with npm provenance — never from
+# a developer machine (CONTRIBUTING.md).
 #
-# Flow: rebuild every platform (same matrix as build.yml) -> collect the .node
+# Flow: rebuild every platform (same matrix as ci.yml) -> collect the .node
 # artifacts -> assemble the per-platform packages + sync all versions
 # (tools/prepare-release.mjs) -> publish each platform package, then the meta
-# package LAST so its optionalDependencies already resolve.
+# package LAST so its optionalDependencies already resolve. Publishes are
+# idempotent (already-on-registry versions are skipped), so re-running is safe.
 on:
-  push:
-    tags: ['v*']
+  release:
+    types: [published]
 
 permissions:
   contents: read

@@ -8,7 +8,7 @@ name: ci
 #
 # Deliberately NOT here: the sustained fuzz campaign (fuzz.yml, nightly — slow,
 # corpus-accumulating discovery, not a pass/fail gate) and publishing to npm
-# (release.yml, on a version tag).
+# (release.yml, fired by publishing a GitHub Release for a vX.Y.Z tag).
 on:
   push:
     branches: [main]

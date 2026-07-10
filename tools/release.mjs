@@ -17,9 +17,11 @@
 //      optionalDependencies pins, all 6 platform packages, the monorepo root,
 //      and the kEngineVersion fallback in src/binding.cpp.
 //   3. Commits "chore: release vX.Y.Z", tags vX.Y.Z, pushes main + the tag.
-//   4. The pushed tag triggers .github/workflows/release.yml, which rebuilds
-//      every platform and publishes to npm with provenance. Nothing publishes
-//      from this machine.
+//   4. YOU then draft the GitHub Release for that tag (paste the vX.Y.Z.md
+//      notes) and click Publish - THAT fires .github/workflows/release.yml,
+//      which rebuilds every platform and publishes to npm with provenance.
+//      Nothing publishes from this machine, and nothing publishes until the
+//      Release is published on GitHub.
 //
 // (CI's prepare-release.mjs re-syncs versions from the tag at publish time, so
 // even a missed file here can't drift what actually ships - this script keeps
@@ -125,6 +127,9 @@ if (noPush) {
   console.log(`\ndone (not pushed). When ready:  git push origin main v${next}`);
 } else {
   run(`git push origin main v${next}`);
-  console.log(`\ndone. Tag v${next} pushed - release.yml is now building all platforms and will publish to npm with provenance.`);
+  console.log(`\ntag v${next} pushed. npm publish fires when you publish the GitHub Release:`);
+  console.log(`  1. open  https://github.com/Moro-JS/engine/releases/new?tag=v${next}`);
+  console.log(`  2. paste the v${next}.md release notes as the body`);
+  console.log(`  3. click "Publish release" - that click starts the build + npm publish`);
   console.log(`watch it: https://github.com/Moro-JS/engine/actions`);
 }
