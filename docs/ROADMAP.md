@@ -15,7 +15,7 @@ Windows (MSVC) CI build leg (the local build has landed in `tools/build.mjs`).
 | M4 WebSocket | ✅ done | RFC 6455 framing/handshake, integrated, `EngineWebSocketAdapter`; socket conformance green; failure closes carry 1002/1007/1009 per §7.4.1; permessage-deflate shipped (opt-in) |
 | M5 hardening | ✅ done | libFuzzer harnesses + corpus, ASan/UBSan clean, idle/slowloris timeout, CI fuzz/sanitizer jobs, SECURITY.md + THREAT_MODEL.md; found+fixed a Content-Length overflow smuggling bug. External review recommended before untrusted-facing TLS production (a human gate, not yet done). |
 | M6 GA 1.0.0 | ✅ done | first published release; stable surface; every cap runtime-configurable via serve() options; `probe().capabilities` feature flags; MoroJS ships the engine as its default (`engine: 'moro'`) with Node fallback |
-| v1.1.0 perf | ✅ done | pipelined response corking (one write per batch) + zero-allocation warm hot path (header slot reuse, snapshot swaps, scratch response buffer, zero-copy fast-path writes); outperforms uWebSockets.js in both real-world and pipelined profiles, single thread |
+| v1.1.0 perf | ✅ done | pipelined response corking (one write per batch) + zero-allocation warm hot path (header slot reuse, snapshot swaps, scratch response buffer, zero-copy fast-path writes); ~3.7× pipelined throughput vs 1.0.0 |
 
 ## Beyond 1.0
 

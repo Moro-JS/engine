@@ -7,10 +7,11 @@ requests. MIT licensed.
 **Status: GA (1.1.x).** HTTP/1.1 + WebSocket cores (with permessage-deflate),
 in-process TLS/HTTPS/WSS, fully configurable limits, hardening, sanitizers,
 fuzzing, and the release pipeline are all shipped (M0–M6 complete). 1.1.0 added
-pipelined response corking and a zero-allocation hot path — the engine now
-outperforms uWebSockets.js in both real-world and pipelined benchmark profiles
-on a single thread. In progress: ALPN HTTP/2 (vendored nghttp2). See
-[docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+pipelined response corking and a zero-allocation hot path (~3.7× pipelined
+throughput vs 1.0.0). Measured comparisons live in the
+[MoroJS Benchmark repo](https://github.com/Moro-JS/benchmark). In progress:
+ALPN HTTP/2 (vendored nghttp2). See [docs/DESIGN.md](docs/DESIGN.md) and
+[docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Why
 
