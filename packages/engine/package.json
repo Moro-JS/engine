@@ -1,6 +1,6 @@
 {
   "name": "@morojs/engine",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "MoroJS native HTTP engine - Moro-authored C++ core with per-platform prebuilt binaries and automatic Node.js fallback in MoroJS",
   "license": "MIT",
   "author": "CM Ventures Inc.",
@@ -38,12 +38,12 @@
     "provenance": true
   },
   "optionalDependencies": {
-    "@morojs/engine-darwin-arm64": "1.0.0",
-    "@morojs/engine-darwin-x64": "1.0.0",
-    "@morojs/engine-linux-x64-gnu": "1.0.0",
-    "@morojs/engine-linux-arm64-gnu": "1.0.0",
-    "@morojs/engine-linux-x64-musl": "1.0.0",
-    "@morojs/engine-win32-x64": "1.0.0"
+    "@morojs/engine-darwin-arm64": "1.1.0",
+    "@morojs/engine-darwin-x64": "1.1.0",
+    "@morojs/engine-linux-x64-gnu": "1.1.0",
+    "@morojs/engine-linux-arm64-gnu": "1.1.0",
+    "@morojs/engine-linux-x64-musl": "1.1.0",
+    "@morojs/engine-win32-x64": "1.1.0"
   },
   "keywords": [
     "morojs",

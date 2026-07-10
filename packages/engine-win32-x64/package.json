@@ -1,6 +1,6 @@
 {
   "name": "@morojs/engine-win32-x64",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Prebuilt @morojs/engine native binaries for win32/x64 (all supported Node ABIs).",
   "license": "MIT",
   "author": "CM Ventures Inc.",
