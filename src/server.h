@@ -88,7 +88,16 @@ inline uint32_t& globalReqCounter() {
   return counter;
 }
 inline std::unordered_map<uint32_t, Connection*>& globalRequests() {
-  static std::unordered_map<uint32_t, Connection*> map;
+  // Pre-sized with a low load factor: this map takes an insert + an erase on
+  // EVERY request, so rehashes and collision chains sit directly on the hot
+  // path. 4096 buckets at 0.5 load ≈ 2048 concurrent in-flight requests
+  // before the first rehash.
+  static std::unordered_map<uint32_t, Connection*> map = [] {
+    std::unordered_map<uint32_t, Connection*> m;
+    m.max_load_factor(0.5f);
+    m.reserve(2048);
+    return m;
+  }();
   return map;
 }
 
@@ -344,15 +353,45 @@ class Server {
     const bool bodyless = isBodyless(status);
     if (bodyless) bodyLen = 0;  // never emit a body for these statuses
 
+    // Corked plaintext fast path: build the frame STRAIGHT INTO the cork
+    // buffer - no scratch, no intermediate memcpy. This is the hot path for
+    // every pipelined batch. (TLS must go through writeOutView so the frame is
+    // encrypted before it reaches corkBuf.)
+    if (c->corked && !c->tls) {
+      appendResponse(c->corkBuf, c, status, headersBlock, customCL, body,
+                     bodyLen, bodyless);
+      c->responseStarted = true;
+      c->responseEnded = true;
+      completeCorkedResponse(c);
+      if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
+      return;
+    }
+
     std::string& out = c->scratch;
     out.clear();
     out.reserve(bodyLen + headersBlock.size() + 128);
+    appendResponse(out, c, status, headersBlock, customCL, body, bodyLen,
+                   bodyless);
+    c->responseStarted = true;
+    c->responseEnded = true;
+    writeOutView(c, out, /*terminal=*/true);
+    releaseScratch(c);
+  }
+
+  // Append one complete response frame (status line through body) to `out`.
+  // Framing belongs to the engine: a body-carrying response always declares
+  // the ACTUAL body size (an app-supplied mismatch would desync every
+  // follow-up response on a keep-alive connection). HEAD and bodyless statuses
+  // legitimately declare the would-be entity length (RFC 9110 §8.6), so the
+  // app-supplied value is honored there.
+  void appendResponse(std::string& out, Connection* c, int status,
+                      const std::string& headersBlock, long long customCL,
+                      const char* body, size_t bodyLen, bool bodyless) {
     appendStatusLine(out, status);
     out += "Date: ";
     out += httpDate();
     out += "\r\n";
     out += headersBlock;
-    // Framing belongs to the engine: a body-carrying response always declares the ACTUAL body size (an app-supplied mismatch would desync every follow-up response on a keep-alive connection). HEAD and bodyless statuses legitimately declare the would-be entity length (RFC 9110 §8.6), so the app-supplied value is honored there.
     if (!bodyless) {
       const unsigned long long cl =
           (c->isHead && customCL >= 0)
@@ -369,11 +408,6 @@ class Server {
     out += connectionHeader(c);
     out += "\r\n";
     if (!c->isHead && bodyLen) out.append(body, bodyLen);
-
-    c->responseStarted = true;
-    c->responseEnded = true;
-    writeOutView(c, out, /*terminal=*/true);
-    releaseScratch(c);
   }
 
   // One huge response must not pin its capacity to an idle connection; small

@@ -55,6 +55,15 @@ struct JsServer {
   Global<Function> onWsClose;
   Server* server;
   uint32_t id = 0;
+  // Interned per-path JS strings: real apps route a BOUNDED set of paths, so
+  // the per-request String::NewFromUtf8 (allocation + GC pressure) is paid
+  // once per unique path instead of once per request. Bounded: only paths
+  // <= kPathCacheMaxLen are cached and at most kPathCacheMaxEntries live here
+  // (past the cap, requests simply build the string per-call as before), so
+  // an adversary spraying unique URLs can't grow it. Freed with the JsServer.
+  std::unordered_map<std::string, Global<String>> pathCache;
+  static constexpr size_t kPathCacheMaxEntries = 512;
+  static constexpr size_t kPathCacheMaxLen = 128;
 };
 
 static std::unordered_map<uint32_t, JsServer*> g_servers;
@@ -214,10 +223,25 @@ static void invokeJs(JsServer* js, Global<Function>& fn, Connection* c,
 
   Local<Function> f = fn.Get(iso);
   if (withExtra) {
+    // Serve the path from the interned cache when possible (see JsServer).
+    Local<String> pathStr;
+    if (path.size() <= JsServer::kPathCacheMaxLen) {
+      auto it = js->pathCache.find(path);
+      if (it != js->pathCache.end()) {
+        pathStr = it->second.Get(iso);
+      } else {
+        pathStr = str(iso, path);
+        if (js->pathCache.size() < JsServer::kPathCacheMaxEntries) {
+          js->pathCache.emplace(path, Global<String>(iso, pathStr));
+        }
+      }
+    } else {
+      pathStr = str(iso, path);
+    }
     Local<Value> argv[3] = {
         Integer::NewFromUnsigned(iso, c->reqId),
         Integer::New(iso, methodIdx),
-        str(iso, path),
+        pathStr,
     };
     (void)f->Call(ctx, ctx->Global(), 3, argv);
   } else {
