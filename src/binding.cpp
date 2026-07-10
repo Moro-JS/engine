@@ -23,7 +23,7 @@ namespace engine {
 // the JS loader (packages/engine/index.js) reads it from package.json and
 // overrides this in probe() and on `.version`. Keep it roughly in step, but the
 // loader is the source of truth, so this never has to be bumped by hand.
-static const char* kEngineVersion = "1.1.0";
+static const char* kEngineVersion = "1.1.1";
 
 using v8::Array;
 using v8::ArrayBuffer;
