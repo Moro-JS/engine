@@ -702,6 +702,77 @@ describe('@morojs/engine hardening conformance', { skip }, () => {
     );
   });
 
+  it('slow-read defense: a STEADY slow reader of a STREAMED (chunked write()) response gets the full body', { timeout: 60000 }, async () => {
+    // Distinct code path from the single-respond() tests: streaming issues
+    // many write() calls, each its own uv_write completing via onWrite. This
+    // guards the per-completion writeTicks reset AND the queue-shrinkage reset
+    // together against regression - SSE / chunked downloads to a slow reader
+    // (the reviewer's named case) must not be severed. Handler respects
+    // backpressure (waitWritable), streaming 8 MB in 64 KB chunks under a
+    // fixed Content-Length.
+    const total = 8 * 1024 * 1024;
+    const CHUNK = 64 * 1024;
+    await withServer(
+      async (ctx) => {
+        ctx.writeHead(200, ['content-length', String(total)]);
+        const chunk = Buffer.alloc(CHUNK, 0x64);
+        let sent = 0;
+        while (sent < total) {
+          if (!ctx.write(chunk)) await ctx.waitWritable();
+          sent += CHUNK;
+        }
+        ctx.end();
+      },
+      { responseTimeoutMs: 1000 },
+      async ({ port, aborted }) => {
+        const gotBody = await new Promise((resolve, reject) => {
+          let bodyBytes = 0;
+          let headSeen = false;
+          let pending = Buffer.alloc(0);
+          const s = net.connect({ host: '127.0.0.1', port }, () => {
+            s.write(`GET /stream HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`);
+          });
+          s.pause();
+          const pull = setInterval(() => {
+            const chunk = s.read(256 * 1024) ?? s.read();
+            if (!chunk) return;
+            if (!headSeen) {
+              pending = Buffer.concat([pending, chunk]);
+              const idx = pending.indexOf('\r\n\r\n');
+              if (idx === -1) return;
+              headSeen = true;
+              bodyBytes += pending.length - (idx + 4);
+              pending = Buffer.alloc(0);
+            } else {
+              bodyBytes += chunk.length;
+            }
+            if (bodyBytes >= total) {
+              clearInterval(pull);
+              clearTimeout(guard);
+              s.destroy();
+              resolve(bodyBytes);
+            }
+          }, 120);
+          const guard = setTimeout(() => {
+            clearInterval(pull);
+            s.destroy();
+            reject(new Error(`streamed body incomplete: ${bodyBytes}/${total}`));
+          }, 45000);
+          s.on('close', () => {
+            if (bodyBytes < total) {
+              clearInterval(pull);
+              clearTimeout(guard);
+              reject(new Error(`stream closed mid-body at ${bodyBytes}/${total} (slow-read false positive)`));
+            }
+          });
+          s.on('error', () => {});
+        });
+        assert.equal(gotBody, total, 'the entire streamed body must arrive uncut');
+        assert.equal(aborted.length, 0, 'a steadily-draining slow reader of a stream must never be shed');
+      }
+    );
+  });
+
   it('responseBackpressureLimit (opt-in): outbound bytes past the cap shed the connection immediately', T, async () => {
     await withServer(
       (ctx) => { setImmediate(() => ctx.respond(200, null, BIG)); }, // async: uncorked write path
