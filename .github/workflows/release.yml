@@ -60,6 +60,8 @@ jobs:
           name: binaries-linux-${{ matrix.arch }}-gnu
           path: build/*.node
 
+  # docker-run instead of `container:`: JS actions can't run inside Alpine
+  # containers on arm64 runners (no musl Node to inject). See ci.yml.
   linux-musl:
     strategy:
       matrix:
@@ -69,11 +71,12 @@ jobs:
           - runner: ubuntu-24.04-arm
             arch: arm64
     runs-on: ${{ matrix.runner }}
-    container: node:24-alpine
     steps:
       - uses: actions/checkout@v4
-      - run: apk add --no-cache build-base
-      - run: node tools/build.mjs --all
+      - name: Build in Alpine container (musl)
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo node:24-alpine \
+            sh -c "apk add --no-cache build-base && node tools/build.mjs --all"
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-linux-${{ matrix.arch }}-musl
