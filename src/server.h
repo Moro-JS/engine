@@ -181,8 +181,9 @@ struct Connection {
   uint32_t idleTicks = 0;
   // Request-timeout bookkeeping: incremented each sweep while a request is partially received; NOT reset by activity (slow-drip defense), only when the request completes or the connection goes back to idle keep-alive.
   uint32_t requestTicks = 0;
-  // Write-progress bookkeeping (slow-read defense): incremented each sweep while uv writes are pending, reset whenever one completes (onWrite); the connection is closed once no write completes for the whole responseTimeoutMs budget.
+  // Write-progress bookkeeping (slow-read defense): writeTicks counts sweeps with uv writes pending and NO drain progress; it resets on any progress and the connection is closed once it spans the whole responseTimeoutMs budget. Progress = the outbound queue SHRANK since the previous sweep (lastWriteQueue), or a write completed (onWrite). Queue shrinkage - not completion alone - is the load-bearing signal: a single large respond() is ONE uv_write that only completes when the whole body has drained, so a steadily-reading slow client would never produce a completion and would be shed mid-transfer despite continuous progress. SIZE_MAX = no baseline yet (next sweep records one).
   uint32_t writeTicks = 0;
+  size_t lastWriteQueue = SIZE_MAX;
 
   ~Connection() {
     delete wsParser;
@@ -912,7 +913,8 @@ class Server {
     bool terminal = wr->terminal;
     delete wr;
     c->pendingWrites--;
-    c->writeTicks = 0;  // a write completed: the drain is making progress
+    c->writeTicks = 0;           // a write completed: the drain made progress
+    c->lastWriteQueue = SIZE_MAX;  // re-baseline at the next sweep
 
     if (status != 0) {
       c->server->abortConnection(c);
@@ -1365,15 +1367,31 @@ class Server {
       // (or pins a zero TCP receive window) would otherwise hold its WriteReq
       // buffers, kernel socket buffers, and fd forever - active never clears
       // because the terminal write never flushes, so BOTH receive timeouts
-      // skip it permanently. writeTicks resets on every completed write
-      // (onWrite), so a slow-but-draining peer lives; only a fully stalled
-      // drain is shed. Applies to WebSockets too: a stalled consumer under
+      // skip it permanently. Progress is measured as the outbound queue
+      // SHRINKING between sweeps (plus write completions via onWrite):
+      // completion alone is a trap - one large respond() is a single
+      // uv_write that only completes when the whole body has drained, so a
+      // steadily-reading slow client (weak link, rate-limited download)
+      // would be shed mid-transfer despite continuous progress. A stalled /
+      // zero-window peer never shrinks the queue and is still shed at the
+      // budget. Applies to WebSockets too: a stalled consumer under
       // wsBackpressureLimit that the app stops sending to is otherwise held
       // forever, and a stalled Close-frame flush (closeAfterFlush) likewise.
-      if (s->limits_.responseTimeoutMs && c->pendingWrites > 0 &&
-          ++c->writeTicks >= respLimit) {
-        stalled.push_back(c);
-        continue;
+      // (Known residual, same as nginx's send_timeout semantics: a peer
+      // draining a token amount per sweep window resets the budget and can
+      // hold its memory - maxConnections / responseBackpressureLimit bound
+      // that; see THREAT_MODEL.)
+      if (s->limits_.responseTimeoutMs && c->pendingWrites > 0) {
+        const size_t q = uv_stream_get_write_queue_size(
+            reinterpret_cast<uv_stream_t*>(&c->handle));
+        if (q < c->lastWriteQueue) {
+          c->writeTicks = 0;  // bytes drained since the last sweep
+        } else if (++c->writeTicks >= respLimit) {
+          c->lastWriteQueue = q;
+          stalled.push_back(c);
+          continue;
+        }
+        c->lastWriteQueue = q;
       }
       if (c->isWebSocket || c->active) continue;
       if (s->limits_.idleTimeoutMs && ++c->idleTicks >= idleLimit) {

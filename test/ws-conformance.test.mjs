@@ -781,6 +781,79 @@ describe('@morojs/engine RFC 6455 WebSocket conformance', { skip }, () => {
     }
   });
 
+  it('slow-read defense: a STEADY slow WS consumer of a large frame is NOT shed (H-2, wsBackpressureLimit off)', { timeout: 60000 }, async () => {
+    // Same root cause as the HTTP slow-read case: one large wsSend() is a
+    // single queued write. With wsBackpressureLimit:0 (unlimited) only
+    // responseTimeoutMs governs the drain, so a steadily-reading slow consumer
+    // must survive on queue-shrinkage progress, not write completion.
+    const local = startWsServer({ responseTimeoutMs: 1000, wsBackpressureLimit: 0 });
+    const size = 12 * 1024 * 1024;
+    try {
+      const received = await new Promise((resolve, reject) => {
+        const s = net.connect({ host: '127.0.0.1', port: local.port }, () => {
+          const key = crypto.randomBytes(16).toString('base64');
+          s.write(
+            `GET / HTTP/1.1${CRLF}Host: t${CRLF}Upgrade: websocket${CRLF}` +
+              `Connection: Upgrade${CRLF}Sec-WebSocket-Key: ${key}${CRLF}` +
+              `Sec-WebSocket-Version: 13${CRLF}${CRLF}`
+          );
+        });
+        s.pause();
+        let handshakeDone = false;
+        let buf = Buffer.alloc(0);
+        let frameBytes = 0;
+        const payload = Buffer.alloc(size, 0x7a);
+        // Expected echo: 10-byte header (127 extended length) + payload.
+        const expected = 10 + size;
+        const pull = setInterval(() => {
+          const chunk = s.read(256 * 1024) ?? s.read();
+          if (!chunk) return;
+          if (!handshakeDone) {
+            buf = Buffer.concat([buf, chunk]);
+            const idx = buf.indexOf('\r\n\r\n');
+            if (idx === -1) return;
+            const head = buf.subarray(0, idx).toString('latin1');
+            if (!/^HTTP\/1\.1 101/.test(head)) {
+              clearInterval(pull);
+              s.destroy();
+              return reject(new Error(`expected 101, got: ${head.split('\r\n')[0]}`));
+            }
+            handshakeDone = true;
+            frameBytes += buf.length - (idx + 4);
+            buf = Buffer.alloc(0);
+            // Now send the large frame the server will echo back.
+            s.write(buildFrame({ opcode: OP.BINARY, payload }));
+            return;
+          }
+          frameBytes += chunk.length;
+          if (frameBytes >= expected) {
+            clearInterval(pull);
+            clearTimeout(guard);
+            s.destroy();
+            resolve(frameBytes);
+          }
+        }, 120);
+        const guard = setTimeout(() => {
+          clearInterval(pull);
+          s.destroy();
+          reject(new Error(`did not receive full echo: got ${frameBytes}/${expected}`));
+        }, 40000);
+        s.on('close', () => {
+          if (frameBytes < expected) {
+            clearInterval(pull);
+            clearTimeout(guard);
+            reject(new Error(`WS connection closed mid-frame at ${frameBytes}/${expected} (H-2 false positive)`));
+          }
+        });
+        s.on('error', () => {});
+      });
+      assert.ok(received >= 10 + size, 'the full echoed frame must arrive uncut');
+      assert.equal(local.events.closes.length, 0, 'a steadily-draining slow WS consumer must never be shed');
+    } finally {
+      local.close();
+    }
+  });
+
   it('larger message (~300 KB) round-trips intact', T, async () => {
     const { client } = await connectAndHandshake(server);
     try {

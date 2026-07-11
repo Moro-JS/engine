@@ -22,8 +22,10 @@ serve(callbacks: {
                                // complete request from its first byte - does NOT reset
                                // on activity (slow-drip slowloris defense). Expiry: 408 + close.
   responseTimeoutMs?: number;  // default 300000; 0 disables. Budget for DELIVERING queued
-                               // outbound bytes: resets whenever a write completes, so only a
-                               // drain making NO progress for the whole budget is closed
+                               // outbound bytes: resets on drain progress (the write queue
+                               // shrank since the last sweep, or a write completed), so only a
+                               // drain making NO progress for the whole budget is closed -
+                               // steady slow readers of large responses are never shed
                                // (slow-read / zero-window DoS defense; capabilities.responseLimits).
   maxConnections?: number;     // default 0 = unlimited
   maxPendingBytes?: number;    // default maxHeadSize + maxBodySize
@@ -41,7 +43,11 @@ serve(callbacks: {
                                // not-yet-flushed HTTP outbound queue; over it the connection
                                // is closed immediately (HTTP mirror of wsBackpressureLimit).
                                // Leave 0 unless response sizes are bounded: one large
-                               // respond() legitimately queues its whole body.
+                               // respond() legitimately queues its whole body. Memory note:
+                               // a queued response holds an engine-side copy (~2x body peak
+                               // for one slow drain, bounded in time by responseTimeoutMs) -
+                               // apps serving large payloads to untrusted clients should set
+                               // this cap or stream via writeHead()/write() chunks instead.
   wsMaxMessageSize?: number;   // default 16MB; reassembled WS message cap (close 1009 over)
   wsBackpressureLimit?: number;// default 1MB; slow WS consumer shed with 1013. 0 = unlimited
   writeHighWaterMark?: number; // default 262144; write()/wsSend() report backpressure above

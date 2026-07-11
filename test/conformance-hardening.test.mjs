@@ -639,6 +639,69 @@ describe('@morojs/engine hardening conformance', { skip }, () => {
     );
   });
 
+  it('slow-read defense: a STEADY slow reader of a large single response receives the FULL body (no false positive)', { timeout: 60000 }, async () => {
+    // H-1 regression: one large respond() is a single uv_write that only
+    // completes when the whole body drains. Progress must be measured by the
+    // outbound queue shrinking, not by write completion, or a steadily-reading
+    // slow client is shed mid-transfer. 24 MB body, 1s deadline, client pulls
+    // 256 KB every 120ms (~2 MB/s continuous) - far more sweep windows than
+    // the deadline, so a completion-based check would kill it early.
+    const body = Buffer.alloc(16 * 1024 * 1024, 0x63);
+    await withServer(
+      (ctx) => { setImmediate(() => ctx.respond(200, null, body)); },
+      { responseTimeoutMs: 1000 },
+      async ({ port, aborted }) => {
+        const received = await new Promise((resolve, reject) => {
+          let got = 0;
+          let expected = -1;
+          const s = net.connect({ host: '127.0.0.1', port }, () => {
+            s.write(`GET /big HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`);
+          });
+          s.pause();
+          // Drain a bounded slice per tick, falling back to whatever is
+          // buffered so the reader always makes progress (a fixed-size read
+          // returns null when fewer than that many bytes are buffered, which
+          // would stall the drain and defeat the test's intent). Still paced
+          // and continuous, spanning many sweep windows > responseTimeoutMs.
+          const pull = setInterval(() => {
+            const chunk = s.read(256 * 1024) ?? s.read();
+            if (chunk) {
+              got += chunk.length;
+              if (expected === -1) {
+                const headEnd = chunk.indexOf('\r\n\r\n'); // head is tiny; in the first slice
+                if (headEnd !== -1) {
+                  const m = /content-length: (\d+)/i.exec(chunk.subarray(0, headEnd).toString('latin1'));
+                  if (m) expected = headEnd + 4 + Number(m[1]);
+                }
+              }
+              if (expected > 0 && got >= expected) {
+                clearInterval(pull);
+                clearTimeout(guard);
+                s.destroy();
+                resolve(got);
+              }
+            }
+          }, 120);
+          const guard = setTimeout(() => {
+            clearInterval(pull);
+            s.destroy();
+            reject(new Error(`did not receive full body: got ${got}, expected ${expected}`));
+          }, 40000);
+          s.on('close', () => {
+            if (expected === -1 || got < expected) {
+              clearInterval(pull);
+              clearTimeout(guard);
+              reject(new Error(`connection closed mid-download at ${got}/${expected} bytes (H-1 false positive)`));
+            }
+          });
+          s.on('error', () => {});
+        });
+        assert.ok(received > body.length, 'the entire body must arrive uncut');
+        assert.equal(aborted.length, 0, 'a steadily-draining slow reader must never be shed');
+      }
+    );
+  });
+
   it('responseBackpressureLimit (opt-in): outbound bytes past the cap shed the connection immediately', T, async () => {
     await withServer(
       (ctx) => { setImmediate(() => ctx.respond(200, null, BIG)); }, // async: uncorked write path
