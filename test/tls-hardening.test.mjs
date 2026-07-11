@@ -8,7 +8,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { loadEngine, startFixtureServer, parseResponse } from './helpers.mjs';
-import { sslFileOptions, rawTlsRequest } from './tls-helpers.mjs';
+import { sslFileOptions, rawTlsRequest, openRawTls } from './tls-helpers.mjs';
 
 const engine = await loadEngine();
 const tlsCapable = engine?.probe?.().capabilities?.tls === true;
@@ -86,6 +86,61 @@ describe('@morojs/engine TLS hardening', { skip }, () => {
       await sendRawExpectClose(server.port, null);
       assert.equal(server.requests.length, 0);
     });
+  });
+
+  // -------------------------------------------------------------------------
+  // Explicit cipher/group policy (ssl.ciphers / ssl.ciphersuites /
+  // ssl.ecdhCurve) - compliance-profile knobs mirroring Node's
+  // tls.createSecureContext. Unset, host-OpenSSL defaults apply.
+  // -------------------------------------------------------------------------
+
+  it('ssl.ciphersuites pins the negotiated TLS 1.3 suite', T, async () => {
+    await withTlsServer(
+      ok,
+      { ssl: { ...sslFileOptions(), ciphersuites: 'TLS_CHACHA20_POLY1305_SHA256' } },
+      async (server) => {
+        const client = await openRawTls(server.port);
+        try {
+          assert.equal(client.socket.getProtocol(), 'TLSv1.3');
+          assert.equal(client.socket.getCipher().name, 'TLS_CHACHA20_POLY1305_SHA256');
+          await client.send(`GET / HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`);
+          const res = parseResponse(await client.read());
+          assert.equal(res.status, 200, 'requests must still round-trip on the pinned suite');
+        } finally {
+          client.destroy();
+        }
+      }
+    );
+  });
+
+  it('ssl.ecdhCurve pins the key-share group (HelloRetryRequest path included)', T, async () => {
+    await withTlsServer(
+      ok,
+      { ssl: { ...sslFileOptions(), ecdhCurve: 'P-384' } },
+      async (server) => {
+        const client = await openRawTls(server.port);
+        try {
+          const eph = client.socket.getEphemeralKeyInfo();
+          assert.equal(eph.name, 'secp384r1', 'key exchange must use the pinned group');
+          await client.send(`GET / HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`);
+          const res = parseResponse(await client.read());
+          assert.equal(res.status, 200);
+        } finally {
+          client.destroy();
+        }
+      }
+    );
+  });
+
+  it('invalid ssl.ciphers throws from serve() - config errors are loud, never a lax fallback', T, async () => {
+    assert.throws(
+      () => engine.serve({ onRequest() {} }, { ssl: { ...sslFileOptions(), ciphers: 'NO-SUCH-CIPHER' } }),
+      /ciphers/
+    );
+    assert.throws(
+      () => engine.serve({ onRequest() {} }, { ssl: { ...sslFileOptions(), ecdhCurve: 'not-a-group' } }),
+      /ecdhCurve/
+    );
   });
 
   it('a burst of failed handshakes leaves the server fully healthy', T, async () => {

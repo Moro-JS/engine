@@ -181,6 +181,8 @@ struct Connection {
   uint32_t idleTicks = 0;
   // Request-timeout bookkeeping: incremented each sweep while a request is partially received; NOT reset by activity (slow-drip defense), only when the request completes or the connection goes back to idle keep-alive.
   uint32_t requestTicks = 0;
+  // Write-progress bookkeeping (slow-read defense): incremented each sweep while uv writes are pending, reset whenever one completes (onWrite); the connection is closed once no write completes for the whole responseTimeoutMs budget.
+  uint32_t writeTicks = 0;
 
   ~Connection() {
     delete wsParser;
@@ -265,13 +267,17 @@ class Server {
     if (r != 0) return fail(r);
 
     // Start the idle-connection sweep. Granularity adapts to the configured timeout (capped at 4s, floored at 250ms) so short timeouts still fire promptly while the common 120s default sweeps cheaply. Unref'd so the timer alone never keeps the process alive - the listener (and any active connection) does that.
-    if ((limits_.idleTimeoutMs > 0 || limits_.requestTimeoutMs > 0) &&
+    if ((limits_.idleTimeoutMs > 0 || limits_.requestTimeoutMs > 0 ||
+         limits_.responseTimeoutMs > 0) &&
         !sweepActive_) {
       // Granularity follows the shortest enabled timeout.
       uint64_t shortest = limits_.idleTimeoutMs;
       if (limits_.requestTimeoutMs > 0 &&
           (shortest == 0 || limits_.requestTimeoutMs < shortest))
         shortest = limits_.requestTimeoutMs;
+      if (limits_.responseTimeoutMs > 0 &&
+          (shortest == 0 || limits_.responseTimeoutMs < shortest))
+        shortest = limits_.responseTimeoutMs;
       uint64_t half = shortest / 2;
       sweepMs_ = half < 250 ? 250 : (half > 4000 ? 4000 : half);
       sweepTimer_.data = this;
@@ -599,6 +605,9 @@ class Server {
         extensions = &h.value;
     }
     if (!hasUpgrade || !hasConnUpgrade || !key || !ver13) return 0;
+    // RFC 6455 §4.1: the key must be the base64 of a 16-byte nonce; refuse
+    // malformed/probing clients before the accept-key computation (§4.2.1).
+    if (!isValidWsKey(*key)) return 0;
 
     // permessage-deflate negotiation (RFC 7692), opt-in via options.wsDeflate.
     std::string extResp;
@@ -883,6 +892,17 @@ class Server {
       c->pendingWrites--;
       delete wr;
       abortConnection(c);
+      return;
+    }
+    // Opt-in outbound hard cap (responseBackpressureLimit) - the HTTP mirror
+    // of wsBackpressureLimit: a peer that lets queued response bytes pile
+    // past the cap is shed immediately instead of holding WriteReq buffers
+    // until the responseTimeoutMs deadline. WS frames are governed by
+    // wsBackpressureLimit in wsSend/the Ping path instead.
+    if (limits_.responseBackpressureLimit && !c->isWebSocket &&
+        uv_stream_get_write_queue_size(reinterpret_cast<uv_stream_t*>(
+            &c->handle)) > limits_.responseBackpressureLimit) {
+      doClose(c);
     }
   }
 
@@ -892,6 +912,7 @@ class Server {
     bool terminal = wr->terminal;
     delete wr;
     c->pendingWrites--;
+    c->writeTicks = 0;  // a write completed: the drain is making progress
 
     if (status != 0) {
       c->server->abortConnection(c);
@@ -1318,21 +1339,43 @@ class Server {
     if (cb) cb(user);
   }
 
-  // Periodic sweep enforcing the two receive timeouts. WebSocket connections are exempt (they legitimately idle between messages; RFC 6455 ping/pong or the app's own idle policy governs them), as are connections whose request is surfaced to a handler (response time is the app's business).
+  // Periodic sweep enforcing the two receive timeouts and the response-delivery deadline. WebSocket connections are exempt from the receive timeouts (they legitimately idle between messages; RFC 6455 ping/pong or the app's own idle policy governs them), as are connections whose request is surfaced to a handler (response time is the app's business) - but NOT from the delivery deadline below.
   //  - idleTimeoutMs: no bytes at all for the window -> hard close.
   //  - requestTimeoutMs: one request has been arriving for longer than the
   //    budget, however slowly -> 408 + close (slow-drip slowloris defense;
   //    idleTicks alone is defeated by one byte per idle window).
+  //  - responseTimeoutMs: queued outbound bytes have made no progress for the
+  //    whole budget -> hard close (slow-read defense, see below).
   static void onSweep(uv_timer_t* timer) {
     Server* s = static_cast<Server*>(timer->data);
     const uint32_t idleLimit = static_cast<uint32_t>(
         (s->limits_.idleTimeoutMs + s->sweepMs_ - 1) / s->sweepMs_);
     const uint32_t reqLimit = static_cast<uint32_t>(
         (s->limits_.requestTimeoutMs + s->sweepMs_ - 1) / s->sweepMs_);
+    const uint32_t respLimit = static_cast<uint32_t>(
+        (s->limits_.responseTimeoutMs + s->sweepMs_ - 1) / s->sweepMs_);
     std::vector<Connection*> stale;
     std::vector<Connection*> overdue;
+    std::vector<Connection*> stalled;
     for (Connection* c : s->conns_) {
-      if (c->closing || c->isWebSocket || c->active) continue;
+      if (c->closing) continue;
+      // Response-delivery deadline (slow-read DoS defense). The `active`
+      // exemption below is right for a handler that hasn't answered yet, but
+      // once bytes are QUEUED the engine owns them: a peer that stops reading
+      // (or pins a zero TCP receive window) would otherwise hold its WriteReq
+      // buffers, kernel socket buffers, and fd forever - active never clears
+      // because the terminal write never flushes, so BOTH receive timeouts
+      // skip it permanently. writeTicks resets on every completed write
+      // (onWrite), so a slow-but-draining peer lives; only a fully stalled
+      // drain is shed. Applies to WebSockets too: a stalled consumer under
+      // wsBackpressureLimit that the app stops sending to is otherwise held
+      // forever, and a stalled Close-frame flush (closeAfterFlush) likewise.
+      if (s->limits_.responseTimeoutMs && c->pendingWrites > 0 &&
+          ++c->writeTicks >= respLimit) {
+        stalled.push_back(c);
+        continue;
+      }
+      if (c->isWebSocket || c->active) continue;
       if (s->limits_.idleTimeoutMs && ++c->idleTicks >= idleLimit) {
         stale.push_back(c);
         continue;
@@ -1353,6 +1396,8 @@ class Server {
       if (c->tls && !c->tls->handshakeDone()) s->doClose(c);
       else s->sendErrorAndClose(c, 408);
     }
+    // The peer isn't reading, so no error response can reach it: hard close.
+    for (Connection* c : stalled) s->doClose(c);
   }
 
   uv_loop_t* loop_;

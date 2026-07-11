@@ -414,6 +414,30 @@ describe('@morojs/engine RFC 6455 WebSocket conformance', { skip }, () => {
     }
   });
 
+  it('handshake rejection: malformed Sec-WebSocket-Key (not 16-byte base64) is NOT upgraded', T, async () => {
+    // RFC 6455 §4.1: the key must be the base64 of a 16-byte nonce - exactly
+    // 24 bytes, 22 alphabet chars + "==". Anything else is refused (§4.2.1).
+    const badKeys = [
+      'short',                          // wrong length
+      'x'.repeat(24),                   // 24 bytes but no "==" padding
+      'dGhlIHNhbXBsZSBub25jZQ=',        // 23 bytes (truncated)
+      'dGhlIHNhbXBsZSBub25jZQ==x',      // 25 bytes
+      '!!!!!!!!!!!!!!!!!!!!!!==',       // padding right, alphabet wrong
+    ];
+    for (const bad of badKeys) {
+      const client = await openWs(server.port);
+      try {
+        const { req } = upgradeRequest('/', { key: bad });
+        await client.send(req);
+        const head = parseHead(await client.readHandshake());
+        assert.notEqual(head.status, 101, `key ${JSON.stringify(bad)} must not be upgraded`);
+        assert.equal(head.status, 400, 'engine fixture answers a non-upgrade with 400');
+      } finally {
+        client.destroy();
+      }
+    }
+  });
+
   it('handshake rejection: Sec-WebSocket-Version != 13 is NOT upgraded (no 101)', T, async () => {
     const client = await openWs(server.port);
     try {

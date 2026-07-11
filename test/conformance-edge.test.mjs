@@ -168,11 +168,20 @@ describe('@morojs/engine HTTP/1.1 conformance — edge cases', { skip }, () => {
     });
   });
 
-  it('no headers at all (request line + blank line only): engine is lenient and serves it', T, async () => {
-    await withServer(echoPath, async ({ port }) => {
-      // No Host header — HTTP/1.1 technically requires it, but the engine is lenient.
+  it('no headers at all (request line + blank line only): HTTP/1.1 without Host is 400 (RFC 9112 §3.2)', T, async () => {
+    await withServer(echoPath, async ({ port, requests }) => {
       const res = parseResponse(
-        await rawRequest(port, `GET /bare HTTP/1.1${CRLF}${CRLF}`, { until: responsesComplete(1) })
+        await rawRequest(port, `GET /bare HTTP/1.1${CRLF}${CRLF}`, { expectClose: true })
+      );
+      assert.equal(res.status, 400);
+      assert.equal(requests.length, 0, 'the handler must never see a Host-less HTTP/1.1 request');
+    });
+  });
+
+  it('HTTP/1.0 request line + blank line only: served — Host predates HTTP/1.1', T, async () => {
+    await withServer(echoPath, async ({ port }) => {
+      const res = parseResponse(
+        await rawRequest(port, `GET /bare HTTP/1.0${CRLF}${CRLF}`, { expectClose: true })
       );
       assert.equal(res.status, 200);
       assert.equal(res.body, 'echo:/bare');

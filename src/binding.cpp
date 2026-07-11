@@ -86,13 +86,22 @@ static void freeJsServer(void* user) {
 
 // ---- helpers ----
 
+// ToLocal with an empty-string fallback, not ToLocalChecked: NewFromUtf8
+// fails only past V8's string-length cap (~512MB, reachable when an operator
+// raises a size limit that far) or under allocation pressure - degrade to an
+// empty string instead of aborting the whole Node process.
 static Local<String> str(Isolate* iso, const std::string& s) {
-  return String::NewFromUtf8(iso, s.c_str(), v8::NewStringType::kNormal,
-                             static_cast<int>(s.size()))
-      .ToLocalChecked();
+  Local<String> out;
+  if (String::NewFromUtf8(iso, s.c_str(), v8::NewStringType::kNormal,
+                          static_cast<int>(s.size()))
+          .ToLocal(&out))
+    return out;
+  return String::Empty(iso);
 }
 static Local<String> str(Isolate* iso, const char* s) {
-  return String::NewFromUtf8(iso, s).ToLocalChecked();
+  Local<String> out;
+  if (String::NewFromUtf8(iso, s).ToLocal(&out)) return out;
+  return String::Empty(iso);
 }
 
 // Borrowed, zero-copy view of a JS value's bytes (string | ArrayBuffer |
@@ -354,9 +363,20 @@ static void cbOnWsMessage(void* user, Connection* c, const char* data,
     if (len) memcpy(ab->Data(), data, len);
     payload = ab;
   } else {
-    payload = String::NewFromUtf8(iso, data, v8::NewStringType::kNormal,
-                                  static_cast<int>(len))
-                  .ToLocalChecked();
+    Local<String> text;
+    if (!String::NewFromUtf8(iso, data, v8::NewStringType::kNormal,
+                             static_cast<int>(len))
+             .ToLocal(&text)) {
+      // Payload exceeds V8's string cap (an operator raised wsMaxMessageSize
+      // past ~512MB) or allocation failed: drop the message rather than
+      // abort the process (ToLocalChecked) or deliver a truncated lie.
+      fprintf(stderr,
+              "[morojs-engine] dropping %zu-byte text message: exceeds V8 "
+              "string limits\n",
+              len);
+      return;
+    }
+    payload = text;
   }
   Local<Value> argv[3] = {Integer::NewFromUnsigned(iso, c->wsId), payload,
                           v8::Boolean::New(iso, isBinary)};
@@ -413,19 +433,29 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
     // Numeric option -> size_t field. minValue guards fields where 0 (or a
     // negative after coercion) would be nonsense rather than a policy - e.g.
     // maxHeadSize 0 would 431 every request, writeHighWaterMark 0 would
-    // report every write as backpressured.
+    // report every write as backpressured. kMaxLimit is a defensive upper
+    // clamp (2^48 ≈ 256 TiB, far past any real configuration): a double above
+    // 2^64 is UNDEFINED to cast to size_t, and even representable huge values
+    // would overflow limit sums like maxHeadSize + maxBodySize (server.h) or
+    // body.size() + chunkRemaining_ (http_parser.h). NaN fails d >= minValue
+    // and is ignored like any other non-value.
+    constexpr double kMaxLimit = 281474976710656.0;  // 2^48
     auto getNum = [&](const char* name, size_t& out, double minValue) {
       Local<Value> v;
       if (opts->Get(ctx, str(iso, name)).ToLocal(&v) && v->IsNumber()) {
         double d = v->NumberValue(ctx).FromMaybe(-1);
+        if (d > kMaxLimit) d = kMaxLimit;
         if (d >= minValue) out = static_cast<size_t>(d);
       }
     };
     getNum("maxBodySize", limits.maxBodySize, 0);
     getNum("maxHeadSize", limits.maxHeadSize, 1);
     getNum("maxHeaders", limits.maxHeaders, 1);
+    getNum("maxUriSize", limits.maxUriSize, 0);
     getNum("idleTimeoutMs", limits.idleTimeoutMs, 0);
     getNum("requestTimeoutMs", limits.requestTimeoutMs, 0);
+    getNum("responseTimeoutMs", limits.responseTimeoutMs, 0);
+    getNum("responseBackpressureLimit", limits.responseBackpressureLimit, 0);
     getNum("maxConnections", limits.maxConnections, 0);
     getNum("maxPendingBytes", limits.maxPendingBytes, 0);
     getNum("wsMaxMessageSize", limits.wsMaxMessageSize, 1);
@@ -463,6 +493,7 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
           Local<Value> v;
           if (wo->Get(ctx, str(iso, name)).ToLocal(&v) && v->IsNumber()) {
             double d = v->NumberValue(ctx).FromMaybe(-1);
+            if (d > kMaxLimit) d = kMaxLimit;  // same UB/overflow clamp as getNum
             if (d >= 0) out = static_cast<size_t>(d);
           }
         };
@@ -519,6 +550,11 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
         return;
       }
       getStr("passphrase", ssl.passphrase);
+      // Optional cipher/group policy (compliance profiles); validated in
+      // TlsContext::init, config errors throw from serve().
+      getStr("ciphers", ssl.ciphers);
+      getStr("ciphersuites", ssl.ciphersuites);
+      getStr("ecdhCurve", ssl.ecdhCurve);
       std::string minVer;
       getStr("minVersion", minVer);
       if (minVer == "TLSv1.3") ssl.minVersion = TLS1_3_VERSION;
@@ -599,8 +635,11 @@ static void Listen(const FunctionCallbackInfo<Value>& args) {
                       " (" + (uvErr ? uv_strerror(uvErr) : "bind/listen failed") + ")";
     Local<Value> err = v8::Exception::Error(str(iso, msg));
     Local<Object> errObj = err.As<Object>();
-    errObj->Set(ctx, str(iso, "code"), str(iso, name)).Check();
-    errObj->Set(ctx, str(iso, "errno"), Integer::New(iso, uvErr)).Check();
+    // FromMaybe, not Check: attaching diagnostic properties must never abort
+    // the process (Check() hard-aborts if the Set fails, e.g. under
+    // allocation pressure); the Error is thrown either way.
+    (void)errObj->Set(ctx, str(iso, "code"), str(iso, name)).FromMaybe(false);
+    (void)errObj->Set(ctx, str(iso, "errno"), Integer::New(iso, uvErr)).FromMaybe(false);
     iso->ThrowException(err);
     return;
   }
@@ -648,8 +687,10 @@ static void GetHeaders(const FunctionCallbackInfo<Value>& args) {
   Local<Array> arr = Array::New(iso, static_cast<int>(c->headers.size() * 2));
   uint32_t idx = 0;
   for (const auto& h : c->headers) {
-    arr->Set(ctx, idx++, str(iso, h.name)).Check();
-    arr->Set(ctx, idx++, str(iso, h.value)).Check();
+    // FromMaybe, not Check: a failed Set under allocation pressure yields a
+    // hole in the array instead of aborting the whole Node process.
+    (void)arr->Set(ctx, idx++, str(iso, h.name)).FromMaybe(false);
+    (void)arr->Set(ctx, idx++, str(iso, h.value)).FromMaybe(false);
   }
   args.GetReturnValue().Set(arr);
 }
@@ -799,7 +840,7 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   Local<Context> ctx = iso->GetCurrentContext();
   Local<Object> result = Object::New(iso);
   auto set = [&](const char* k, Local<Value> v) {
-    result->Set(ctx, str(iso, k), v).Check();
+    (void)result->Set(ctx, str(iso, k), v).FromMaybe(false);
   };
   set("ok", v8::Boolean::New(iso, true));
   set("version", str(iso, kEngineVersion));
@@ -819,12 +860,17 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   // Feature flags for consumers (MoroJS) to gate option passing on, instead of version-sniffing. Flip as each capability ships: tls (M3/E2), http2 (E4), wsDeflate (E5). "limits" = the full serve() limit surface (maxHeadSize/maxHeaders/ws*/writeHighWaterMark/backlog) is parsed.
   Local<Object> caps = Object::New(iso);
   auto setCap = [&](const char* k, bool v) {
-    caps->Set(ctx, str(iso, k), v8::Boolean::New(iso, v)).Check();
+    (void)caps->Set(ctx, str(iso, k), v8::Boolean::New(iso, v)).FromMaybe(false);
   };
   setCap("limits", true);
   setCap("tls", true);
   setCap("http2", false);
   setCap("wsDeflate", true);
+  // Hardening surface: responseTimeoutMs / responseBackpressureLimit /
+  // maxUriSize serve options are parsed.
+  setCap("responseLimits", true);
+  // ssl.ciphers / ssl.ciphersuites / ssl.ecdhCurve are parsed.
+  setCap("tlsPolicy", true);
   set("capabilities", caps);
   args.GetReturnValue().Set(result);
 }
@@ -853,7 +899,8 @@ static void Initialize(Local<Object> exports, Local<Value> module,
 
   // Context::GetIsolate() was removed in V8 14 (Node 26); GetCurrent() is stable
   Isolate* iso = Isolate::GetCurrent();
-  exports->Set(context, str(iso, "version"), str(iso, kEngineVersion)).Check();
+  (void)exports->Set(context, str(iso, "version"), str(iso, kEngineVersion))
+      .FromMaybe(false);
   (void)module;
 }
 

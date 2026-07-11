@@ -188,6 +188,23 @@ static void testHandshake() {
   std::printf("ok  handshake accept key (RFC 6455 section 1.3 example)\n");
 }
 
+static void testWsKeyValidation() {
+  // §4.1: the key is the base64 of a 16-byte nonce - exactly 24 bytes,
+  // 22 alphabet chars + "==" padding.
+  CHECK(isValidWsKey("dGhlIHNhbXBsZSBub25jZQ=="));    // RFC 6455 §1.3 example
+  CHECK(isValidWsKey("AAAAAAAAAAAAAAAAAAAAAA=="));
+  CHECK(isValidWsKey("a1+/a1+/a1+/a1+/a1+/a1=="));    // alphabet incl. + and /
+  CHECK(!isValidWsKey(""));                           // empty
+  CHECK(!isValidWsKey("short"));                      // wrong length
+  CHECK(!isValidWsKey("dGhlIHNhbXBsZSBub25jZQ="));    // 23 bytes
+  CHECK(!isValidWsKey("dGhlIHNhbXBsZSBub25jZQ===")); // 25 bytes
+  CHECK(!isValidWsKey("dGhlIHNhbXBsZSBub25jZQAA"));   // missing "==" padding
+  CHECK(!isValidWsKey("dGhlIHNhbXBsZSBub2 jZQ=="));   // space mid-key
+  CHECK(!isValidWsKey("dGhlIHNhbXBsZSBub25j-Q=="));   // '-' not in base64
+  CHECK(!isValidWsKey("\001GhlIHNhbXBsZSBub25jZQ=="));  // control byte
+  std::printf("ok  Sec-WebSocket-Key shape validation (section 4.1)\n");
+}
+
 // ---------------------------------------------------------------------------
 // Encoder wire format (§5.2 length encodings)
 // ---------------------------------------------------------------------------
@@ -904,6 +921,7 @@ int main() {
   testSha1();
   testBase64();
   testHandshake();
+  testWsKeyValidation();
   testEncoderWireFormat();
   testKnownMaskedVector();
   testRoundTrips();

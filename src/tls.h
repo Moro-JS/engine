@@ -55,6 +55,12 @@ struct SslConfig {
 
   std::string passphrase;   // decrypts an encrypted private key
   std::string ticketKeys;   // 48-byte session-ticket key material (Node layout)
+  // Optional explicit cipher/group policy for compliance baselines
+  // (PCI/FIPS/hardened profiles); empty = the host Node's OpenSSL defaults.
+  // Mirrors Node's tls.createSecureContext knobs of the same names.
+  std::string ciphers;      // TLS <= 1.2 cipher list (SSL_CTX_set_cipher_list)
+  std::string ciphersuites; // TLS 1.3 suites (SSL_CTX_set_ciphersuites)
+  std::string ecdhCurve;    // key-share groups (SSL_CTX_set1_groups_list); "auto" = default
   int minVersion = TLS1_2_VERSION;
   bool requestCert = false;         // ask the client for a certificate
   bool rejectUnauthorized = true;   // fail the handshake when it doesn't verify
@@ -175,6 +181,24 @@ class TlsContext {
     // let SSL_write report partial progress so large responses never stall.
     SSL_CTX_set_mode(ctx_, SSL_MODE_RELEASE_BUFFERS | SSL_MODE_ENABLE_PARTIAL_WRITE |
                                SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+
+    // Optional explicit cipher/group policy (ssl.ciphers / ssl.ciphersuites /
+    // ssl.ecdhCurve). Unset, the host Node's OpenSSL defaults apply. Config
+    // errors are LOUD, same as bad key material - a server that silently
+    // ignored its compliance profile would be worse than one that won't boot.
+    if (!cfg.ciphers.empty() &&
+        SSL_CTX_set_cipher_list(ctx_, cfg.ciphers.c_str()) != 1) {
+      return sslError(("ssl.ciphers '" + cfg.ciphers + "' selects no cipher").c_str());
+    }
+    if (!cfg.ciphersuites.empty() &&
+        SSL_CTX_set_ciphersuites(ctx_, cfg.ciphersuites.c_str()) != 1) {
+      return sslError(("ssl.ciphersuites '" + cfg.ciphersuites + "' is invalid").c_str());
+    }
+    // "auto" = OpenSSL's built-in group preference (Node accepts it too).
+    if (!cfg.ecdhCurve.empty() && cfg.ecdhCurve != "auto" &&
+        SSL_CTX_set1_groups_list(ctx_, cfg.ecdhCurve.c_str()) != 1) {
+      return sslError(("ssl.ecdhCurve '" + cfg.ecdhCurve + "' is invalid").c_str());
+    }
 
     SSL_CTX_set_default_passwd_cb(ctx_, passwdCb);
     SSL_CTX_set_default_passwd_cb_userdata(ctx_, &passphrase_);
@@ -304,6 +328,10 @@ class TlsContext {
     const unsigned char* server = self->alpnH2_ ? kH2Http11 : kHttp11;
     unsigned int serverLen = self->alpnH2_ ? sizeof(kH2Http11) : sizeof(kHttp11);
     unsigned char* selected = nullptr;
+    // CVE-2024-5535 guard: `selected` is meaningful ONLY when the return is
+    // OPENSSL_NPN_NEGOTIATED. On any other return (notably an empty client
+    // list) it may point at stale memory - never read it, never copy it into
+    // *out; keep the NOACK fallback below on every non-negotiated path.
     if (SSL_select_next_proto(&selected, outlen, server, serverLen, in, inlen) ==
         OPENSSL_NPN_NEGOTIATED) {
       *out = selected;

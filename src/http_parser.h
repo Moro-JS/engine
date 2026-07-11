@@ -59,10 +59,18 @@ struct HttpLimits {
   size_t maxHeadSize = 64 * 1024;  // request line + all headers
   size_t maxHeaders = 100;
   size_t maxBodySize = 10 * 1024 * 1024;
+  // Dedicated request-target (URI) length cap, answered with 414 (RFC 9110
+  // §15.5.15). 0 = no dedicated cap: maxHeadSize still bounds the whole head
+  // (431), so this is opt-in RFC-accurate signaling, not a required defense.
+  size_t maxUriSize = 0;
   // Close a connection after this many ms with no bytes received while not actively running a handler (slowloris defense + keep-alive reuse cap). 0 disables the idle timeout.
   size_t idleTimeoutMs = 120000;
   // Budget for receiving one complete request (head + body), measured from its first byte. Unlike idleTimeoutMs this does NOT reset on activity, so a slow-drip client trickling one byte per idle window is still bounded (slowloris defense; the equivalent of Node's server.requestTimeout, and the same 300s default). Expiry answers 408 and closes. 0 disables.
   size_t requestTimeoutMs = 300000;
+  // Budget for DELIVERING queued outbound bytes: while uv writes are pending, sweep ticks accumulate and reset whenever a write completes, so any genuine drain progress keeps the connection alive but a peer that stops reading (zero receive window) is closed once no write completes for the whole budget (slow-read DoS defense - the response-side mirror of requestTimeoutMs). 0 disables.
+  size_t responseTimeoutMs = 300000;
+  // Hard cap on a connection's not-yet-flushed HTTP outbound queue; exceeding it closes the connection immediately (the HTTP mirror of wsBackpressureLimit). 0 = unlimited - a single large respond() legitimately queues its whole body, so the cap is opt-in for deployments that bound response sizes.
+  size_t responseBackpressureLimit = 0;
   // Max simultaneous connections; new accepts beyond this are dropped immediately (backpressure against connection floods). 0 = unlimited.
   size_t maxConnections = 0;
   // Cap on bytes buffered for a single connection while its response is in flight (pipelined-request flood defense). 0 = use maxHeadSize + maxBodySize.
@@ -98,7 +106,7 @@ class HttpParser {
   std::string body;
   bool keepAlive = true;
 
-  // When ParseStatus::Error is returned, the status to send back before closing the connection (400, 413, 431, 501, 505).
+  // When ParseStatus::Error is returned, the status to send back before closing the connection (400, 413, 414, 431, 505).
   int errorStatus = 400;
 
   // Feed newly received bytes. Consumes from an internal accumulation buffer; callers append to inbound() or pass data here. Returns the parse status; on Complete, bytesConsumed() tells how many bytes of the input formed this request (the remainder is a pipelined follow-up request).
@@ -274,6 +282,23 @@ inline bool HttpParser::parseRequestLine(std::string_view line) {
     if (!isTokenChar(static_cast<unsigned char>(c))) return false;
   }
 
+  // Request-target hygiene (RFC 9112 §3.2 / RFC 3986): reject raw control
+  // bytes. Only the line-terminating CRLF is stripped by the caller, so a
+  // bare CR, NUL, any other C0 byte, or DEL would otherwise reach the app
+  // verbatim in path/query - log-injection and downstream-desync fodder.
+  // Policy notes: high bytes (0x80+) are tolerated (raw UTF-8 paths, matching
+  // Node), and absolute-form / authority-form targets pass through opaquely
+  // (RFC 9112 §3.2.2 requires accepting absolute-form; routing on it is the
+  // app's / fronting proxy's business, again matching Node).
+  for (char c : t) {
+    const unsigned char u = static_cast<unsigned char>(c);
+    if (u < 0x20 || u == 0x7f) return false;  // errorStatus stays 400
+  }
+  if (limits_.maxUriSize && t.size() > limits_.maxUriSize) {
+    errorStatus = 414;
+    return false;
+  }
+
   method = methodFrom(m);
   if (method == Method::OTHER) methodStr.assign(m);
 
@@ -315,6 +340,15 @@ inline bool HttpParser::parseHeaderLine(std::string_view line) {
   }
 
   std::string_view value = trimOWS(line.substr(colon + 1));
+  // Field-value byte discipline (RFC 9110 §5.5: VCHAR / SP / HTAB /
+  // obs-text). A bare CR, NUL, or other C0 byte in a value would be handed
+  // to the app verbatim (only the line-terminating CRLF is stripped) - the
+  // inbound twin of the response-side validHeaderValue filter. obs-text
+  // (0x80+) stays allowed, matching Node.
+  for (char c : value) {
+    const unsigned char u = static_cast<unsigned char>(c);
+    if ((u < 0x20 && u != '\t') || u == 0x7f) return false;
+  }
 
   // Reuse a slot (and its strings' heap capacities) from a previous request when one is available - header parsing is allocation-free on a warm keep-alive connection.
   if (headerCount_ < headers.size()) {
@@ -340,6 +374,22 @@ inline bool HttpParser::parseHeaderLine(std::string_view line) {
 }
 
 inline bool HttpParser::finalizeHeaders() {
+  // Host discipline (RFC 9112 §3.2): an HTTP/1.1 request MUST carry exactly
+  // one Host header - answer 400 to zero (1.1+ only; 1.0 predates Host) or
+  // more than one (any version). Absent/duplicate Host is a building block
+  // for host-confusion and cache-poisoning when the app or a fronting proxy
+  // routes on it; the parser is the one place that can reject it before any
+  // routing sees the request. Node's http server enforces the same
+  // (requireHostHeader, default on).
+  size_t hostCount = 0;
+  for (const auto& h : headers) {
+    if (h.name == "host") ++hostCount;
+  }
+  if (hostCount > 1 || (hostCount == 0 && minorVersion >= 1)) {
+    errorStatus = 400;
+    return false;
+  }
+
   // Connection handling (RFC 9110 §7.6.1). The field is a comma-separated list of connection options; tokenize every Connection header so "keep-alive, close" or "close, foo" are honored. A "close" token anywhere wins over "keep-alive"; otherwise a "keep-alive" token overrides the version default.
   bool sawClose = false, sawKeepAlive = false;
   for (const auto& h : headers) {

@@ -43,6 +43,23 @@ inline std::string computeAcceptKey(std::string_view secWebSocketKey) {
   return base64(digest, sizeof(digest));
 }
 
+// §4.1 handshake requirement 7: |Sec-WebSocket-Key| is the base64 encoding of
+// a 16-byte nonce - exactly 24 bytes on the wire: 22 base64-alphabet chars
+// followed by "==" padding. The accept-key math is well-defined for any input,
+// so this is early rejection of malformed/probing clients (§4.2.1 requires
+// refusing a handshake whose requirements aren't met), not a safety need.
+// (Canonical zero low-bits of the 22nd char are deliberately not enforced.)
+inline bool isValidWsKey(std::string_view key) {
+  if (key.size() != 24) return false;
+  for (size_t i = 0; i < 22; ++i) {
+    const char c = key[i];
+    const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || c == '+' || c == '/';
+    if (!ok) return false;
+  }
+  return key[22] == '=' && key[23] == '=';
+}
+
 // Builds the complete server handshake response head per §4.2.2 step 5:
 // a 101 status line plus Upgrade, Connection, and Sec-WebSocket-Accept
 // headers. An optional Sec-WebSocket-Extensions value accepts a negotiated

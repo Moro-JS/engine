@@ -26,6 +26,7 @@ import {
   parseResponses,
   responsesComplete,
   delay,
+  waitFor,
 } from './helpers.mjs';
 
 const engine = await loadEngine();
@@ -433,5 +434,250 @@ describe('@morojs/engine hardening conformance', { skip }, () => {
     } finally {
       engine.close(serverId);
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // Host header discipline (RFC 9112 §3.2)
+  // -------------------------------------------------------------------------
+
+  it('HTTP/1.1 without a Host header: 400 + close, handler never invoked', T, async () => {
+    await withServer((ctx) => ctx.respond(200, null, 'x'), async ({ port, requests }) => {
+      const raw = await rawRequest(port, `GET /x HTTP/1.1${CRLF}X-Other: 1${CRLF}${CRLF}`, {
+        expectClose: true,
+      });
+      assert.equal(parseResponse(raw).status, 400);
+      assert.equal(requests.length, 0, 'a Host-less HTTP/1.1 request must never reach routing');
+    });
+  });
+
+  it('duplicate Host headers: 400 + close, handler never invoked (host-confusion defense)', T, async () => {
+    await withServer((ctx) => ctx.respond(200, null, 'x'), async ({ port, requests }) => {
+      const raw = await rawRequest(
+        port,
+        `GET /x HTTP/1.1${CRLF}Host: a${CRLF}Host: b${CRLF}${CRLF}`,
+        { expectClose: true }
+      );
+      assert.equal(parseResponse(raw).status, 400);
+      assert.equal(requests.length, 0);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Request-target and header-value byte hygiene
+  // -------------------------------------------------------------------------
+
+  it('raw control byte in the request target: 400, handler never sees it (log-injection defense)', T, async () => {
+    await withServer((ctx) => ctx.respond(200, null, ctx.path), async ({ port, requests }) => {
+      for (const target of ['/a\x01b', '/a\x7fb', '/a\rb', '/q?x=\x02']) {
+        const raw = await rawRequest(port, `GET ${target} HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`, {
+          expectClose: true,
+        });
+        assert.equal(parseResponse(raw).status, 400, `target ${JSON.stringify(target)} must be rejected`);
+      }
+      assert.equal(requests.length, 0);
+    });
+  });
+
+  it('raw UTF-8 high bytes in the target are still served (lenient like Node)', T, async () => {
+    await withServer((ctx) => ctx.respond(200, null, ctx.path), async ({ port }) => {
+      // openRaw sends latin1, so \xc3\xa9 goes out as the raw UTF-8 of é
+      const raw = await rawRequest(port, `GET /caf\xc3\xa9 HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`);
+      const res = parseResponse(raw);
+      assert.equal(res.status, 200);
+      assert.equal(Buffer.from(res.body, 'latin1').toString('utf8'), '/café');
+    });
+  });
+
+  it('raw control byte in an inbound header value: 400 (inbound twin of the response-splitting filter)', T, async () => {
+    await withServer((ctx) => ctx.respond(200, null, 'x'), async ({ port, requests }) => {
+      const raw = await rawRequest(
+        port,
+        `GET / HTTP/1.1${CRLF}Host: t${CRLF}X-Bad: v\x01v${CRLF}${CRLF}`,
+        { expectClose: true }
+      );
+      assert.equal(parseResponse(raw).status, 400);
+      assert.equal(requests.length, 0);
+    });
+  });
+
+  it('HTAB inside a header value stays legal (RFC 9110 §5.5)', T, async () => {
+    await withServer((ctx) => ctx.respond(200, null, ctx.header('x-ok') ?? ''), async ({ port }) => {
+      const raw = await rawRequest(port, `GET / HTTP/1.1${CRLF}Host: t${CRLF}X-Ok: a\tb${CRLF}${CRLF}`);
+      const res = parseResponse(raw);
+      assert.equal(res.status, 200);
+      assert.equal(res.body, 'a\tb');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // maxUriSize (opt-in 414)
+  // -------------------------------------------------------------------------
+
+  it('maxUriSize: a target over the cap answers 414; at the cap is served', T, async () => {
+    await withServer(
+      (ctx) => ctx.respond(200, null, 'ok'),
+      { maxUriSize: 64 },
+      async ({ port }) => {
+        const at = '/' + 'a'.repeat(63); // exactly 64
+        const okRes = parseResponse(
+          await rawRequest(port, `GET ${at} HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`)
+        );
+        assert.equal(okRes.status, 200);
+
+        const over = parseResponse(
+          await rawRequest(port, `GET ${at}a HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`, {
+            expectClose: true,
+          })
+        );
+        assert.equal(over.status, 414);
+      }
+    );
+  });
+
+  it('no dedicated URI cap by default: a 2KB target is served (bounded only by maxHeadSize)', T, async () => {
+    await withServer((ctx) => ctx.respond(200, null, 'ok'), async ({ port }) => {
+      const raw = await rawRequest(
+        port,
+        `GET /${'b'.repeat(2048)} HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`
+      );
+      assert.equal(parseResponse(raw).status, 200);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Slow-read response DoS (response-delivery deadline + opt-in outbound cap).
+  // The receive side has always been swept; these pin down the delivery side:
+  // a client that takes its response too slowly (or never) must not hold
+  // WriteReq buffers, kernel buffers, and an fd forever.
+  // -------------------------------------------------------------------------
+
+  // Far past loopback socket buffering, so a non-reading peer leaves the bulk
+  // of the response queued in libuv and the terminal write never completes.
+  const BIG = Buffer.alloc(32 * 1024 * 1024, 0x61);
+
+  // Connect, send one GET, and never read the response (paused socket).
+  function connectAndStall(port) {
+    return new Promise((resolve, reject) => {
+      const s = net.connect({ host: '127.0.0.1', port }, () => {
+        s.write(`GET /big HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`, (err) =>
+          err ? reject(err) : resolve(s)
+        );
+      });
+      s.pause(); // zero consumption: the response can never drain
+      s.on('error', () => {}); // RST on shed is expected
+    });
+  }
+
+  it('slow-read defense: a client that never reads its response is shed at the delivery deadline', T, async () => {
+    // Async responder (the MoroJS shape): respond() runs after onRequest
+    // returns, so the response takes the uncorked path and `active` stays set
+    // until the terminal write flushes - the exact state the receive-side
+    // timeouts used to skip forever. The shed must fire onAborted exactly once.
+    await withServer(
+      (ctx) => { setImmediate(() => ctx.respond(200, null, BIG)); },
+      { responseTimeoutMs: 1000 },
+      async ({ port, aborted, requests }) => {
+        const s = await connectAndStall(port);
+        try {
+          await waitFor(() => requests.length === 1, { timeout: 5000, message: 'request not surfaced' });
+          // The response is queued but undeliverable; the sweep must shed the
+          // connection once no write completes for the whole budget.
+          await waitFor(() => aborted.length === 1, {
+            timeout: 15000,
+            message: 'stalled connection was never shed (slow-read DoS)',
+          });
+        } finally {
+          s.destroy();
+        }
+      }
+    );
+  });
+
+  it('slow-read defense: a reader that stalls briefly but resumes before the deadline gets the full response', T, async () => {
+    const body = Buffer.alloc(8 * 1024 * 1024, 0x62);
+    await withServer(
+      (ctx) => { setImmediate(() => ctx.respond(200, null, body)); },
+      { responseTimeoutMs: 3000 },
+      async ({ port, aborted }) => {
+        const got = await new Promise((resolve, reject) => {
+          let buf = Buffer.alloc(0);
+          let expected = -1;
+          const timer = setTimeout(() => {
+            s.destroy();
+            reject(new Error('full response not received'));
+          }, 25000);
+          const s = net.connect({ host: '127.0.0.1', port }, () => {
+            s.write(`GET /big HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`);
+            s.pause();
+            // Stall for 1.2s - under the 3s budget - then drain everything.
+            setTimeout(() => s.resume(), 1200);
+          });
+          s.pause();
+          s.on('data', (d) => {
+            buf = Buffer.concat([buf, d]);
+            if (expected === -1) {
+              const headEnd = buf.indexOf('\r\n\r\n');
+              if (headEnd === -1) return;
+              const m = /content-length: (\d+)/i.exec(buf.subarray(0, headEnd).toString('latin1'));
+              if (!m) return reject(new Error('no content-length'));
+              expected = headEnd + 4 + Number(m[1]);
+            }
+            if (buf.length >= expected) {
+              clearTimeout(timer);
+              s.destroy();
+              resolve(buf.length);
+            }
+          });
+          s.on('error', (err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
+        });
+        assert.ok(got > body.length, 'the full body must arrive');
+        assert.equal(aborted.length, 0, 'a merely-slow reader must NOT be shed');
+      }
+    );
+  });
+
+  it('responseBackpressureLimit (opt-in): outbound bytes past the cap shed the connection immediately', T, async () => {
+    await withServer(
+      (ctx) => { setImmediate(() => ctx.respond(200, null, BIG)); }, // async: uncorked write path
+      { responseBackpressureLimit: 256 * 1024, responseTimeoutMs: 0 }, // deadline off: the cap alone must act
+      async ({ port, aborted }) => {
+        const s = await connectAndStall(port);
+        try {
+          // No sweep involvement - queueing past the cap closes on the spot.
+          await waitFor(() => aborted.length === 1, {
+            timeout: 5000,
+            message: 'over-cap outbound queue was not shed',
+          });
+        } finally {
+          s.destroy();
+        }
+      }
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // Limit clamping: absurd operator values must degrade predictably
+  // -------------------------------------------------------------------------
+
+  it('absurdly large numeric limits are clamped defensively; the server still serves', T, async () => {
+    await withServer(
+      (ctx) => ctx.respond(200, null, ctx.body() ? Buffer.from(ctx.body()) : 'no-body'),
+      {
+        maxBodySize: Number.MAX_VALUE,
+        maxHeadSize: Number.MAX_SAFE_INTEGER,
+        maxPendingBytes: Number.MAX_VALUE,
+        wsMaxMessageSize: Number.MAX_VALUE,
+      },
+      async ({ port }) => {
+        const res = parseResponse(
+          await rawRequest(port, `POST / HTTP/1.1${CRLF}Host: t${CRLF}Content-Length: 5${CRLF}${CRLF}hello`)
+        );
+        assert.equal(res.status, 200);
+        assert.equal(res.body, 'hello');
+      }
+    );
   });
 });

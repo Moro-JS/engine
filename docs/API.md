@@ -21,6 +21,10 @@ serve(callbacks: {
   requestTimeoutMs?: number;   // default 300000; 0 disables. Budget for receiving ONE
                                // complete request from its first byte - does NOT reset
                                // on activity (slow-drip slowloris defense). Expiry: 408 + close.
+  responseTimeoutMs?: number;  // default 300000; 0 disables. Budget for DELIVERING queued
+                               // outbound bytes: resets whenever a write completes, so only a
+                               // drain making NO progress for the whole budget is closed
+                               // (slow-read / zero-window DoS defense; capabilities.responseLimits).
   maxConnections?: number;     // default 0 = unlimited
   maxPendingBytes?: number;    // default maxHeadSize + maxBodySize
   reusePort?: boolean;         // default false. SO_REUSEPORT so several engine instances
@@ -31,6 +35,13 @@ serve(callbacks: {
   // are ignored in favor of the default.
   maxHeadSize?: number;        // default 65536; request line + all headers (431 over)
   maxHeaders?: number;         // default 100 (431 over)
+  maxUriSize?: number;         // default 0 = no dedicated cap (maxHeadSize still bounds the
+                               // head with 431); set to answer 414 for over-long targets
+  responseBackpressureLimit?: number; // default 0 = unlimited. Opt-in hard cap on the
+                               // not-yet-flushed HTTP outbound queue; over it the connection
+                               // is closed immediately (HTTP mirror of wsBackpressureLimit).
+                               // Leave 0 unless response sizes are bounded: one large
+                               // respond() legitimately queues its whole body.
   wsMaxMessageSize?: number;   // default 16MB; reassembled WS message cap (close 1009 over)
   wsBackpressureLimit?: number;// default 1MB; slow WS consumer shed with 1013. 0 = unlimited
   writeHighWaterMark?: number; // default 262144; write()/wsSend() report backpressure above
@@ -47,6 +58,12 @@ serve(callbacks: {
     minVersion?: 'TLSv1.2'|'TLSv1.3';  // default TLSv1.2
     requestCert?: boolean;             // mutual TLS
     rejectUnauthorized?: boolean;      // default true
+    // Explicit cipher/group policy (capabilities.tlsPolicy) for compliance
+    // baselines; unset = the host Node's OpenSSL defaults. Same semantics as
+    // Node's tls.createSecureContext; invalid values THROW from serve().
+    ciphers?: string;                  // TLS <= 1.2 cipher list
+    ciphersuites?: string;             // TLS 1.3 suites (colon-separated)
+    ecdhCurve?: string;                // key-share groups, e.g. 'X25519:P-256'; 'auto' = default
   };
 
   // v1.3.0+ - WebSocket permessage-deflate (RFC 7692; capabilities.wsDeflate).
@@ -93,9 +110,12 @@ isAborted(reqId): boolean;
 // On failure (no binary for this platform/ABI): { ok: false, abi, platform, arch, error }
 // capabilities (absent = all false): feature flags for consumers to
 // gate option passing on instead of version-sniffing:
-//   { limits: boolean, tls: boolean, http2: boolean, wsDeflate: boolean }
+//   { limits: boolean, tls: boolean, http2: boolean, wsDeflate: boolean,
+//     responseLimits: boolean,  // responseTimeoutMs / responseBackpressureLimit / maxUriSize parsed
+//     tlsPolicy: boolean }      // ssl.ciphers / ssl.ciphersuites / ssl.ecdhCurve parsed
 probe(): { ok: boolean, version?: string, abi, platform, arch,
-           capabilities?: { limits: boolean, tls: boolean, http2: boolean, wsDeflate: boolean },
+           capabilities?: { limits: boolean, tls: boolean, http2: boolean, wsDeflate: boolean,
+                            responseLimits: boolean, tlsPolicy: boolean },
            error?: string };
 version: string;
 ```
