@@ -42,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [20, 22, 24]
+        node-version: [20, 22, 24, 26]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -186,7 +186,14 @@ jobs:
           path: build/*.node
 
   linux-musl:
-    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     container: node:24-alpine
     steps:
       - uses: actions/checkout@v4
@@ -194,7 +201,7 @@ jobs:
       - run: node tools/build.mjs --all
       - uses: actions/upload-artifact@v4
         with:
-          name: binaries-linux-x64-musl
+          name: binaries-linux-${{ matrix.arch }}-musl
           path: build/*.node
 
   # Windows (MSVC): build.mjs downloads the per-version node.lib
@@ -225,7 +232,7 @@ jobs:
     strategy:
       matrix:
         os: [macos-14, ubuntu-22.04]
-        node: [20, 22, 24, 25, 26]
+        node: [20, 22, 23, 24, 25, 26]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -243,8 +250,9 @@ jobs:
     needs: [linux-musl]
     strategy:
       matrix:
-        node: [20, 22, 24, 25, 26]
-    runs-on: ubuntu-22.04
+        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+        node: [20, 22, 23, 24, 25, 26]
+    runs-on: ${{ matrix.runner }}
     container: node:${{ matrix.node }}-alpine
     steps:
       - uses: actions/checkout@v4
@@ -260,7 +268,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22, 24, 25, 26]
+        node: [20, 22, 23, 24, 25, 26]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -289,6 +297,26 @@ jobs:
           path: build/
       - run: npm run test:conformance && npm run test:ws-conformance && npm run test:limits && npm run test:tls
 
+  # Full conformance on macOS for the running ABI. The darwin binaries ship to
+  # real users, so at least one darwin leg must run the whole suite (the smoke
+  # matrix above only load-tests). Same Homebrew-LLVM CXX setup as the darwin
+  # build job; same runner flavor as the darwin smoke leg (macos-14 = arm64).
+  conformance-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
+        run: |
+          brew list llvm >/dev/null 2>&1 || brew install llvm
+          echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build engine for this Node ABI
+        run: node tools/build.mjs
+      - name: Smoke + HTTP + WebSocket + limits + TLS + pmd conformance
+        run: npm run test:smoke && npm run test:conformance && npm run test:conformance-edge && npm run test:hardening && npm run test:regression && npm run test:ws-conformance && npm run test:limits && npm run test:tls && npm run test:tls-hardening && npm run test:ws-deflate
+
   # ── Single required gate ────────────────────────────────────────────────────
 
   # The one check branch protection should require. Goes green iff every job
@@ -310,6 +338,7 @@ jobs:
       - smoke-musl
       - smoke-windows
       - conformance-windows
+      - conformance-macos
     runs-on: ubuntu-latest
     steps:
       - name: Verify all jobs passed

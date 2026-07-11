@@ -7,7 +7,8 @@ export interface EngineCapabilities {
   limits: boolean;
   /** In-process TLS termination via ServeOptions.ssl. */
   tls: boolean;
-  /** ALPN-negotiated HTTP/2 alongside HTTP/1.1 via ServeOptions.http2. */
+  /** ALPN-negotiated HTTP/2 alongside HTTP/1.1 — reserved for a future
+   *  release; not yet configurable (no ServeOptions field). */
   http2: boolean;
   /** WebSocket permessage-deflate (RFC 7692) via ServeOptions.wsDeflate. */
   wsDeflate: boolean;
@@ -98,6 +99,11 @@ export interface ServeOptions {
     ca?: string | ArrayBuffer | Uint8Array;
     /** Decrypts an encrypted private key */
     passphrase?: string;
+    /** Session-ticket keys, Node tls.Server-compatible: exactly 48 bytes
+     *  (16-byte key name + 16-byte HMAC secret + 16-byte AES key). Share the
+     *  same buffer across reusePort workers / processes so TLS sessions
+     *  resume across all of them. Rotation is the caller's job. */
+    ticketKeys?: string | ArrayBuffer | Uint8Array;
     /** Protocol floor. Default 'TLSv1.2'. */
     minVersion?: 'TLSv1.2' | 'TLSv1.3';
     /** Request a client certificate (mutual TLS) */
@@ -119,6 +125,15 @@ export interface ServeOptions {
         /** Hard cap on an inflated message (zip-bomb defense).
          *  Default: wsMaxMessageSize. */
         maxDecompressedSize?: number;
+        /** Share ONE server-owned deflate stream (reset per message) across
+         *  all permessage-deflate connections instead of ~262 KB of deflate
+         *  state per connection. Trades per-message compression ratio (no
+         *  cross-message context) for memory; forces
+         *  server_no_context_takeover in the negotiated response (RFC 7692
+         *  §7.1.1.1 permits this even when the client didn't offer it).
+         *  Clients that cap server_max_window_bits below serverMaxWindowBits
+         *  fall back to a per-connection compressor. Default false. */
+        sharedCompressor?: boolean;
       };
 }
 

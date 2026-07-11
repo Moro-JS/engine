@@ -32,11 +32,15 @@ export function sslInlineOptions() {
 /**
  * Open a raw TLS client to 127.0.0.1:port, trusting the fixture CA.
  * Resolves (after the handshake) to the raw-client contract plus `.socket`
- * for alpnProtocol/authorized inspection.
+ * for alpnProtocol/authorized inspection, plus `.waitSession()` which
+ * resolves with the first session ticket the server delivers (TLS 1.3 sends
+ * NewSessionTicket AFTER the handshake, so the listener is attached before
+ * connecting to make the capture race-free).
  *
- * opts: { alpnProtocols?, servername = 'localhost', rejectUnauthorized = true, ca? }
+ * opts: { alpnProtocols?, servername = 'localhost', rejectUnauthorized = true,
+ *         ca?, session? (a previously captured ticket, to attempt resumption) }
  */
-export function openRawTls(port, opts = {}) {
+export async function openRawTls(port, opts = {}) {
   const socket = tls.connect({
     host: '127.0.0.1',
     port,
@@ -44,8 +48,12 @@ export function openRawTls(port, opts = {}) {
     ca: opts.ca ?? fixturePem('ca.pem'),
     rejectUnauthorized: opts.rejectUnauthorized !== false,
     ALPNProtocols: opts.alpnProtocols,
+    session: opts.session,
   });
-  return wrapRawSocket(socket, 'secureConnect');
+  const firstSession = new Promise((resolve) => socket.once('session', resolve));
+  const client = await wrapRawSocket(socket, 'secureConnect');
+  client.waitSession = () => firstSession;
+  return client;
 }
 
 /**

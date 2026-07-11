@@ -86,13 +86,18 @@ async function startEcho(options) {
   return { sid, port, messages, closes, close: () => engine.close(sid) };
 }
 
+// offerDeflate: false (no offer), true (bare permessage-deflate offer), or a
+// string used verbatim as the Sec-WebSocket-Extensions value.
 async function handshake(client, offerDeflate) {
   const key = crypto.randomBytes(16).toString('base64');
   let req =
     `GET / HTTP/1.1${CRLF}Host: t${CRLF}Upgrade: websocket${CRLF}` +
     `Connection: Upgrade${CRLF}Sec-WebSocket-Key: ${key}${CRLF}` +
     `Sec-WebSocket-Version: 13${CRLF}`;
-  if (offerDeflate) req += `Sec-WebSocket-Extensions: permessage-deflate${CRLF}`;
+  if (offerDeflate) {
+    const offer = typeof offerDeflate === 'string' ? offerDeflate : 'permessage-deflate';
+    req += `Sec-WebSocket-Extensions: ${offer}${CRLF}`;
+  }
   req += CRLF;
   await client.send(req);
   const head = await client.read({ until: s => s.includes('\r\n\r\n') });
@@ -206,6 +211,77 @@ describe('@morojs/engine permessage-deflate conformance', { skip }, () => {
       const f = parseServerFrame(raw);
       assert.equal(f.opcode, OP.CLOSE);
       assert.equal(f.payload.readUInt16BE(0), 1002, 'unnegotiated RSV1 is a protocol error');
+    } finally {
+      client.destroy();
+      server.close();
+    }
+  });
+
+  // ---- wsDeflate.sharedCompressor: one server-owned deflate stream ----
+
+  it('sharedCompressor: response forces server_no_context_takeover even when not offered', T, async () => {
+    const server = await startEcho({ wsDeflate: { sharedCompressor: true } });
+    const client = await openRaw(server.port);
+    try {
+      const head = await handshake(client, true); // bare offer: no takeover params
+      assert.match(head, /^HTTP\/1\.1 101 /);
+      assert.match(head, /Sec-WebSocket-Extensions: permessage-deflate/i);
+      // The shared stream resets per message, so the response MUST advertise
+      // it; RFC 7692 §7.1.1.1 permits including it even when not offered.
+      assert.match(head, /server_no_context_takeover/i);
+    } finally {
+      client.destroy();
+      server.close();
+    }
+  });
+
+  it('sharedCompressor: concurrent clients each get their own payloads back (no cross-connection contamination)', T, async () => {
+    const server = await startEcho({ wsDeflate: { sharedCompressor: true, threshold: 1 } });
+    const a = await openRaw(server.port);
+    const b = await openRaw(server.port);
+    try {
+      assert.match(await handshake(a, true), /server_no_context_takeover/i);
+      assert.match(await handshake(b, true), /server_no_context_takeover/i);
+      // Alternate A/B so consecutive uses of the shared stream belong to
+      // DIFFERENT connections; every echo must inflate to its own payload.
+      for (let i = 0; i < 3; i++) {
+        const msgA = `client-A message ${i} ` + 'alpha '.repeat(60);
+        const msgB = `client-B message ${i} ` + 'omega '.repeat(60);
+        await a.send(frame({ opcode: OP.TEXT, rsv1: true, payload: deflateMessage(msgA) }));
+        const fa = parseServerFrame(await a.read({ until: s => s.length >= 4 }));
+        await b.send(frame({ opcode: OP.TEXT, rsv1: true, payload: deflateMessage(msgB) }));
+        const fb = parseServerFrame(await b.read({ until: s => s.length >= 4 }));
+        assert.equal(fa.opcode, OP.TEXT);
+        assert.equal(fb.opcode, OP.TEXT);
+        assert.equal(fa.rsv1, true, 'echo to A must be compressed (shared stream)');
+        assert.equal(fb.rsv1, true, 'echo to B must be compressed (shared stream)');
+        assert.equal(inflateMessage(fa.payload).toString(), msgA);
+        assert.equal(inflateMessage(fb.payload).toString(), msgB);
+      }
+    } finally {
+      a.destroy();
+      b.destroy();
+      server.close();
+    }
+  });
+
+  it('sharedCompressor: a client capping server_max_window_bits=10 falls back per-connection and still compresses', T, async () => {
+    const server = await startEcho({ wsDeflate: { sharedCompressor: true, threshold: 1 } });
+    const client = await openRaw(server.port);
+    try {
+      const head = await handshake(client, 'permessage-deflate; server_max_window_bits=10');
+      assert.match(head, /^HTTP\/1\.1 101 /);
+      assert.match(head, /server_max_window_bits=10/i);
+      // The shared stream's window is fixed at the configured bits; a smaller
+      // negotiated window uses a per-connection compressor with context
+      // takeover intact, so nothing forces server_no_context_takeover here.
+      assert.doesNotMatch(head, /server_no_context_takeover/i);
+      const text = 'window-capped '.repeat(80);
+      await client.send(frame({ opcode: OP.TEXT, rsv1: true, payload: deflateMessage(text) }));
+      const f = parseServerFrame(await client.read({ until: s => s.length >= 4 }));
+      assert.equal(f.opcode, OP.TEXT);
+      assert.equal(f.rsv1, true, 'fallback path must still compress');
+      assert.equal(inflateMessage(f.payload).toString(), text);
     } finally {
       client.destroy();
       server.close();

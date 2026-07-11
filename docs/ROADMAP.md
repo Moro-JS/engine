@@ -98,5 +98,5 @@ Ongoing / recommended:
 
 Binaries build locally for darwin/arm64 across all 6 ABIs. The CI matrix
 (`.github/workflows/build.yml`) covers darwin x64+arm64, linux gnu x64+arm64,
-linux musl x64, and a Node 20–26 smoke matrix. Windows (MSVC) is the one
+linux musl x64+arm64, and a Node 20–26 smoke matrix. Windows (MSVC) is the one
 remaining build leg to wire up.

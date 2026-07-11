@@ -7,15 +7,16 @@
 //      directory and drops the root LICENSE alongside them.
 //   2. Syncs EVERY package.json version to the release version, and rewrites the
 //      meta package's exact-pinned optionalDependencies to the same version, so
-//      the seven hand-maintained version strings can never drift.
+//      the hand-maintained version strings (meta + every platform package) can
+//      never drift.
 //
 // Binary naming: moro_engine_<platform>_<arch>[_<libc>]_<abi>.node
 // Package dirs:  engine-<platform>-<arch>[-<libc>]  (so <platform>_<arch>[_<libc>]
 //                is the dir name after 'engine-' with '-' -> '_').
 //
 // Usage: node tools/prepare-release.mjs <version> [--check]
-//   --check verifies every non-win32 platform package received >=1 binary
-//           (a release must not publish an empty binary carrier).
+//   --check verifies every platform package (win32 included) received >=1
+//           binary (a release must not publish an empty binary carrier).
 
 import {
   readdirSync,

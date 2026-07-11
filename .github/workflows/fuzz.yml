@@ -22,8 +22,8 @@ jobs:
 
       # Stock Ubuntu clang ships the libFuzzer runtime (Apple clang does not),
       # so ubuntu-latest is the right home for this job.
-      - name: Install clang (+ OpenSSL headers for the tls harness)
-        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev
+      - name: Install clang (+ OpenSSL/zlib headers for the tls/pmd harnesses)
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev zlib1g-dev
 
       # Persist the corpus so coverage accumulates. libFuzzer writes new
       # coverage-expanding inputs back into test/fuzz/corpus/<fuzzer>. A unique

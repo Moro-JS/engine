@@ -8,19 +8,25 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "../../src/websocket.h"
 
 using namespace moro::engine;
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-  if (size == 0) return 0;
+  if (size < 2) return 0;
   size_t chunk = (data[0] % 16) + 1;
-  const uint8_t* body = data + 1;
-  size_t bodyLen = size - 1;
+  // Second input byte selects the RSV1 regime so the permessage-deflate
+  // parser paths (compressed first frame / continuation / control rules,
+  // RFC 7692 §6) get fuzzed alongside the strict no-extension mode.
+  const bool pmdNegotiated = (data[1] & 1) != 0;
+  const uint8_t* body = data + 2;
+  size_t bodyLen = size - 2;
 
   WsParser::Limits limits;
   limits.maxMessageSize = 1 * 1024 * 1024;
+  limits.pmdNegotiated = pmdNegotiated;
   WsParser parser(limits);
 
   auto onMessage = [](std::string_view payload, bool isBinary, bool isCompressed) {
@@ -32,10 +38,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     (void)s;
   };
 
+  // consume() takes mutable bytes (it unmasks complete frames in place —
+  // the zero-copy receive path); libFuzzer's input is const, so feed from a
+  // copy, exactly like the server feeds from its own read buffer.
+  std::vector<uint8_t> wire(body, body + bodyLen);
   size_t off = 0;
   while (off < bodyLen) {
     size_t n = chunk < (bodyLen - off) ? chunk : (bodyLen - off);
-    bool ok = parser.consume(body + off, n, onMessage, onControl);
+    bool ok = parser.consume(wire.data() + off, n, onMessage, onControl);
     off += n;
     if (!ok) break;  // failed connection: a real server stops feeding it
   }

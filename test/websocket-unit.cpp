@@ -11,6 +11,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -77,15 +78,20 @@ struct Events {
 
 // Feed bytes into the parser in chunks of at most chunkSize (SIZE_MAX = all
 // at once). Returns false as soon as consume() reports a protocol error.
+// consume() unmasks complete frames in place (zero-copy receive), so it
+// takes mutable bytes: feed from a scratch copy, like the server's read
+// buffer. Tests that assert on the in-place mutation call consume() on
+// their own buffer directly.
 static bool feed(WsParser& p, std::string_view bytes, Events& ev,
                  size_t chunkSize = size_t(-1)) {
+  std::string buf(bytes);
   size_t i = 0;
-  if (bytes.empty()) {
+  if (buf.empty()) {
     return p.consume(nullptr, 0, ev.onMessage(), ev.onControl());
   }
-  while (i < bytes.size()) {
-    const size_t n = std::min(chunkSize, bytes.size() - i);
-    if (!p.consume(reinterpret_cast<const uint8_t*>(bytes.data()) + i, n,
+  while (i < buf.size()) {
+    const size_t n = std::min(chunkSize, buf.size() - i);
+    if (!p.consume(reinterpret_cast<uint8_t*>(buf.data()) + i, n,
                    ev.onMessage(), ev.onControl())) {
       return false;
     }
@@ -130,7 +136,7 @@ static bool rejects(std::string_view bytes, WsParser::Limits limits = {}) {
   WsParser p(limits);
   Events ev;
   if (feed(p, bytes, ev)) return false;  // was accepted: not rejected
-  const uint8_t zero = 0;
+  uint8_t zero = 0;
   if (p.consume(&zero, 1, ev.onMessage(), ev.onControl())) return false;
   return true;
 }
@@ -233,8 +239,9 @@ static void testEncoderWireFormat() {
 
 static void testKnownMaskedVector() {
   // RFC 6455 §5.7: a single-frame masked text message containing "Hello".
-  static const uint8_t wire[] = {0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d,
-                                 0x7f, 0x9f, 0x4d, 0x51, 0x58};
+  // (Mutable: the zero-copy fast path unmasks the payload in this buffer.)
+  uint8_t wire[] = {0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d,
+                    0x7f, 0x9f, 0x4d, 0x51, 0x58};
   WsParser p;
   Events ev;
   CHECK(p.consume(wire, sizeof(wire), ev.onMessage(), ev.onControl()));
@@ -242,6 +249,8 @@ static void testKnownMaskedVector() {
   CHECK(!ev.items[0].isControl);
   CHECK(!ev.items[0].isBinary);
   CHECK(ev.items[0].payload == "Hello");
+  // In-place contract: the wire buffer now holds the unmasked payload.
+  CHECK(std::memcmp(wire + 6, "Hello", 5) == 0);
   std::printf("ok  masked decode (RFC 6455 section 5.7 \"Hello\" vector)\n");
 }
 
@@ -271,7 +280,10 @@ static void roundTripControl(WsOpcode op, const std::string& payload) {
 
 static void testRoundTrips() {
   // Text at 7-, 16-, and 64-bit lengths (valid UTF-8 required, §5.6).
+  // Delivered whole in one consume() call, these exercise the zero-copy
+  // fast path (size 0 completes at the mask key, before any payload state).
   roundTripData(WsOpcode::Text, "");
+  roundTripData(WsOpcode::Text, "a");
   roundTripData(WsOpcode::Text, "morojs");
   roundTripData(WsOpcode::Text, std::string(125, 't'));
   roundTripData(WsOpcode::Text, std::string(126, 't'));
@@ -287,6 +299,7 @@ static void testRoundTrips() {
   std::string bin;
   for (int j = 0; j < 300; ++j) bin += char(uint8_t(j & 0xFF));
   roundTripData(WsOpcode::Binary, "");
+  roundTripData(WsOpcode::Binary, std::string(1, '\x80'));
   roundTripData(WsOpcode::Binary, bin);                       // 16-bit
   roundTripData(WsOpcode::Binary, std::string(80000, '\xFE'));  // 64-bit
 
@@ -561,6 +574,331 @@ static void testErrors() {
 }
 
 // ---------------------------------------------------------------------------
+// Close code table (§7.4: wire validity of close frame status codes)
+// ---------------------------------------------------------------------------
+
+static void testCloseCodeTable() {
+  // §7.4.1/§7.4.2: 0-999 are never used; 1004/1005/1006/1015 are reserved and
+  // MUST NOT be set in a close frame; 1016-2999 are reserved for the protocol;
+  // >4999 is outside the defined space. All fail the connection (1002).
+  const uint16_t bad[] = {0,    1,    500,  999,  1004, 1005,
+                          1006, 1015, 1016, 2000, 2999, 5000, 65535};
+  for (uint16_t code : bad) {
+    std::string body;
+    encodeClosePayload(body, code, "");
+    CHECK(rejects(clientFrame(WsOpcode::Close, body)));
+  }
+  {
+    WsParser p;
+    Events ev;
+    std::string body;
+    encodeClosePayload(body, 1005, "");
+    CHECK(!feed(p, clientFrame(WsOpcode::Close, body), ev));
+    CHECK(p.failCode() == 1002);  // protocol error, not 1007/1009
+  }
+
+  // §7.4.1 defined codes and §7.4.2 registered/private ranges are accepted
+  // and surface unchanged through parseCloseCode.
+  const uint16_t good[] = {1000, 1001, 1002, 1003, 1007, 1008,
+                           1011, 1014, 3000, 4000, 4999};
+  for (uint16_t code : good) {
+    WsParser p;
+    Events ev;
+    std::string body;
+    encodeClosePayload(body, code, "bye");
+    CHECK(feed(p, clientFrame(WsOpcode::Close, body), ev));
+    CHECK(ev.items.size() == 1);
+    CHECK(ev.items[0].isControl && ev.items[0].op == WsOpcode::Close);
+    CHECK(parseCloseCode(ev.items[0].payload) == code);
+  }
+
+  std::printf("ok  close code table (section 7.4 wire validity)\n");
+}
+
+// ---------------------------------------------------------------------------
+// RSV1 with permessage-deflate negotiated (RFC 7692 §6)
+// ---------------------------------------------------------------------------
+
+static void testPmdNegotiatedRsv1() {
+  const WsParser::Limits pmd{.maxMessageSize = 16 * 1024 * 1024,
+                             .pmdNegotiated = true};
+
+  // RSV1 on the first frame of a data message marks it compressed: accepted,
+  // reported compressed, and the (still-deflated) payload skips the parser's
+  // UTF-8 validation - the caller validates after inflating.
+  {
+    WsParser p(pmd);
+    Events ev;
+    std::string f = clientFrame(WsOpcode::Text, "\xFF\x01\x02");  // not UTF-8
+    f[0] = char(uint8_t(f[0]) | 0x40);
+    CHECK(feed(p, f, ev));
+    CHECK(ev.items.size() == 1);
+    CHECK(!ev.items[0].isControl && ev.items[0].compressed);
+    CHECK(ev.items[0].payload == "\xFF\x01\x02");
+  }
+
+  // An uncompressed message under the same limits reports compressed=false.
+  {
+    WsParser p(pmd);
+    Events ev;
+    CHECK(feed(p, clientFrame(WsOpcode::Text, "plain"), ev));
+    CHECK(ev.items.size() == 1 && !ev.items[0].compressed);
+  }
+
+  // A fragmented compressed message: RSV1 only on the first frame (§6.1);
+  // the reassembled whole is reported compressed.
+  {
+    WsParser p(pmd);
+    Events ev;
+    std::string w = clientFrame(WsOpcode::Binary, "\xAB", /*fin=*/false);
+    w[0] = char(uint8_t(w[0]) | 0x40);
+    w += clientFrame(WsOpcode::Continuation, "\xCD", /*fin=*/true);
+    CHECK(feed(p, w, ev));
+    CHECK(ev.items.size() == 1);
+    CHECK(ev.items[0].compressed && ev.items[0].payload == "\xAB\xCD");
+  }
+
+  // §6.1: RSV1 on a continuation frame fails the connection.
+  {
+    std::string w = clientFrame(WsOpcode::Text, "ab", /*fin=*/false);
+    w[0] = char(uint8_t(w[0]) | 0x40);  // first frame compressed: fine
+    std::string cont = clientFrame(WsOpcode::Continuation, "cd", /*fin=*/true);
+    cont[0] = char(uint8_t(cont[0]) | 0x40);
+    CHECK(rejects(w + cont, pmd));
+  }
+
+  // §6.1: RSV1 on a control frame fails the connection, negotiated or not.
+  for (WsOpcode op : {WsOpcode::Ping, WsOpcode::Pong, WsOpcode::Close}) {
+    std::string f = clientFrame(op, "");
+    f[0] = char(uint8_t(f[0]) | 0x40);
+    CHECK(rejects(f, pmd));
+  }
+
+  // §5.2: RSV2/RSV3 stay forbidden even with permessage-deflate negotiated.
+  for (uint8_t rsv : {uint8_t(0x20), uint8_t(0x10)}) {
+    std::string f = clientFrame(WsOpcode::Text, "hi");
+    f[0] = char(uint8_t(f[0]) | rsv);
+    CHECK(rejects(f, pmd));
+  }
+
+  std::printf("ok  RSV1 handling with permessage-deflate negotiated (RFC 7692)\n");
+}
+
+// ---------------------------------------------------------------------------
+// Zero-copy receive fast path: in-place unmasking of the wire buffer
+// ---------------------------------------------------------------------------
+
+// Header + mask length of a client frame ('7-bit'=6, 16-bit=8, 64-bit=14).
+static size_t clientHeaderLen(std::string_view frame) {
+  const uint8_t len7 = uint8_t(frame[1]) & 0x7F;
+  return 2 + (len7 == 126 ? 2 : (len7 == 127 ? 8 : 0)) + 4;
+}
+
+static void testFastPathInPlaceUnmask() {
+  // Documents the in-place contract: after a fast-path emit the input buffer
+  // holds the UNMASKED payload, and the emitted view points INTO the input
+  // buffer (zero copies into message_).
+  const std::string payload = "in-place unmask contract \xE2\x9C\x93";
+  const std::string wire = clientFrame(WsOpcode::Text, payload);
+  std::string buf = wire;  // mutable wire buffer, like the server's readBuf
+  const size_t off = clientHeaderLen(wire);
+  WsParser p;
+  const char* viewData = nullptr;
+  std::string got;
+  bool ok = p.consume(
+      reinterpret_cast<uint8_t*>(buf.data()), buf.size(),
+      [&](std::string_view pl, bool bin, bool compressed) {
+        viewData = pl.data();
+        got.assign(pl);
+        CHECK(!bin && !compressed);
+      },
+      [&](WsOpcode, std::string_view) { CHECK(false); });
+  CHECK(ok);
+  CHECK(got == payload);
+  CHECK(viewData == buf.data() + off);        // the view is INTO the buffer
+  CHECK(buf.substr(off) == payload);          // payload unmasked in place
+  CHECK(buf.compare(0, off, wire, 0, off) == 0);  // header + mask untouched
+
+  // Same contract when the header and mask key arrived in an EARLIER
+  // consume() call: a whole payload in one later buffer still fast-paths
+  // (message_ is empty, the frame just entered its payload).
+  const std::string big(70000, '\x7E');
+  const std::string wire2 = clientFrame(WsOpcode::Binary, big);
+  const size_t off2 = clientHeaderLen(wire2);  // 64-bit length: 14
+  std::string head = wire2.substr(0, off2);
+  std::string body = wire2.substr(off2);
+  WsParser p2;
+  Events ev;
+  CHECK(p2.consume(reinterpret_cast<uint8_t*>(head.data()), head.size(),
+                   ev.onMessage(), ev.onControl()));
+  CHECK(ev.items.empty());
+  CHECK(p2.consume(reinterpret_cast<uint8_t*>(body.data()), body.size(),
+                   ev.onMessage(), ev.onControl()));
+  CHECK(ev.items.size() == 1);
+  CHECK(ev.items[0].isBinary && ev.items[0].payload == big);
+  CHECK(body == big);  // unmasked in place in the second buffer
+
+  std::printf("ok  zero-copy fast path (in-place unmask, view into buffer)\n");
+}
+
+static void testFastPathBatchedFrames() {
+  // [complete frame A][complete frame B][partial frame C] in one consume()
+  // buffer: A and B are fast-pathed (unmasked in place, views emitted); C is
+  // missing its final bytes, so it buffers via the copy path and completes
+  // on the NEXT consume() call.
+  const std::string aPayload = "alpha";
+  std::string bPayload(300, '\0');
+  for (int j = 0; j < 300; ++j) bPayload[j] = char(uint8_t(j));
+  const std::string cPayload = "gamma delta";
+
+  const std::string a = clientFrame(WsOpcode::Text, aPayload);
+  const std::string b = clientFrame(WsOpcode::Binary, bPayload);
+  const std::string cFrame = clientFrame(WsOpcode::Text, cPayload);
+  const size_t cCut = cFrame.size() - 4;  // withhold C's last 4 payload bytes
+
+  std::string buf = a + b + cFrame.substr(0, cCut);
+  WsParser p;
+  Events ev;
+  CHECK(p.consume(reinterpret_cast<uint8_t*>(buf.data()), buf.size(),
+                  ev.onMessage(), ev.onControl()));
+  CHECK(ev.items.size() == 2);
+  CHECK(!ev.items[0].isControl && !ev.items[0].isBinary &&
+        ev.items[0].payload == aPayload);
+  CHECK(!ev.items[1].isControl && ev.items[1].isBinary &&
+        ev.items[1].payload == bPayload);
+
+  // A and B were unmasked IN PLACE (fast path); C's partial payload buffered
+  // into message_ instead (copy path), so its bytes in buf stay MASKED.
+  CHECK(buf.substr(clientHeaderLen(a), aPayload.size()) == aPayload);
+  CHECK(buf.substr(a.size() + clientHeaderLen(b), bPayload.size()) == bPayload);
+  const size_t cOff = a.size() + b.size() + clientHeaderLen(cFrame);
+  CHECK(buf.substr(cOff) ==
+        cFrame.substr(clientHeaderLen(cFrame), cPayload.size() - 4));
+
+  // The withheld tail arrives: C completes via the copy path.
+  std::string rest = cFrame.substr(cCut);
+  CHECK(p.consume(reinterpret_cast<uint8_t*>(rest.data()), rest.size(),
+                  ev.onMessage(), ev.onControl()));
+  CHECK(ev.items.size() == 3);
+  CHECK(!ev.items[2].isControl && !ev.items[2].isBinary &&
+        ev.items[2].payload == cPayload);
+
+  std::printf("ok  batched frames: two fast-pathed + split tail copy-pathed\n");
+}
+
+static void testInterleavedPingSingleBuffer() {
+  // Fragmented text with a Ping between the fragments, ALL in one consume()
+  // buffer: the fragments take the copy path (no in-place unmasking - the
+  // buffer is untouched), the ping surfaces between them, and the message
+  // reassembles correctly.
+  std::string buf = clientFrame(WsOpcode::Text, "Hel", /*fin=*/false);
+  buf += clientFrame(WsOpcode::Ping, "mid");
+  buf += clientFrame(WsOpcode::Continuation, "lo", /*fin=*/true);
+  const std::string before = buf;
+
+  WsParser p;
+  Events ev;
+  CHECK(p.consume(reinterpret_cast<uint8_t*>(buf.data()), buf.size(),
+                  ev.onMessage(), ev.onControl()));
+  CHECK(ev.items.size() == 2);
+  CHECK(ev.items[0].isControl && ev.items[0].op == WsOpcode::Ping &&
+        ev.items[0].payload == "mid");
+  CHECK(!ev.items[1].isControl && !ev.items[1].isBinary &&
+        ev.items[1].payload == "Hello");
+  CHECK(buf == before);  // copy path throughout: wire bytes stay masked
+
+  std::printf("ok  interleaved ping in one buffer (fragments copy-pathed)\n");
+}
+
+// ---------------------------------------------------------------------------
+// Incremental UTF-8 validation (uncompressed text, §5.6/§8.1 fail-fast)
+// ---------------------------------------------------------------------------
+
+static void testIncrementalUtf8() {
+  // Invalid UTF-8 in the FIRST fragment of a fragmented text message fails
+  // 1007 immediately - the rest of the message is never fed.
+  {
+    WsParser p;
+    Events ev;
+    const std::string frag1 = "abc\xFF" + std::string(500, 'x');
+    CHECK(!feed(p, clientFrame(WsOpcode::Text, frag1, /*fin=*/false), ev));
+    CHECK(p.failCode() == 1007);
+    CHECK(ev.items.empty());
+  }
+
+  // ...and per CHUNK within one large frame: consume() fails on the first
+  // payload chunk carrying the invalid byte - the remaining ~100 KB of the
+  // declared payload is never provided, let alone buffered.
+  {
+    std::string payload(100000, 'a');
+    payload[5] = '\xFF';
+    const std::string wire = clientFrame(WsOpcode::Text, payload, /*fin=*/false);
+    std::string firstChunk = wire.substr(0, clientHeaderLen(wire) + 16);
+    WsParser p;
+    Events ev;
+    CHECK(!p.consume(reinterpret_cast<uint8_t*>(firstChunk.data()),
+                     firstChunk.size(), ev.onMessage(), ev.onControl()));
+    CHECK(p.failCode() == 1007);
+  }
+
+  // Valid multi-byte sequences split across FRAGMENT boundaries at every
+  // offset pass: 4-byte emoji split 1/3, 2/2, 3/1; 3- and 2-byte sequences
+  // at every cut as well.
+  const std::string emoji = "\xF0\x9F\x8C\x8D";  // U+1F30D
+  const std::string mark = "\xE2\x9C\x93";       // U+2713
+  const std::string eacute = "\xC3\xA9";         // U+00E9
+  for (const std::string& seq : {emoji, mark, eacute}) {
+    for (size_t cut = 1; cut < seq.size(); ++cut) {
+      WsParser p;
+      Events ev;
+      std::string w =
+          clientFrame(WsOpcode::Text, "ok" + seq.substr(0, cut), /*fin=*/false);
+      w += clientFrame(WsOpcode::Continuation, seq.substr(cut) + "!",
+                       /*fin=*/true);
+      CHECK(feed(p, w, ev));
+      CHECK(ev.items.size() == 1);
+      CHECK(ev.items[0].payload == "ok" + seq + "!");
+    }
+  }
+
+  // The same splits across CONSUME-CALL boundaries within a single frame
+  // (chunk sizes that cut every sequence at every offset).
+  {
+    const std::string msg = "ok" + emoji + " caf" + eacute + " " + mark;
+    const std::string w = clientFrame(WsOpcode::Text, msg);
+    for (size_t chunk : {1, 2, 3, 5}) {
+      WsParser p;
+      Events ev;
+      CHECK(feed(p, w, ev, chunk));
+      CHECK(ev.items.size() == 1);
+      CHECK(ev.items[0].payload == msg);
+    }
+  }
+
+  // A dangling partial sequence at FIN fails 1007: single frame (whole
+  // message via the fast path)...
+  {
+    WsParser p;
+    Events ev;
+    CHECK(!feed(p, clientFrame(WsOpcode::Text, "ok\xE2\x9C"), ev));
+    CHECK(p.failCode() == 1007);
+  }
+  // ...and when the truncated sequence spans fragments (copy path): every
+  // fragment's bytes are a valid PREFIX, but FIN lands mid-sequence.
+  {
+    WsParser p;
+    Events ev;
+    std::string w = clientFrame(WsOpcode::Text, "a\xF0\x9F", /*fin=*/false);
+    w += clientFrame(WsOpcode::Continuation, "\x8C", /*fin=*/true);  // 1 short
+    CHECK(!feed(p, w, ev));
+    CHECK(p.failCode() == 1007);
+    CHECK(ev.items.empty());
+  }
+
+  std::printf("ok  incremental UTF-8 (fail-fast 1007, split sequences)\n");
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
   testSha1();
@@ -573,6 +911,12 @@ int main() {
   testFragmentationWithInterleavedPing();
   testByteAtATimeConversation();
   testErrors();
+  testCloseCodeTable();
+  testPmdNegotiatedRsv1();
+  testFastPathInPlaceUnmask();
+  testFastPathBatchedFrames();
+  testInterleavedPingSingleBuffer();
+  testIncrementalUtf8();
   std::printf("\nall websocket unit tests passed (%d checks)\n", gChecks);
   return 0;
 }

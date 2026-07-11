@@ -7,6 +7,8 @@
 //   - the HTTP/1.1 machinery is unchanged under TLS (GET, POST echo,
 //     keep-alive, chunked streaming, 413/431 limits, abort -> onAborted)
 //   - ALPN negotiates http/1.1 (and tolerates clients with no overlap)
+//   - ssl.ticketKeys (Node-compatible 48-byte layout) makes sessions resume
+//     across servers sharing the keys, and only those
 //   - WSS: RFC 6455 upgrade + echo over the TLS socket
 //   - config errors THROW from serve() (bad PEM, mismatch, missing file,
 //     partial config) - never a silent plaintext server
@@ -223,6 +225,79 @@ describe('@morojs/engine TLS conformance', { skip }, () => {
         client.destroy();
       }
     });
+  });
+
+  // -------------------------------------------------------------------------
+  // Session tickets (ssl.ticketKeys, Node tls.Server-compatible)
+  // -------------------------------------------------------------------------
+
+  it('ticketKeys: session resumes across two servers sharing keys', T, async () => {
+    const ticketKeys = crypto.randomBytes(48); // Node layout: name|hmac|aes
+    const ssl = () => ({ ...sslInlineOptions(), ticketKeys });
+    await withTlsServer(ok, ssl(), async (server1) => {
+      await withTlsServer(ok, ssl(), async (server2) => {
+        // Full handshake against server 1; capture the ticket. TLS 1.3
+        // delivers NewSessionTicket after the handshake, so wait for the
+        // 'session' event, not just secureConnect.
+        const c1 = await openRawTls(server1.port);
+        let session;
+        try {
+          session = await c1.waitSession();
+        } finally {
+          c1.destroy();
+        }
+        // Offer the ticket to server 2: same ticket keys -> it decrypts the
+        // foreign ticket and resumes.
+        const c2 = await openRawTls(server2.port, { session });
+        try {
+          assert.equal(c2.socket.isSessionReused(), true,
+            'server 2 must resume a session issued by server 1');
+          await c2.send(GET());
+          assert.equal(parseResponse(await c2.read()).status, 200);
+        } finally {
+          c2.destroy();
+        }
+      });
+    });
+  });
+
+  it('ticketKeys: no resumption across servers with different keys', T, async () => {
+    await withTlsServer(ok, { ...sslInlineOptions(), ticketKeys: crypto.randomBytes(48) },
+      async (server1) => {
+        await withTlsServer(ok, { ...sslInlineOptions(), ticketKeys: crypto.randomBytes(48) },
+          async (server2) => {
+            const c1 = await openRawTls(server1.port);
+            let session;
+            try {
+              session = await c1.waitSession();
+            } finally {
+              c1.destroy();
+            }
+            // Server 2 cannot decrypt the foreign ticket: the handshake still
+            // SUCCEEDS as a full handshake, just without resumption.
+            const c2 = await openRawTls(server2.port, { session });
+            try {
+              assert.equal(c2.socket.isSessionReused(), false,
+                'a foreign ticket must fall back to a full handshake');
+              await c2.send(GET());
+              assert.equal(parseResponse(await c2.read()).status, 200,
+                'full handshake must still serve requests');
+            } finally {
+              c2.destroy();
+            }
+          });
+      });
+  });
+
+  it('serve() throws on wrong-length ticketKeys', T, () => {
+    assert.throws(
+      () =>
+        engine.serve(
+          { onRequest() {}, onAborted() {} },
+          { ssl: { ...sslInlineOptions(), ticketKeys: crypto.randomBytes(47) } }
+        ),
+      /48/
+    );
   });
 
   // -------------------------------------------------------------------------

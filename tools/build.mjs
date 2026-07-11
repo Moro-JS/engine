@@ -174,11 +174,19 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null }) {
         '-DNDEBUG',
         '-fstack-protector-strong',
         '-D_FORTIFY_SOURCE=2',
+        // src/ uses no exceptions or RTTI, and the V8 headers compile with
+        // both off (node core itself builds this way) — drop the machinery.
+        '-fno-exceptions',
+        '-fno-rtti',
       ];
 
   const common = [
     '-std=c++20',
     ...modeFlags,
+    // x64 ISA floor: x86-64-v2 (SSE4.2/POPCNT, ~2009 Nehalem and later;
+    // RHEL 9's baseline). arm64 stays at the compiler's default armv8-a.
+    // Release-only so the sanitizer lane's flags stay exactly as-is.
+    ...(!sanitize && arch === 'x64' ? ['-march=x86-64-v2'] : []),
     '-fvisibility=hidden',
     `-I${includeDir}`,
     '-DBUILDING_NODE_EXTENSION',
@@ -241,7 +249,11 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null }) {
     args = [
       '/nologo',
       '/std:c++20',
-      '/EHsc',
+      // No throw/dynamic_cast in src; V8 headers compile with exceptions and
+      // RTTI off (as node core does) — mirrors -fno-exceptions/-fno-rtti.
+      '/EHs-c-',
+      '/D_HAS_EXCEPTIONS=0',
+      '/GR-',
       '/O2',
       '/GL',
       '/GS',

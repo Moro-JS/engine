@@ -254,6 +254,21 @@ int main() {
     CHECK(q.errorStatus == 431);
   }
 
+  // --- head-size limit counts HEAD bytes only, not a body delivered in the
+  // same parse() call (the pending-replay path hands a full pipelined request
+  // to one parse(); its body must not trip the 431 guard) ---
+  {
+    HttpLimits lim;
+    lim.maxHeadSize = 64;
+    lim.maxBodySize = 1 << 20;
+    std::string body(4096, 'b');  // body far larger than maxHeadSize
+    std::string req = "POST /x HTTP/1.1\r\nContent-Length: " +
+                      std::to_string(body.size()) + "\r\n\r\n" + body;
+    HttpParser p(lim);
+    CHECK(feed(p, req) == ParseStatus::Complete);
+    CHECK(p.body == body);
+  }
+
   // --- configurable maxHeaders: boundary at N / N+1 ---
   {
     HttpLimits lim;

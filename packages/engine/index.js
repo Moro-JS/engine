@@ -21,11 +21,25 @@ const { version: ENGINE_VERSION } = require('./package.json');
 
 function libcSuffix() {
   if (process.platform !== 'linux') return '';
+  // Fast path: Alpine (by far the common musl host) marks itself on disk —
+  // far cheaper than generating a process report.
+  if (existsSync('/etc/alpine-release')) return '-musl';
   // glibc exposes its version in the process report; musl does not. When the
   // report API is unavailable entirely, assume glibc (the overwhelmingly
   // common case) rather than musl.
   try {
-    const report = process.report && process.report.getReport();
+    let report = null;
+    if (process.report) {
+      // Skip env serialization while generating the report — we only need the
+      // header — then restore whatever the app had configured.
+      const prevExcludeEnv = process.report.excludeEnv;
+      process.report.excludeEnv = true;
+      try {
+        report = process.report.getReport();
+      } finally {
+        process.report.excludeEnv = prevExcludeEnv;
+      }
+    }
     if (!report) return '-gnu';
     if (report.header && report.header.glibcVersionRuntime) return '-gnu';
     return '-musl';
@@ -125,6 +139,15 @@ module.exports = new Proxy(
       // from the target above so neither forces a native load.
       const binding = loadBinding();
       return binding[prop];
+    },
+    has(target, prop) {
+      // Keep `in` consistent with the get trap (so `'serve' in engine` works
+      // for feature detection) without forcing a native load: `then` and
+      // symbols read as undefined there, so report them absent here; every
+      // other string key is served from the binding on first touch.
+      if (prop in target) return true;
+      if (typeof prop === 'symbol' || prop === 'then') return false;
+      return typeof prop === 'string';
     },
   }
 );

@@ -18,6 +18,13 @@ struct PmdOptions {
   int clientMaxWindowBits = 15;
   size_t threshold = 1024;         // min message bytes before compressing a send
   size_t maxDecompressedSize = 0;  // 0 => fall back to wsMaxMessageSize
+  // Share ONE server-owned deflate stream (reset per message) across all
+  // permessage-deflate connections instead of ~262 KB of deflate state per
+  // connection. Trades per-message compression ratio (no cross-message
+  // context) for memory, and forces server_no_context_takeover in the
+  // negotiated response - which RFC 7692 §7.1.1.1 explicitly permits the
+  // server to include even when the client's offer didn't ask for it.
+  bool sharedCompressor = false;
 };
 
 }  // namespace engine

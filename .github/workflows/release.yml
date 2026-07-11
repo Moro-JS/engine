@@ -61,7 +61,14 @@ jobs:
           path: build/*.node
 
   linux-musl:
-    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     container: node:24-alpine
     steps:
       - uses: actions/checkout@v4
@@ -69,7 +76,7 @@ jobs:
       - run: node tools/build.mjs --all
       - uses: actions/upload-artifact@v4
         with:
-          name: binaries-linux-x64-musl
+          name: binaries-linux-${{ matrix.arch }}-musl
           path: build/*.node
 
   windows:

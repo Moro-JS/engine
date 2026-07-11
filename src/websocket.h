@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -126,6 +127,66 @@ inline bool isValidUtf8(std::string_view s) {
   return true;
 }
 
+// Streaming UTF-8 validator: the incremental form of isValidUtf8 above,
+// enforcing the same RFC 3629 §4 rules (overlong encodings, UTF-16
+// surrogates, code points above U+10FFFF, stray continuation bytes, invalid
+// leading bytes). Bytes may arrive in any splits — a multi-byte sequence can
+// span chunk boundaries (WebSocket fragment or consume()-call boundaries,
+// §5.4) — so truncation is not knowable per chunk: the caller checks
+// complete() at end-of-message. Lets a text message be rejected (1007) at
+// the offending chunk instead of after buffering the whole message.
+class Utf8Validator {
+ public:
+  // Feed the next chunk. Returns false when a byte makes the stream
+  // irrecoverably invalid (no suffix could make it valid UTF-8); the
+  // validator is then in an undefined state — reset() before reuse.
+  bool accept(std::string_view s) {
+    for (const char ch : s) {
+      const uint8_t b = uint8_t(ch);
+      if (need_ == 0) {
+        if (b < 0x80) continue;               // one byte: U+0000..U+007F
+        if ((b & 0xE0) == 0xC0) {             // two bytes: U+0080..U+07FF
+          need_ = 1;
+          cp_ = b & 0x1F;
+          min_ = 0x80;
+        } else if ((b & 0xF0) == 0xE0) {      // three bytes: U+0800..U+FFFF
+          need_ = 2;
+          cp_ = b & 0x0F;
+          min_ = 0x800;
+        } else if ((b & 0xF8) == 0xF0) {      // four bytes: U+10000..U+10FFFF
+          need_ = 3;
+          cp_ = b & 0x07;
+          min_ = 0x10000;
+        } else {
+          return false;  // 0x80..0xBF stray continuation, or 0xF8..0xFF
+        }
+      } else {
+        if ((b & 0xC0) != 0x80) return false;  // not a continuation byte
+        cp_ = (cp_ << 6) | (b & 0x3F);
+        if (--need_ == 0) {
+          if (cp_ < min_) return false;                      // overlong
+          if (cp_ > 0x10FFFF) return false;                  // beyond Unicode
+          if (cp_ >= 0xD800 && cp_ <= 0xDFFF) return false;  // surrogates
+        }
+      }
+    }
+    return true;
+  }
+
+  // True when the stream does not end mid multi-byte sequence — required at
+  // the end of a message (§5.6: the COMPLETE message must be valid UTF-8).
+  // When true the validator is already in its initial state, so no reset()
+  // is needed between messages.
+  bool complete() const { return need_ == 0; }
+
+  void reset() { need_ = 0; }
+
+ private:
+  uint32_t need_ = 0;  // continuation bytes still required
+  uint32_t cp_ = 0;    // code point accumulated so far
+  uint32_t min_ = 0;   // smallest code point this sequence length may encode
+};
+
 // Incremental server-side frame decoder (RFC 6455 §5.2). Feed bytes as they
 // arrive off the wire — any byte of a header or payload may arrive in a
 // separate consume() call. Emits complete MESSAGES (fragments reassembled
@@ -174,8 +235,19 @@ class WsParser {
   // onControl(opcode, payload): Close/Ping/Pong with unmasked payload
   // (<= 125 bytes, §5.5).
   // The string_views are only valid for the duration of the callback.
-  bool consume(const uint8_t* data, size_t len, MessageFn onMessage,
-               ControlFn onControl) {
+  // Templated on the callable types so callers' lambdas are invoked directly
+  // (no std::function allocation per read); MessageFn/ControlFn document the
+  // required signatures.
+  //
+  // `data` is MUTABLE: a data frame that is a whole message by itself (first
+  // frame, FIN set) and whose full payload sits in this buffer is unmasked
+  // (§5.3) IN PLACE and emitted as a view into `data` — the zero-copy fast
+  // path. The caller must not rely on the buffer's contents after the call
+  // and must keep the buffer untouched until consume() returns (the views'
+  // valid-only-during-the-callback contract already implies both).
+  template <typename OnMessage, typename OnControl>
+  bool consume(uint8_t* data, size_t len, OnMessage&& onMessage,
+               OnControl&& onControl) {
     if (failed_) return false;
     size_t i = 0;
     while (i < len) {
@@ -205,19 +277,80 @@ class WsParser {
           break;
         }
         case State::Payload: {
-          const size_t take =
-              size_t(std::min<uint64_t>(payloadRemaining_, len - i));
+          const size_t avail = len - i;
+          // Zero-copy fast path: this data frame is an entire message on its
+          // own (first frame of the message, FIN set, no fragment bytes
+          // buffered) and its whole payload is already in this input buffer.
+          // Unmask it IN PLACE in the wire buffer and emit a view into it —
+          // message_ is never touched, so a warm connection receives with
+          // zero copies. Applies to compressed frames too (the view feeds
+          // inflate). Fragmented messages, control frames (<= 125 bytes and
+          // interleavable inside a fragmented message — not worth it), and
+          // frames split across consume() calls take the buffering path
+          // below. The caller-facing contract is unchanged: the view is only
+          // valid for the duration of the callback.
+          if (!isControl_ && frameStartsMessage_ && fin_ && message_.empty() &&
+              payloadRemaining_ <= avail) {
+            const size_t take = size_t(payloadRemaining_);
+            char* p = reinterpret_cast<char*>(data) + i;
+            unmaskInPlace(p, take, mask_, maskPos_);
+            // §5.6/§8.1: an uncompressed text payload MUST be valid UTF-8.
+            // The frame is the whole message, so the validator must accept
+            // every byte AND end outside a multi-byte sequence. Compressed
+            // payloads are still deflated here — the caller validates
+            // post-inflate (skip). Binary: no UTF-8 requirement.
+            if (!messageIsBinary_ && !messageCompressed_ &&
+                (!utf8_.accept(std::string_view(p, take)) ||
+                 !utf8_.complete())) {
+              failCode_ = 1007;  // §7.4.1: Invalid frame payload data
+              return fail();
+            }
+            // Reset frame + message state BEFORE the callback (the next
+            // bytes begin a new frame header), mirroring finishFrame().
+            i += take;
+            payloadRemaining_ = 0;
+            state_ = State::Header;
+            hdrHave_ = 0;
+            inMessage_ = false;
+            const bool isBinary = messageIsBinary_;
+            const bool compressed = messageCompressed_;
+            messageCompressed_ = false;
+            onMessage(std::string_view(p, take), isBinary, compressed);
+            break;
+          }
+          const size_t take = size_t(std::min<uint64_t>(payloadRemaining_, avail));
           std::string& sink = isControl_ ? control_ : message_;
+          // Large declared payloads: reserve once at the first buffered
+          // chunk (bounded by commitLength's limit check) so chunked appends
+          // don't re-copy the buffer geometrically. Deferred to here — after
+          // the fast path above — so frames it consumes never allocate.
+          // Small frames keep amortized growth: a per-frame exact reserve
+          // would make many-small-fragment messages quadratic.
+          if (!isControl_ && payloadRemaining_ > 65536 &&
+              sink.size() + size_t(payloadRemaining_) > sink.capacity()) {
+            sink.reserve(sink.size() + size_t(payloadRemaining_));
+          }
           const size_t base = sink.size();
-          sink.resize(base + take);
           // §5.3: transformed-octet-i = original-octet-i XOR
           // masking-key-octet-(i MOD 4). maskPos_ persists across consume()
-          // calls so a payload split anywhere still unmasks correctly.
-          for (size_t k = 0; k < take; ++k) {
-            sink[base + k] = char(data[i + k] ^ mask_[maskPos_++ & 3]);
-          }
+          // calls so a payload split anywhere still unmasks correctly:
+          // append raw (memcpy, no zero-fill), then unmask in place in the
+          // sink.
+          sink.append(reinterpret_cast<const char*>(data + i), take);
+          unmaskInPlace(sink.data() + base, take, mask_, maskPos_);
+          maskPos_ = (maskPos_ + take) & 3;
           i += take;
           payloadRemaining_ -= take;
+          // §5.6/§8.1, incrementally: validate each uncompressed-text chunk
+          // as it is unmasked, so invalid UTF-8 fails (1007) at the
+          // offending chunk instead of after buffering up to maxMessageSize
+          // bytes. Truncation (a dangling multi-byte sequence) is checked at
+          // FIN in finishFrame() via utf8_.complete().
+          if (!isControl_ && !messageIsBinary_ && !messageCompressed_ &&
+              !utf8_.accept(std::string_view(sink.data() + base, take))) {
+            failCode_ = 1007;  // §7.4.1: Invalid frame payload data
+            return fail();
+          }
           if (payloadRemaining_ == 0 && !finishFrame(onMessage, onControl)) {
             return fail();
           }
@@ -240,6 +373,30 @@ class WsParser {
   bool fail() {
     failed_ = true;
     return false;
+  }
+
+  // §5.3: transformed-octet-i = original-octet-i XOR
+  // masking-key-octet-(i MOD 4). Unmasks p[0..n) in place, 8 bytes at a
+  // time: the 8-byte key is the 4-byte mask repeated, rotated to `pos` (the
+  // payload offset this chunk starts at, mod 4), so byte j of every word
+  // lines up with mask[(pos + j) & 3] regardless of endianness. Shared by
+  // the zero-copy fast path (wire buffer) and the copy path (sink buffer).
+  static void unmaskInPlace(char* p, size_t n, const uint8_t mask[4],
+                            size_t pos) {
+    uint8_t km[8];
+    for (size_t j = 0; j < 8; ++j) km[j] = mask[(pos + j) & 3];
+    uint64_t key;
+    std::memcpy(&key, km, 8);
+    size_t k = 0;
+    for (; k + 8 <= n; k += 8) {
+      uint64_t w;
+      std::memcpy(&w, p + k, 8);
+      w ^= key;
+      std::memcpy(p + k, &w, 8);
+    }
+    for (; k < n; ++k) {
+      p[k] = char(uint8_t(p[k]) ^ mask[(pos + k) & 3]);
+    }
   }
 
   // Both base header bytes are in hdr_; validate them and decide what the
@@ -278,8 +435,9 @@ class WsParser {
 
     if (isControl_) {
       // §5.5: control frames MUST have a payload of 125 bytes or less and
-      // MUST NOT be fragmented.
-      if (!fin_ || len7 > 125) return false;
+      // MUST NOT be fragmented. RFC 7692 §6.1: RSV1 (the per-message
+      // compressed bit) MUST NOT be set on control frames.
+      if (!fin_ || len7 > 125 || rsv1) return false;
       controlOpcode_ = static_cast<WsOpcode>(op);
     } else if (op == uint8_t(WsOpcode::Continuation)) {
       // §5.4: a continuation frame is only valid while a fragmented message
@@ -287,11 +445,13 @@ class WsParser {
       // frames (the compressed bit lives only on the first frame).
       if (!inMessage_) return false;
       if (rsv1) return false;
+      frameStartsMessage_ = false;
     } else {
       // §5.4: fragments after the first carry opcode 0, so a new Text or
       // Binary frame while a message is in progress is a protocol error.
       if (inMessage_) return false;
       inMessage_ = true;
+      frameStartsMessage_ = true;
       messageIsBinary_ = (op == uint8_t(WsOpcode::Binary));
       messageCompressed_ = rsv1;  // RFC 7692: RSV1 on the first frame = compressed
     }
@@ -338,6 +498,9 @@ class WsParser {
         failCode_ = 1009;  // §7.4.1: Message Too Big
         return false;
       }
+      // (The large-payload reserve for message_ lives in consume()'s copy
+      // path, deferred past the zero-copy fast path so frames that never
+      // touch message_ never allocate.)
     }
     payloadRemaining_ = payloadLen_;
     maskHave_ = 0;
@@ -347,7 +510,8 @@ class WsParser {
   }
 
   // The frame's payload (possibly empty) is fully buffered and unmasked.
-  bool finishFrame(const MessageFn& onMessage, const ControlFn& onControl) {
+  template <typename OnMessage, typename OnControl>
+  bool finishFrame(OnMessage& onMessage, OnControl& onControl) {
     // Next bytes begin a new frame header.
     state_ = State::Header;
     hdrHave_ = 0;
@@ -384,17 +548,23 @@ class WsParser {
     if (!fin_) return true;
 
     // §5.6/§8.1: a text message's complete payload MUST be valid UTF-8.
-    // Validation runs on the reassembled message, so multi-byte sequences
-    // split across fragment boundaries (§5.4) are handled correctly. For a
-    // COMPRESSED message the payload is still deflated here, so the caller
-    // inflates first and validates UTF-8 on the result (skip it here).
-    if (!messageIsBinary_ && !messageCompressed_ && !isValidUtf8(message_)) {
+    // Every chunk was already validated incrementally as it was unmasked
+    // (multi-byte sequences split across fragment or consume() boundaries
+    // carry over in utf8_'s state), so all that remains at FIN is that the
+    // message does not END mid multi-byte sequence. For a COMPRESSED message
+    // the payload is still deflated here, so the caller inflates first and
+    // validates UTF-8 on the result (skip it here). When complete() holds,
+    // utf8_ is already back in its initial state for the next message.
+    if (!messageIsBinary_ && !messageCompressed_ && !utf8_.complete()) {
       failCode_ = 1007;  // §7.4.1: Invalid frame payload data
       return false;
     }
 
     onMessage(std::string_view(message_), messageIsBinary_, messageCompressed_);
     message_.clear();
+    // One huge message must not pin its capacity to an idle connection (same
+    // 64 KiB watermark as server.h's releaseScratch).
+    if (message_.capacity() > 65536) message_.shrink_to_fit();
     inMessage_ = false;
     messageCompressed_ = false;
     return true;
@@ -424,6 +594,11 @@ class WsParser {
   uint64_t payloadRemaining_ = 0;
   bool fin_ = false;
   bool isControl_ = false;
+  // True when the current data frame opened its message (opcode Text/Binary,
+  // not Continuation) — with fin_, the zero-copy fast path's "this frame is
+  // the whole message" test. Meaningless for control frames (they never set
+  // or read it; beginFrame's data branches always reassign it).
+  bool frameStartsMessage_ = false;
   WsOpcode controlOpcode_ = WsOpcode::Close;
 
   // Fragmented-message reassembly (§5.4).
@@ -432,6 +607,11 @@ class WsParser {
   bool messageCompressed_ = false;  // RFC 7692: RSV1 on the first frame
   std::string message_;  // data message reassembly buffer
   std::string control_;  // control frame payload buffer (<= 125 bytes)
+  // Per-message streaming UTF-8 state for UNCOMPRESSED text messages (§5.6).
+  // Invariant: between messages it is always in its initial state — a
+  // message either ends with complete() true (initial state by definition)
+  // or fails, which latches the parser for good.
+  Utf8Validator utf8_;
 };
 
 // Frame encoder (§5.2). Appends one complete frame (header + payload) to

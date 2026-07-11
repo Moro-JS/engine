@@ -21,11 +21,16 @@
 
 #pragma once
 
+#include <openssl/core_names.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/params.h>
 #include <openssl/pem.h>
+#include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -49,6 +54,7 @@ struct SslConfig {
   std::string caPem;
 
   std::string passphrase;   // decrypts an encrypted private key
+  std::string ticketKeys;   // 48-byte session-ticket key material (Node layout)
   int minVersion = TLS1_2_VERSION;
   bool requestCert = false;         // ask the client for a certificate
   bool rejectUnauthorized = true;   // fail the handshake when it doesn't verify
@@ -87,15 +93,19 @@ class TlsContext {
       reset();
       ctx_ = other.ctx_;
       passphrase_ = std::move(other.passphrase_);
+      ticketKeys_ = std::move(other.ticketKeys_);
       alpnH2_ = other.alpnH2_;
       other.ctx_ = nullptr;
-      // Both SSL_CTX callbacks captured the moved-from object: the passwd cb's
-      // userdata is our passphrase_ string, and the ALPN select cb's is `this`.
-      // Re-aim both at the moved-to object, or a later handshake dereferences
-      // the old (often stack-allocated) TlsContext — a use-after-return.
+      // The SSL_CTX callbacks captured the moved-from object: the passwd cb's
+      // userdata is our passphrase_ string, the ALPN select cb's arg is
+      // `this`, and the ticket-key cb reaches us via SSL_CTX app_data.
+      // Re-aim all of them at the moved-to object, or a later handshake
+      // dereferences the old (often stack-allocated) TlsContext — a
+      // use-after-return.
       if (ctx_) {
         SSL_CTX_set_default_passwd_cb_userdata(ctx_, &passphrase_);
         SSL_CTX_set_alpn_select_cb(ctx_, alpnSelectCb, this);
+        SSL_CTX_set_app_data(ctx_, this);
       }
     }
     return *this;
@@ -115,6 +125,45 @@ class TlsContext {
     if (!ctx_) return sslError("SSL_CTX_new");
     passphrase_ = cfg.passphrase;
     alpnH2_ = cfg.alpnH2;
+
+    // Session-ID context is mandatory for resumption on verifying servers:
+    // without a sid-ctx, servers with SSL_VERIFY_PEER fatally reject
+    // session-resumption attempts (SSL_R_SESSION_ID_CONTEXT_UNINITIALIZED)
+    // instead of falling back to a full handshake.
+    SSL_CTX_set_session_id_context(
+        ctx_, reinterpret_cast<const unsigned char*>("moro-engine"), 11);
+
+    // ---- session-ticket keys (Node tls.Server `ticketKeys` contract) ----
+    // One 48-byte secret in Node's layout: 16-byte key name, 16-byte HMAC
+    // secret, 16-byte AES key - the same buffer tls.Server's setTicketKeys()
+    // accepts. Servers configured with identical keys (reusePort workers,
+    // separate processes) can decrypt each other's tickets, so TLS sessions
+    // resume across all of them. Static keys trade forward secrecy for that
+    // portability; generating and ROTATING them is the caller's job (Node's
+    // tls.Server makes the same trade). When absent, OpenSSL keeps its
+    // per-context random keys (tickets stay process-local).
+    //
+    // NOTE: OpenSSL 3.x's own SSL_CTX_set_tlsext_ticket_keys wants 80 bytes
+    // (16-byte name + 32-byte HMAC + 32-byte AES) and would reject Node's
+    // 48-byte buffer, so - exactly like Node - we install a ticket-key
+    // callback that implements the 16/16/16 layout with AES-128-CBC +
+    // HMAC-SHA256. Tickets minted here are wire-compatible across any two
+    // engine servers sharing the keys.
+    if (!cfg.ticketKeys.empty()) {
+      if (cfg.ticketKeys.size() != 48) {
+        // The binding validates length before Server construction; this is a
+        // defensive backstop for non-JS callers of TlsContext.
+        return "ticketKeys must be exactly 48 bytes (16-byte key name + "
+               "16-byte HMAC secret + 16-byte AES key, Node's layout)";
+      }
+      ticketKeys_ = cfg.ticketKeys;
+      // The callback has no user-data argument; it finds this TlsContext via
+      // SSL_CTX app_data (re-aimed on move, see operator=).
+      SSL_CTX_set_app_data(ctx_, this);
+      if (SSL_CTX_set_tlsext_ticket_key_evp_cb(ctx_, ticketKeyCb) != 1) {
+        return sslError("SSL_CTX_set_tlsext_ticket_key_evp_cb");
+      }
+    }
 
     // Hardening baseline: TLS >= 1.2 (configurable floor), no renegotiation
     // (client-initiated renegotiation is a DoS vector), no TLS-level
@@ -159,12 +208,20 @@ class TlsContext {
     }
 
     // ---- CA(s): trust anchors for client-certificate verification ----
+    // Each CA feeds BOTH the trust store and the advertised client-CA list
+    // (the CertificateRequest's certificate_authorities, RFC 8446 4.2.4 /
+    // RFC 5246 7.4.4) - without the latter, clients cannot pick which
+    // certificate to present. This mirrors Node's tls.Server contract.
     if (!cfg.caPem.empty()) {
       std::string err = addCaPem(cfg.caPem);
       if (!err.empty()) return err;
-    } else if (!cfg.caFile.empty() &&
-               SSL_CTX_load_verify_locations(ctx_, cfg.caFile.c_str(), nullptr) != 1) {
-      return sslError(("loading CA file '" + cfg.caFile + "'").c_str());
+    } else if (!cfg.caFile.empty()) {
+      if (SSL_CTX_load_verify_locations(ctx_, cfg.caFile.c_str(), nullptr) != 1) {
+        return sslError(("loading CA file '" + cfg.caFile + "'").c_str());
+      }
+      // SSL_CTX_set_client_CA_list takes ownership of the stack.
+      STACK_OF(X509_NAME)* names = SSL_load_client_CA_file(cfg.caFile.c_str());
+      if (names) SSL_CTX_set_client_CA_list(ctx_, names);
     }
 
     if (cfg.requestCert) {
@@ -195,6 +252,45 @@ class TlsContext {
 
   static int verifyAccept(int /*preverifyOk*/, X509_STORE_CTX* /*store*/) {
     return 1;  // rejectUnauthorized=false: accept regardless of verification
+  }
+
+  // Session-ticket key callback implementing Node's setTicketKeys() layout
+  // (16-byte key name | 16-byte HMAC-SHA256 secret | 16-byte AES-128-CBC key)
+  // per SSL_CTX_set_tlsext_ticket_key_evp_cb(3). Used for both TLS 1.2
+  // tickets and TLS 1.3 NewSessionTicket PSKs. Return contract:
+  //   enc=1: 1 = ticket built with these keys, -1 = error (no ticket).
+  //   enc=0: 1 = key name matched, decrypt; 0 = foreign key name, fall back
+  //          to a FULL handshake (never a hard failure); -1 = error.
+  static int ticketKeyCb(SSL* ssl, unsigned char* name, unsigned char* iv,
+                         EVP_CIPHER_CTX* ectx, EVP_MAC_CTX* hctx, int enc) {
+    SSL_CTX* sslCtx = SSL_get_SSL_CTX(ssl);
+    TlsContext* self =
+        static_cast<TlsContext*>(sslCtx ? SSL_CTX_get_app_data(sslCtx) : nullptr);
+    if (!self || self->ticketKeys_.size() != 48) return -1;
+    const unsigned char* keys =
+        reinterpret_cast<const unsigned char*>(self->ticketKeys_.data());
+    const unsigned char* keyName = keys;        // [0,16)  ticket key name
+    const unsigned char* hmacKey = keys + 16;   // [16,32) HMAC-SHA256 secret
+    const unsigned char* aesKey = keys + 32;    // [32,48) AES-128-CBC key
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST,
+                                         const_cast<char*>("sha256"), 0),
+        OSSL_PARAM_construct_end(),
+    };
+    if (enc) {
+      memcpy(name, keyName, 16);
+      // iv is an EVP_MAX_IV_LENGTH buffer; AES-128-CBC uses 16 of it.
+      if (RAND_bytes(iv, 16) <= 0) return -1;
+      if (EVP_EncryptInit_ex(ectx, EVP_aes_128_cbc(), nullptr, aesKey, iv) != 1)
+        return -1;
+      if (EVP_MAC_init(hctx, hmacKey, 16, params) != 1) return -1;
+      return 1;
+    }
+    if (memcmp(name, keyName, 16) != 0) return 0;  // not ours: full handshake
+    if (EVP_MAC_init(hctx, hmacKey, 16, params) != 1) return -1;
+    if (EVP_DecryptInit_ex(ectx, EVP_aes_128_cbc(), nullptr, aesKey, iv) != 1)
+      return -1;
+    return 1;
   }
 
   static int alpnSelectCb(SSL* /*ssl*/, const unsigned char** out,
@@ -243,7 +339,18 @@ class TlsContext {
         return sslError("SSL_CTX_add_extra_chain_cert");
       }
     }
-    ERR_clear_error();  // benign end-of-PEM error from the last read attempt
+    // NULL from PEM_read_bio_X509 is a benign EOF only when the queued error
+    // is PEM_R_NO_START_LINE; anything else is a truncated/corrupt
+    // intermediate and must fail init() loudly, not boot with a broken chain.
+    {
+      unsigned long e = ERR_peek_last_error();
+      if (ERR_GET_LIB(e) == ERR_LIB_PEM && ERR_GET_REASON(e) == PEM_R_NO_START_LINE) {
+        ERR_clear_error();
+      } else {
+        BIO_free(bio);
+        return sslError("parsing certificate chain PEM");
+      }
+    }
     BIO_free(bio);
     return "";
   }
@@ -255,14 +362,32 @@ class TlsContext {
     int added = 0;
     while (X509* ca = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) {
       int ok = X509_STORE_add_cert(store, ca);
+      // Advertise the subject in the client-CA list too (see init());
+      // SSL_CTX_add_client_CA copies the subject name, no ownership transfer.
+      int adv = SSL_CTX_add_client_CA(ctx_, ca);
       X509_free(ca);  // X509_STORE_add_cert up-refs
       if (ok != 1) {
         BIO_free(bio);
         return sslError("X509_STORE_add_cert");
       }
+      if (adv != 1) {
+        BIO_free(bio);
+        return sslError("SSL_CTX_add_client_CA");
+      }
       added++;
     }
-    ERR_clear_error();
+    // NULL from PEM_read_bio_X509 is a benign EOF only when the queued error
+    // is PEM_R_NO_START_LINE; anything else is a truncated/corrupt CA cert
+    // and must fail init() loudly, not boot a server with a broken store.
+    {
+      unsigned long e = ERR_peek_last_error();
+      if (ERR_GET_LIB(e) == ERR_LIB_PEM && ERR_GET_REASON(e) == PEM_R_NO_START_LINE) {
+        ERR_clear_error();
+      } else {
+        BIO_free(bio);
+        return sslError("parsing ca PEM");
+      }
+    }
     BIO_free(bio);
     if (added == 0) return "ca contained no PEM certificates";
     return "";
@@ -277,6 +402,7 @@ class TlsContext {
 
   SSL_CTX* ctx_ = nullptr;
   std::string passphrase_;
+  std::string ticketKeys_;  // 48 bytes (name|hmac|aes) when configured, else empty
   bool alpnH2_ = false;
 };
 
@@ -288,6 +414,20 @@ class TlsSession {
     ssl_ = SSL_new(ctx);
     rbio_ = BIO_new(BIO_s_mem());
     wbio_ = BIO_new(BIO_s_mem());
+    if (!ssl_ || !rbio_ || !wbio_) {
+      // Allocation failure. SSL_set_bio must only see valid BIOs, so
+      // ownership never transferred - free each piece individually and latch
+      // fatal_ so the caller sheds the connection instead of dereferencing
+      // nulls (every member function early-outs on fatal_).
+      if (rbio_) BIO_free(rbio_);
+      if (wbio_) BIO_free(wbio_);
+      if (ssl_) SSL_free(ssl_);
+      ssl_ = nullptr;
+      rbio_ = nullptr;
+      wbio_ = nullptr;
+      fatal_ = true;
+      return;
+    }
     // SSL_set_bio transfers BIO ownership to the SSL object; SSL_free frees all.
     SSL_set_bio(ssl_, rbio_, wbio_);
     SSL_set_accept_state(ssl_);
@@ -302,6 +442,7 @@ class TlsSession {
 
   // Negotiated ALPN protocol ("h2" / "http/1.1"), or "" when none.
   std::string alpn() const {
+    if (!ssl_) return std::string();
     const unsigned char* proto = nullptr;
     unsigned int len = 0;
     SSL_get0_alpn_selected(ssl_, &proto, &len);
@@ -323,9 +464,12 @@ class TlsSession {
                     std::string& cipherOut) {
     if (fatal_) return false;
     // BIO_s_mem grows as needed; a short write here is out-of-memory.
+    // Cap each BIO_write at 1 MiB: a >= 2 GiB remainder would cast negative
+    // (BIO_write takes int) and be misread as an error.
     size_t off = 0;
     while (off < len) {
-      int w = BIO_write(rbio_, data + off, static_cast<int>(len - off));
+      const int chunk = static_cast<int>(std::min<size_t>(len - off, 1u << 20));
+      int w = BIO_write(rbio_, data + off, chunk);
       if (w <= 0) {
         fatal_ = true;
         drain(cipherOut);
@@ -388,10 +532,13 @@ class TlsSession {
   // this indicates a bug or a torn-down session).
   bool writePlain(const char* data, size_t len, std::string& cipherOut) {
     if (fatal_ || !handshakeDone_) return false;
+    // Cap each SSL_write at 1 MiB: a >= 2 GiB remainder would cast negative
+    // (SSL_write takes int) and tear the connection down as a fake error.
     size_t off = 0;
     while (off < len) {
       ERR_clear_error();
-      int n = SSL_write(ssl_, data + off, static_cast<int>(len - off));
+      const int chunk = static_cast<int>(std::min<size_t>(len - off, 1u << 20));
+      int n = SSL_write(ssl_, data + off, chunk);
       if (n <= 0) {
         // With mem-BIOs WANT_WRITE cannot happen (wbio grows); anything else
         // is fatal.
@@ -416,10 +563,15 @@ class TlsSession {
 
  private:
   void drain(std::string& out) {
-    char buf[16 * 1024];
-    int n;
-    while ((n = BIO_read(wbio_, buf, sizeof(buf))) > 0) {
-      out.append(buf, static_cast<size_t>(n));
+    if (!wbio_) return;
+    // wbio_ is exclusively SSL-written and caller-drained, so after copying
+    // the whole buffer a reset cannot discard bytes anyone still expects;
+    // one BIO_get_mem_data + BIO_reset replaces a 16 KB BIO_read loop.
+    char* p = nullptr;
+    long n = BIO_get_mem_data(wbio_, &p);
+    if (n > 0) {
+      out.append(p, static_cast<size_t>(n));
+      (void)BIO_reset(wbio_);
     }
   }
 

@@ -26,9 +26,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   std::string out;
   bool ok = ctx.inflateMessage(
       std::string_view(reinterpret_cast<const char*>(data), size), out);
-  // On success or failure, the output must never exceed the cap (+ one 16KiB
-  // zlib output block, the granularity at which the cap is checked).
-  if (out.size() > kCap + 16384) __builtin_trap();
+  // On success or failure, the output must never exceed the cap (the check
+  // runs before each append, so not even transiently).
+  if (out.size() > kCap) __builtin_trap();
   (void)ok;
 
   // Feed it again through a fresh context in no-context-takeover mode to
@@ -40,7 +40,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     std::string out2;
     ctx2.inflateMessage(
         std::string_view(reinterpret_cast<const char*>(data), size), out2);
-    if (out2.size() > kCap + 16384) __builtin_trap();
+    if (out2.size() > kCap) __builtin_trap();
   }
   return 0;
 }

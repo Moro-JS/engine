@@ -43,6 +43,7 @@
     "@morojs/engine-linux-x64-gnu": "1.1.1",
     "@morojs/engine-linux-arm64-gnu": "1.1.1",
     "@morojs/engine-linux-x64-musl": "1.1.1",
+    "@morojs/engine-linux-arm64-musl": "1.1.1",
     "@morojs/engine-win32-x64": "1.1.1"
   },
   "keywords": [

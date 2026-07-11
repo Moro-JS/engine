@@ -64,6 +64,7 @@ optional-dependency lockfile bug ([npm/cli#4828](https://github.com/npm/cli/issu
 | `@morojs/engine-linux-x64-gnu`   | linux  | x64     | glibc |
 | `@morojs/engine-linux-arm64-gnu` | linux  | arm64   | glibc |
 | `@morojs/engine-linux-x64-musl`  | linux  | x64     | musl  |
+| `@morojs/engine-linux-arm64-musl` | linux | arm64 | musl  |
 
 Node ABIs: 115/127/131/137/141/147 (Node 20/22/23/24/25/26). Any other
 platform/ABI (including Windows, until an MSVC build lands) falls back to

@@ -14,7 +14,7 @@
 // What it does, in order:
 //   1. Safety gates: clean working tree, on main, --skip-checks-able build+smoke.
 //   2. Bumps the version EVERYWHERE it lives: the meta package + its exact
-//      optionalDependencies pins, all 6 platform packages, the monorepo root,
+//      optionalDependencies pins, all 7 platform packages, the monorepo root,
 //      and the kEngineVersion fallback in src/binding.cpp.
 //   3. Commits "chore: release vX.Y.Z", tags vX.Y.Z, pushes main + the tag.
 //   4. YOU then draft the GitHub Release for that tag (paste the vX.Y.Z.md

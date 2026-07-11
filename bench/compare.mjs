@@ -1,6 +1,7 @@
-// Bench result recorder / gate. Reads 3 autocannon medians from run.sh,
-// takes the middle value, and either reports, records it as the machine's
-// baseline, or gates at >= GATE_RATIO of the recorded baseline.
+// Bench result recorder / gate. Reads 3 per-run average throughputs
+// (autocannon `requests.average`) from run.sh, takes the median of the
+// three, and either reports, records it as the machine's baseline, or
+// gates at >= GATE_RATIO of the recorded baseline.
 //
 // Baselines are per-machine (hostname+cpu) because absolute req/s numbers
 // are meaningless across hosts: the ship gate runs on the machine that

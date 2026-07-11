@@ -221,6 +221,11 @@ inline void HttpParser::reset() {
   if (consumed_ > 0) {
     buf_.erase(0, consumed_);
   }
+  // A huge request's buffered bytes (e.g. a 10 MB upload) must not stay
+  // pinned to an idle keep-alive connection (same policy as body/scratch);
+  // only shrink when the remaining content is small. shrink_to_fit preserves
+  // content, so a pipelined leftover survives.
+  if (buf_.capacity() > 65536 && buf_.size() <= 65536) buf_.shrink_to_fit();
   consumed_ = 0;
   scanPos_ = 0;
   state_ = State::RequestLine;
@@ -450,6 +455,15 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
       if (line.empty()) {  // blank line terminates the head
         headEnd_ = nextScan;
         scanPos_ = nextScan;
+        // Final head-size check, including the terminating blank line. This
+        // (not buf_.size()) is the complete head's true size: the buffer may
+        // already hold the request's body when a buffered batch is replayed
+        // in one parse() call, and those bytes must not count against the
+        // head limit.
+        if (headEnd_ - consumed_ > limits_.maxHeadSize) {
+          errorStatus = 431;
+          return ParseStatus::Error;
+        }
         // Trim stale reuse-slots from a prior, larger request BEFORE any
         // consumer can iterate the vector.
         headers.resize(headerCount_);
@@ -468,7 +482,14 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
       if (!parseHeaderLine(line)) return ParseStatus::Error;
       scanPos_ = nextScan;
     }
-    if (buf_.size() - consumed_ > limits_.maxHeadSize && state_ != State::Body &&
+    // Bound the HEAD bytes scanned so far (scanPos_), not the whole buffer:
+    // buf_ may already hold the request's body (or pipelined follow-ups) when
+    // a buffered batch is replayed in one parse() call, and counting those
+    // bytes would 431 a valid request whose body exceeds maxHeadSize. The
+    // no-newline branch above can keep using buf_.size(): body bytes are
+    // always preceded by the blank line's '\n', so an un-terminated remainder
+    // is head bytes by construction.
+    if (scanPos_ - consumed_ > limits_.maxHeadSize && state_ != State::Body &&
         state_ != State::ChunkSize) {
       errorStatus = 431;
       return ParseStatus::Error;

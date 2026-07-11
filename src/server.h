@@ -82,9 +82,15 @@ inline const char* reasonPhrase(int status) {
 class Server;
 struct Connection;
 
-// Globally-unique request id counter + registry, so the V8 binding can map a reqId (its only handle) back to a Connection regardless of which Server owns it.
+// Request id counter + registry mapping a reqId (the binding's only handle)
+// back to its Connection, across every Server on the calling thread.
+// thread_local, not process-global: worker_threads + reusePort (see
+// HttpLimits::reusePort) runs one engine per thread, each with its own uv
+// loop, servers and connections, and a reqId only ever crosses the
+// JS<->C++ boundary on the thread that created it - per-thread registries
+// are race-free without locks.
 inline uint32_t& globalReqCounter() {
-  static uint32_t counter = 0;
+  static thread_local uint32_t counter = 0;
   return counter;
 }
 inline std::unordered_map<uint32_t, Connection*>& globalRequests() {
@@ -92,7 +98,7 @@ inline std::unordered_map<uint32_t, Connection*>& globalRequests() {
   // EVERY request, so rehashes and collision chains sit directly on the hot
   // path. 4096 buckets at 0.5 load ≈ 2048 concurrent in-flight requests
   // before the first rehash.
-  static std::unordered_map<uint32_t, Connection*> map = [] {
+  static thread_local std::unordered_map<uint32_t, Connection*> map = [] {
     std::unordered_map<uint32_t, Connection*> m;
     m.max_load_factor(0.5f);
     m.reserve(2048);
@@ -101,13 +107,13 @@ inline std::unordered_map<uint32_t, Connection*>& globalRequests() {
   return map;
 }
 
-// WebSocket connections get their own id space + registry (a wsId outlives the reqId that created it).
+// WebSocket connections get their own id space + registry (a wsId outlives the reqId that created it). Same per-thread ownership rules as globalRequests().
 inline uint32_t& globalWsCounter() {
-  static uint32_t counter = 0;
+  static thread_local uint32_t counter = 0;
   return counter;
 }
 inline std::unordered_map<uint32_t, Connection*>& globalWebSockets() {
-  static std::unordered_map<uint32_t, Connection*> map;
+  static thread_local std::unordered_map<uint32_t, Connection*> map;
   return map;
 }
 
@@ -163,6 +169,10 @@ struct Connection {
   bool wsClosing = false;
   // permessage-deflate context (RFC 7692); null unless negotiated for this connection at upgrade time.
   PmdContext* pmd = nullptr;
+  // Outbound compression goes through the Server's SharedDeflator instead of
+  // this connection's pmd (which is then InflateOnly). Set at upgrade when
+  // wsDeflate.sharedCompressor negotiated the server's full window.
+  bool pmdShared = false;
 
   // TLS transform when the server terminates TLS; null on plaintext servers (the hot path pays exactly one null check).
   TlsSession* tls = nullptr;
@@ -566,11 +576,21 @@ class Server {
       if (h.name == "upgrade" && iequals(trimOWS(h.value), "websocket"))
         hasUpgrade = true;
       else if (h.name == "connection") {
-        // token list may contain other options (e.g. "keep-alive, Upgrade")
+        // Connection is a comma-separated list of case-insensitive tokens
+        // (RFC 9110 §7.6.1), e.g. "keep-alive, Upgrade" - tokenize and compare
+        // each (same tokenization as finalizeHeaders): a substring match would
+        // wrongly accept "not-upgrade", a case-sensitive one wrongly reject
+        // "UPGRADE".
         std::string_view v = h.value;
-        if (v.find("Upgrade") != std::string_view::npos ||
-            v.find("upgrade") != std::string_view::npos)
-          hasConnUpgrade = true;
+        size_t pos = 0;
+        while (pos <= v.size()) {
+          size_t comma = v.find(',', pos);
+          std::string_view tok = trimOWS(v.substr(
+              pos, comma == std::string_view::npos ? v.size() - pos : comma - pos));
+          if (iequals(tok, "upgrade")) hasConnUpgrade = true;
+          if (comma == std::string_view::npos) break;
+          pos = comma + 1;
+        }
       } else if (h.name == "sec-websocket-key")
         key = &h.value;
       else if (h.name == "sec-websocket-version" && trimOWS(h.value) == "13")
@@ -589,10 +609,42 @@ class Server {
         size_t cap = limits_.wsDeflate.maxDecompressedSize
                          ? limits_.wsDeflate.maxDecompressedSize
                          : limits_.wsMaxMessageSize;
-        auto* ctx = new PmdContext(*pmdParams, cap);
+        // wsDeflate.sharedCompressor: route this connection's outbound
+        // compression through the ONE server-owned deflate stream instead of
+        // a ~262 KB per-connection one. Only when the negotiated server
+        // window equals the shared stream's window, i.e. the client did NOT
+        // cap server_max_window_bits below the configured value: the shared
+        // stream has one FIXED window, and re-negotiating it per client
+        // would defeat the sharing - such clients keep today's
+        // per-connection full PmdContext (honoring their cap).
+        bool useShared =
+            limits_.wsDeflate.sharedCompressor &&
+            pmdParams->serverMaxWindowBits == limits_.wsDeflate.serverMaxWindowBits;
+        if (useShared && !sharedDeflator_) {
+          // Created lazily at the first eligible upgrade (not in the Server
+          // constructor): a server that enables the option but never sees a
+          // pmd client allocates nothing.
+          sharedDeflator_.reset(
+              new SharedDeflator(limits_.wsDeflate.serverMaxWindowBits));
+          if (!sharedDeflator_->valid()) sharedDeflator_.reset();
+        }
+        if (useShared && !sharedDeflator_) useShared = false;  // zlib init failed
+        if (useShared) {
+          // The shared stream is reset after EVERY message, so the response
+          // must advertise server_no_context_takeover - RFC 7692 §7.1.1.1
+          // explicitly permits the server to include it even when the offer
+          // didn't ask for it. Set BEFORE buildPmdResponse below.
+          pmdParams->serverNoContextTakeover = true;
+        }
+        auto* ctx = new PmdContext(*pmdParams, cap,
+                                   useShared ? PmdContext::Mode::InflateOnly
+                                             : PmdContext::Mode::Full);
         if (ctx->valid()) {
+          // The threshold lives on the context even in InflateOnly mode so
+          // wsSend's threshold check is identical on both paths.
           ctx->setThreshold(limits_.wsDeflate.threshold);
           c->pmd = ctx;
+          c->pmdShared = useShared;
           extResp = buildPmdResponse(*pmdParams);
         } else {
           delete ctx;  // zlib init failed - fall back to no compression
@@ -622,7 +674,7 @@ class Server {
 
     const uint32_t wsId = c->wsId;
     if (cb_.onWsOpen) cb_.onWsOpen(cb_.user, c, c->path);
-    // Frames the client sent in the same TCP segment as the handshake are already buffered in the HTTP parser - hand them to the WebSocket parser (copied out first: feedWebSocket may tear the connection down on a protocol error, after which c and its parser must not be touched).
+    // Frames the client sent in the same TCP segment as the handshake are already buffered in the HTTP parser - hand them to the WebSocket parser (copied out first: feedWebSocket may tear the connection down on a protocol error, after which c and its parser must not be touched; the copy is also the mutable storage the parser's in-place unmasking needs).
     std::string early(c->parser.leftover());
     c->parser = HttpParser(limits_);  // HTTP is done on this connection
     if (!early.empty()) feedWebSocket(c, early.data(), early.size());
@@ -632,18 +684,33 @@ class Server {
   // Send a WebSocket data frame (server frames are never masked, §5.1). permessage-deflate: when negotiated and the message is at least the configured threshold, compress it and set RSV1 (RFC 7692 §7.2.1).
   bool wsSend(Connection* c, const char* data, size_t len, bool isBinary) {
     if (!c || !c->isWebSocket || c->closing || c->wsClosing) return false;
-    std::string out;
     bool compressed = false;
     std::string deflated;
-    if (c->pmd && len >= c->pmd->threshold() &&
-        c->pmd->deflateMessage(std::string_view(data, len), deflated)) {
-      compressed = true;
+    if (c->pmd && len >= c->pmd->threshold()) {
+      // pmdShared connections deflate through the server-owned SharedDeflator
+      // (their PmdContext is InflateOnly - see upgradeToWebSocket); the reset
+      // after every message keeps interleaved connections independent.
+      std::string_view in(data, len);
+      compressed = c->pmdShared
+                       ? (sharedDeflator_ && sharedDeflator_->deflateMessage(in, deflated))
+                       : c->pmd->deflateMessage(in, deflated);
     }
     std::string_view payload = compressed ? std::string_view(deflated)
                                           : std::string_view(data, len);
+    // Frame into the connection's reusable scratch buffer (same policy as
+    // respond()'s non-corked path): a warm connection sends with zero
+    // allocations, and releaseScratch keeps one huge frame from pinning its
+    // capacity. writeOutView never keeps a reference past the call: the bytes
+    // reach the kernel synchronously (uv_try_write) or are copied first -
+    // into a queued WriteReq, the TLS ciphertext buffer (writePlain), or
+    // corkBuf (a wsSend issued from onWsOpen/onWsMessage inside the upgrade's
+    // still-corked dispatch).
+    std::string& out = c->scratch;
+    out.clear();
     encodeFrame(out, isBinary ? WsOpcode::Binary : WsOpcode::Text, payload,
                 /*fin=*/true, /*rsv1=*/compressed);
-    writeOut(c, std::move(out), /*terminal=*/false);
+    writeOutView(c, out, /*terminal=*/false);
+    releaseScratch(c);
     size_t q = uv_stream_get_write_queue_size(reinterpret_cast<uv_stream_t*>(&c->handle));
     if (limits_.wsBackpressureLimit && q > limits_.wsBackpressureLimit) {
       // Slow/stalled consumer - shed it (1013 Try Again Later) so its queued frames can't grow memory without bound (limits_.wsBackpressureLimit, 0 = unlimited; maxBackpressure defense).
@@ -1033,7 +1100,14 @@ class Server {
   // Plaintext ingestion - identical for direct TCP reads and decrypted TLS records. May tear the connection down (doClose sets c->closing; the Connection object itself stays alive until uv's close callback).
   void dispatchPlaintext(Connection* c, const char* data, size_t len) {
     if (c->isWebSocket) {
-      feedWebSocket(c, data, len);
+      // Zero-copy WS receive: the parser unmasks complete frames IN PLACE in
+      // this buffer, so feedWebSocket takes mutable bytes. The const here is
+      // only an artifact of this shared signature — both actual sources are
+      // mutable storage we own: c->readBuf for plaintext reads (onAlloc
+      // hands its storage to uv_read) and TlsSession::onCiphertext's local
+      // decrypt scratch (a stack buffer) for TLS. Neither is reused until
+      // the next uv_read / TLS record, after consume() has returned.
+      feedWebSocket(c, const_cast<char*>(data), len);
       return;
     }
     if (c->active) {
@@ -1049,12 +1123,18 @@ class Server {
     dispatchBatch(c, st);
   }
 
-  void feedWebSocket(Connection* c, const char* data, size_t len) {
+  // `data` is mutable: the parser's zero-copy fast path unmasks complete
+  // single-frame messages in place and the onWsMessage payload may be a view
+  // into it. That view stays valid across everything the JS callback can do
+  // (wsSend/wsClose/doClose write to other buffers; nothing re-enters a read)
+  // because reads are sequential on the loop: the read buffer is not touched
+  // again until the next uv_read/TLS record, after consume() returns.
+  void feedWebSocket(Connection* c, char* data, size_t len) {
     if (c->wsClosing || !c->wsParser) return;
     // Set when an inbound message fails inflate/UTF-8 (RFC 7692/6455): the parser itself succeeds, so surface the close code out-of-band.
     uint16_t pmdFail = 0;
     bool ok = c->wsParser->consume(
-        reinterpret_cast<const uint8_t*>(data), len,
+        reinterpret_cast<uint8_t*>(data), len,
         [&](std::string_view payload, bool isBinary, bool compressed) {
           if (compressed && c->pmd) {
             // Inflate (hard output cap = zip-bomb defense), then UTF-8-validate text post-inflate (the parser skipped it for compressed frames).
@@ -1286,6 +1366,11 @@ class Server {
   ServerCallbacks cb_;
   HttpLimits limits_;
   size_t maxPending_ = 0;  // per-connection not-yet-parsed backlog cap
+  // The one deflate stream every pmdShared connection sends through
+  // (wsDeflate.sharedCompressor). Created lazily at the first eligible
+  // upgrade; unique_ptr so checkFullyClosed's `delete this` frees it with
+  // the rest of the Server.
+  std::unique_ptr<SharedDeflator> sharedDeflator_;
   // Deferred-shutdown bookkeeping: the Server outlives close() until every uv handle it owns (listener + sweep timer + each connection) is reaped.
   int liveHandles_ = 0;
   bool closeRequested_ = false;

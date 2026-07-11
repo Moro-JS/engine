@@ -12,6 +12,7 @@ packages/
   engine-linux-x64-gnu/       -> @morojs/engine-linux-x64-gnu
   engine-linux-arm64-gnu/     -> @morojs/engine-linux-arm64-gnu
   engine-linux-x64-musl/      -> @morojs/engine-linux-x64-musl
+  engine-linux-arm64-musl/    -> @morojs/engine-linux-arm64-musl
   engine-win32-x64/           -> @morojs/engine-win32-x64
 ```
 
@@ -36,7 +37,7 @@ which:
    per-platform package directory copies that platform's matching `.node` files
    in, drops the root `LICENSE` alongside them, and sets `version`; then syncs
    the meta package's own `version` **and** every exact-pinned
-   `optionalDependencies` entry to the same version (so the seven version
+   `optionalDependencies` entry to the same version (so the eight version
    strings can never drift). `--check` fails the release if any published
    platform received zero binaries.
 3. Publishes each per-platform package, then the meta package (`packages/engine`)

@@ -43,6 +43,7 @@ esbuild-style: `@morojs/engine` meta package (loader + types) with per-platform 
 @morojs/engine-darwin-arm64      @morojs/engine-linux-x64-gnu
 @morojs/engine-darwin-x64        @morojs/engine-linux-arm64-gnu
 @morojs/engine-win32-x64         @morojs/engine-linux-x64-musl
+@morojs/engine-linux-arm64-musl
 ```
 
 Each platform package carries one binary per supported ABI:

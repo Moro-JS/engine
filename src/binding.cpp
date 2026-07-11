@@ -10,6 +10,7 @@
 #include <uv.h>
 #include <v8.h>
 
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -66,8 +67,12 @@ struct JsServer {
   static constexpr size_t kPathCacheMaxLen = 128;
 };
 
-static std::unordered_map<uint32_t, JsServer*> g_servers;
-static uint32_t g_serverIdCounter = 0;
+// thread_local, not process-global: worker_threads + reusePort (see
+// HttpLimits::reusePort) runs one engine per thread, each with its own uv loop
+// and servers, and a serverId only ever crosses the JS<->C++ boundary on the
+// thread that created it - per-thread registries are race-free without locks.
+static thread_local std::unordered_map<uint32_t, JsServer*> g_servers;
+static thread_local uint32_t g_serverIdCounter = 0;
 
 // Invoked by Server once it is fully closed and self-deleted. Releases the
 // per-server JS state (the Global<> destructors Reset the handles, unpinning
@@ -90,34 +95,74 @@ static Local<String> str(Isolate* iso, const char* s) {
   return String::NewFromUtf8(iso, s).ToLocalChecked();
 }
 
+// Borrowed, zero-copy view of a JS value's bytes (string | ArrayBuffer |
+// TypedArray | DataView). A string's UTF-8 lives in the owned Utf8Value
+// member; ArrayBuffer backing stores are external allocations whose data
+// pointer is stable while no JS runs (nothing can detach the buffer under
+// the borrow). valid() is false for null/undefined (no byte content).
+// Safe to pass into Server::respond/write/end/wsSend: those copy the bytes
+// into engine-owned buffers (Connection::scratch / corkBuf / the TLS
+// ciphertext buffer / a queued WriteReq - see respond/appendResponse/
+// writeOutView in server.h) before any JS re-entry, so the borrow never
+// outlives this stack frame.
+class ByteSource {
+ public:
+  ByteSource(Isolate* iso, Local<Value> v) {
+    if (v->IsString()) {
+      // String::Utf8Value is stable across V8 versions (Node 20..26); the
+      // direct Utf8Length/WriteUtf8 API changed shape in V8 14 (Node 26).
+      utf8_.emplace(iso, v);
+      if (**utf8_) {
+        data_ = **utf8_;
+        size_ = static_cast<size_t>(utf8_->length());
+      }
+      valid_ = true;
+      return;
+    }
+    if (v->IsArrayBuffer()) {
+      Local<ArrayBuffer> ab = v.As<ArrayBuffer>();
+      // ab->Data() rather than GetBackingStore()->Data(): the latter
+      // materializes a std::shared_ptr<BackingStore> whose control block was
+      // created inside the Node binary, and UBSan's cross-DSO vptr check
+      // trips on its destruction.
+      data_ = static_cast<const char*>(ab->Data());
+      size_ = ab->ByteLength();
+      valid_ = true;
+      return;
+    }
+    if (v->IsTypedArray() || v->IsDataView()) {
+      Local<v8::ArrayBufferView> view = v.As<v8::ArrayBufferView>();
+      data_ = static_cast<const char*>(view->Buffer()->Data()) + view->ByteOffset();
+      size_ = view->ByteLength();
+      valid_ = true;
+    }
+  }
+  bool valid() const { return valid_; }
+  // data() is null only when size() == 0 (null/undefined, an empty
+  // ArrayBuffer, or a string whose UTF-8 conversion failed) - callers may
+  // pass (data(), size()) through unconditionally.
+  const char* data() const { return data_; }
+  size_t size() const { return size_; }
+
+ private:
+  std::optional<String::Utf8Value> utf8_;
+  const char* data_ = nullptr;
+  size_t size_ = 0;
+  bool valid_ = false;
+};
+
 // Copy the bytes of a JS value (string | ArrayBuffer | TypedArray) into out.
 // Returns false if the value carries no byte content (null/undefined).
+// Config-path convenience (ssl key/cert/ca); the request/WS hot paths borrow
+// via ByteSource instead of copying.
 static bool extractBytes(Isolate* iso, Local<Context> ctx, Local<Value> v,
                          std::string& out) {
-  if (v->IsString()) {
-    // String::Utf8Value is stable across V8 versions (Node 20..26); the direct
-    // Utf8Length/WriteUtf8 API changed shape in V8 14 (Node 26).
-    String::Utf8Value s(iso, v);
-    if (*s) out.assign(*s, s.length());
-    else out.clear();
-    return true;
-  }
-  if (v->IsArrayBuffer()) {
-    Local<ArrayBuffer> ab = v.As<ArrayBuffer>();
-    // ab->Data() rather than GetBackingStore()->Data(): the latter materializes
-    // a std::shared_ptr<BackingStore> whose control block was created inside the
-    // Node binary, and UBSan's cross-DSO vptr check trips on its destruction.
-    out.assign(static_cast<const char*>(ab->Data()), ab->ByteLength());
-    return true;
-  }
-  if (v->IsTypedArray() || v->IsDataView()) {
-    Local<v8::ArrayBufferView> view = v.As<v8::ArrayBufferView>();
-    const char* base = static_cast<const char*>(view->Buffer()->Data()) + view->ByteOffset();
-    out.assign(base, view->ByteLength());
-    return true;
-  }
   (void)ctx;
-  return false;
+  ByteSource src(iso, v);
+  if (!src.valid()) return false;
+  if (src.size()) out.assign(src.data(), src.size());
+  else out.clear();
+  return true;
 }
 
 // RFC 9110 §5.1 token characters, the only bytes legal in a field name.
@@ -127,7 +172,10 @@ static bool validHeaderName(const char* s, int n) {
     const unsigned char ch = static_cast<unsigned char>(s[i]);
     const bool alnum = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') ||
                        (ch >= 'A' && ch <= 'Z');
-    if (!alnum && !strchr("!#$%&'*+-.^_`|~", ch)) return false;
+    // ch must be checked against 0 first: strchr matches the set string's
+    // terminating NUL, so a bare !strchr would accept a 0x00 byte in a
+    // field name.
+    if (!alnum && (ch == 0 || !strchr("!#$%&'*+-.^_`|~", ch))) return false;
   }
   return true;
 }
@@ -424,6 +472,7 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
         getIntW("clientMaxWindowBits", limits.wsDeflate.clientMaxWindowBits);
         getSizeW("threshold", limits.wsDeflate.threshold);
         getSizeW("maxDecompressedSize", limits.wsDeflate.maxDecompressedSize);
+        getBoolW("sharedCompressor", limits.wsDeflate.sharedCompressor);
       }
     }
   }
@@ -462,6 +511,13 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
       getBytes("key", ssl.keyPem);
       getBytes("cert", ssl.certPem);
       getBytes("ca", ssl.caPem);
+      getBytes("ticketKeys", ssl.ticketKeys);
+      if (!ssl.ticketKeys.empty() && ssl.ticketKeys.size() != 48) {
+        iso->ThrowException(v8::Exception::Error(str(
+            iso, "ssl.ticketKeys must be exactly 48 bytes (see Node's tls.Server ticketKeys)")));
+        delete js;
+        return;
+      }
       getStr("passphrase", ssl.passphrase);
       std::string minVer;
       getStr("minVersion", minVer);
@@ -647,10 +703,12 @@ static void Respond(const FunctionCallbackInfo<Value>& args) {
   std::string headers;
   long long customCL = -1;
   buildHeaders(iso, ctx, args[2], headers, customCL);
-  std::string body;
-  bool hasBody = args.Length() >= 4 && extractBytes(iso, ctx, args[3], body);
-  c->server->respond(c, status, headers, customCL,
-                     hasBody ? body.data() : nullptr, hasBody ? body.size() : 0);
+  // The body borrow is taken AFTER buildHeaders: buildHeaders can run
+  // arbitrary JS (array getters / valueOf), which could detach an ArrayBuffer
+  // out from under an earlier borrow. Both stay on this stack through the
+  // respond() call.
+  ByteSource body(iso, args[3]);
+  c->server->respond(c, status, headers, customCL, body.data(), body.size());
 }
 
 // writeHead(reqId, status, headersFlat|null)
@@ -669,25 +727,22 @@ static void WriteHead(const FunctionCallbackInfo<Value>& args) {
 // write(reqId, chunk) -> boolean backpressure
 static void Write(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
-  Local<Context> ctx = iso->GetCurrentContext();
   Connection* c = connFrom(args);
   if (!c) { args.GetReturnValue().Set(false); return; }
-  std::string chunk;
+  ByteSource chunk(iso, args[1]);
   bool ok = true;
-  if (args.Length() >= 2 && extractBytes(iso, ctx, args[1], chunk))
-    ok = c->server->write(c, chunk.data(), chunk.size());
+  if (chunk.valid()) ok = c->server->write(c, chunk.data(), chunk.size());
   args.GetReturnValue().Set(ok);
 }
 
 // end(reqId, chunk?)
 static void End(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
-  Local<Context> ctx = iso->GetCurrentContext();
   Connection* c = connFrom(args);
   if (!c) return;
-  std::string chunk;
-  bool hasChunk = args.Length() >= 2 && extractBytes(iso, ctx, args[1], chunk);
-  c->server->end(c, hasChunk ? chunk.data() : nullptr, hasChunk ? chunk.size() : 0);
+  // A missing/null/undefined chunk borrows nothing: end(nullptr, 0).
+  ByteSource chunk(iso, args[1]);
+  c->server->end(c, chunk.data(), chunk.size());
 }
 
 // ---- WebSocket (RFC 6455) ----
@@ -711,14 +766,12 @@ static Connection* wsFrom(const FunctionCallbackInfo<Value>& args) {
 // wsSend(wsId, data, isBinary) -> boolean backpressure
 static void WsSend(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
-  Local<Context> ctx = iso->GetCurrentContext();
   Connection* c = wsFrom(args);
   if (!c) { args.GetReturnValue().Set(false); return; }
-  std::string data;
   bool isBinary = args.Length() >= 3 && args[2]->BooleanValue(iso);
+  ByteSource data(iso, args[1]);
   bool ok = true;
-  if (args.Length() >= 2 && extractBytes(iso, ctx, args[1], data))
-    ok = c->server->wsSend(c, data.data(), data.size(), isBinary);
+  if (data.valid()) ok = c->server->wsSend(c, data.data(), data.size(), isBinary);
   args.GetReturnValue().Set(ok);
 }
 
