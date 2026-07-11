@@ -1,6 +1,6 @@
 {
   "name": "@morojs/engine-darwin-x64",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Prebuilt @morojs/engine native binaries for darwin/x64 (all supported Node ABIs).",
   "license": "MIT",
   "author": "CM Ventures Inc.",
