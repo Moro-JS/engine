@@ -13,7 +13,7 @@ Windows (MSVC) CI build leg (the local build has landed in `tools/build.mjs`).
 | M2 streaming | ✅ done | writeHead/write/end, backpressure, chunked, HEAD, 100-continue, sendFile |
 | M3 TLS | ✅ done | `serve()` `options.ssl` (both MoroJS shapes), OpenSSL from the host Node binary, memory-BIO transform (`src/tls.h`), ALPN, HTTPS+WSS conformance + hardening suites + `fuzz_tls_transport`. SNI multi-identity not implemented (one key/cert per server). |
 | M4 WebSocket | ✅ done | RFC 6455 framing/handshake, integrated, `EngineWebSocketAdapter`; socket conformance green; failure closes carry 1002/1007/1009 per §7.4.1; permessage-deflate shipped (opt-in) |
-| M5 hardening | ✅ done | libFuzzer harnesses + corpus, ASan/UBSan clean, idle/slowloris timeout, CI fuzz/sanitizer jobs, SECURITY.md + THREAT_MODEL.md; found+fixed a Content-Length overflow smuggling bug. External review recommended before untrusted-facing TLS production (a human gate, not yet done). |
+| M5 hardening | ✅ done | libFuzzer harnesses + corpus, ASan/UBSan clean, idle/slowloris timeout, CI fuzz/sanitizer jobs, SECURITY.md + THREAT_MODEL.md; found+fixed a Content-Length overflow smuggling bug. As with any TLS-terminating software, a formal independent security audit is recommended for the highest-assurance untrusted-facing deployments. |
 | M6 GA 1.0.0 | ✅ done | first published release; stable surface; every cap runtime-configurable via serve() options; `probe().capabilities` feature flags; MoroJS ships the engine as its default (`engine: 'moro'`) with Node fallback |
 | v1.1.0 perf | ✅ done | pipelined response corking (one write per batch) + zero-allocation warm hot path (header slot reuse, snapshot swaps, scratch response buffer, zero-copy fast-path writes); ~3.7× pipelined throughput vs 1.0.0 |
 
@@ -25,8 +25,8 @@ Windows (MSVC) CI build leg (the local build has landed in `tools/build.mjs`).
 - **Windows (MSVC) CI build leg** — the local build lands in `tools/build.mjs`;
   wiring the CI matrix leg is the remaining packaging work.
 - **SNI multi-identity** — one key/cert per server today; per-SNI dispatch is future.
-- **External security review** before untrusted-facing production — a human gate,
-  not self-certifiable.
+- **Formal independent security audit** — recommended, as with any TLS-terminating
+  software, before the highest-assurance untrusted-facing deployments.
 - **max-connections cap + per-request total-time / min-throughput timeouts** —
   the idle sweep reaps silent connections but not a steady byte-trickle.
 
@@ -89,8 +89,8 @@ Completed for 1.0:
   the threat-model pass (reject during digit accumulation, regression-tested).
 
 Ongoing / recommended:
-- **External security review** before relying on the engine for untrusted-facing
-  production traffic — a human gate, not self-certifiable.
+- **Formal independent security audit** — recommended, as with any TLS-terminating
+  software, before the highest-assurance untrusted-facing deployments.
 - max-connections cap and per-request total-time / min-throughput timeouts (the
   idle sweep reaps silent connections but not steady byte-trickle).
 

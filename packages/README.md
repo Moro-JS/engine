@@ -30,7 +30,7 @@ Binaries ship **only** from a tagged CI run with npm provenance, never from a
 developer machine (see `CONTRIBUTING.md`). Pushing a `v*` tag runs `release.yml`,
 which:
 
-1. Rebuilds every platform (same matrix as `build.yml`) and collects the
+1. Rebuilds every platform (same matrix as `ci.yml`) and collects the
    `build/*.node` artifacts (`moro_engine_<platform>_<arch>[_<libc>]_<abi>.node`,
    one per supported ABI — the `libc` segment keeps glibc and musl distinct).
 2. Runs `node tools/prepare-release.mjs <version> --check`, which for each
@@ -52,23 +52,24 @@ committed scaffold contains no `.node` files and would publish an empty package.
 ## Adding a new Node ABI
 
 Add one line to `TARGETS` in `tools/build.mjs`, add the Node version to the
-smoke matrix in `.github/workflows/build.yml`, and ship a minor release. No
+smoke matrix in `.github/workflows/ci.yml`, and ship a minor release. No
 package-layout change is needed - each per-platform package simply carries the
 additional `.node`.
 
 ## win32 status
 
-`@morojs/engine-win32-x64` is scaffolded (the package directory exists) but is
-**deliberately NOT listed as an optionalDependency** of the meta package, and is
-not published: `tools/build.mjs` has no MSVC compile branch yet (the `build`
-workflow's `windows` leg is `continue-on-error` / expected to fail).
+`@morojs/engine-win32-x64` is a **fully shipped platform**, on the same footing
+as darwin and linux:
 
-It is left out of `optionalDependencies` on purpose — pinning an unpublished
-version there makes strict installers (notably Yarn Classic) fail `install` on
-**every** platform with "package not found". On Windows the engine simply isn't
-found and MoroJS falls back to Node's `http` server.
+- It is listed as an exact-version `optionalDependency` of the meta package
+  (`packages/engine/package.json`), so npm installs it on a matching Windows
+  host.
+- `tools/build.mjs` has a complete MSVC compile branch — it downloads the
+  per-ABI `node.lib` (SHASUMS-verified) and compiles with `cl.exe`
+  (`/DELAYLOAD:node.exe` + the `src/win_delay_load_hook.h` hook so the addon
+  binds to whatever process hosts it).
+- `.github/workflows/ci.yml` and `release.yml` build, load-smoke, and
+  conformance-test the win32-x64 binary alongside every other flavor.
 
-To start shipping Windows: add an MSVC branch to `build.mjs` (download `node.lib`
-per ABI + `cl.exe` flags, mirroring the darwin/linux branches), then add
-`@morojs/engine-win32-x64` back to the meta package's `optionalDependencies`.
-The packaging scaffold is otherwise already in place.
+On a Windows host with a matching prebuilt binary the native engine loads; on
+any platform/ABI without one, MoroJS falls back to Node's `http` server.

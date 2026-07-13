@@ -1,0 +1,18 @@
+version: 2
+
+# Keep GitHub Actions pinned-by-SHA references current. Actions are pinned to
+# full commit SHAs (with a `# vX.Y.Z` comment) in the workflows for supply-chain
+# integrity; Dependabot bumps those SHAs — and their version comments — when a
+# new release lands, opening a PR that CI gates like any other change.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # One PR per week for routine action bumps instead of one per action.
+      github-actions:
+        patterns:
+          - '*'
+    commit-message:
+      prefix: ci

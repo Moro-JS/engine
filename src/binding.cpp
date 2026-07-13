@@ -10,6 +10,7 @@
 #include <uv.h>
 #include <v8.h>
 
+#include <climits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -92,6 +93,12 @@ static void freeJsServer(void* user) {
 // empty string instead of aborting the whole Node process.
 static Local<String> str(Isolate* iso, const std::string& s) {
   Local<String> out;
+  // NewFromUtf8's length is an int. A string past INT_MAX (reachable only when
+  // an operator raises a size limit past 2 GiB) would cast negative - V8 then
+  // treats the data as NUL-terminated and over-reads - or, just past 2^32,
+  // wrap to a small positive length (silent truncation). Guard before the
+  // cast; degrade to an empty string, the same fallback as a NewFromUtf8 fail.
+  if (s.size() > static_cast<size_t>(INT_MAX)) return String::Empty(iso);
   if (String::NewFromUtf8(iso, s.c_str(), v8::NewStringType::kNormal,
                           static_cast<int>(s.size()))
           .ToLocal(&out))
@@ -364,7 +371,12 @@ static void cbOnWsMessage(void* user, Connection* c, const char* data,
     payload = ab;
   } else {
     Local<String> text;
-    if (!String::NewFromUtf8(iso, data, v8::NewStringType::kNormal,
+    // The len > INT_MAX check runs BEFORE the cast: a length past 2 GiB would
+    // cast negative (V8 reads `data` as NUL-terminated and over-reads) or, just
+    // past 2^32, wrap to a small positive length (silent truncation). Either
+    // way it must never reach NewFromUtf8; take the drop-and-log path instead.
+    if (len > static_cast<size_t>(INT_MAX) ||
+        !String::NewFromUtf8(iso, data, v8::NewStringType::kNormal,
                              static_cast<int>(len))
              .ToLocal(&text)) {
       // Payload exceeds V8's string cap (an operator raised wsMaxMessageSize
@@ -684,7 +696,12 @@ static void GetHeaders(const FunctionCallbackInfo<Value>& args) {
   Local<Context> ctx = iso->GetCurrentContext();
   Connection* c = connFrom(args);
   if (!c) { args.GetReturnValue().Set(Array::New(iso, 0)); return; }
-  Local<Array> arr = Array::New(iso, static_cast<int>(c->headers.size() * 2));
+  // Array::New's length is an int and is only a capacity hint (Set() below
+  // grows the array by index regardless). Clamp the hint so headers.size()*2
+  // can't cast negative if a config raised maxHeaders past 2 GiB.
+  size_t hint = c->headers.size() * 2;
+  if (hint > static_cast<size_t>(INT_MAX)) hint = static_cast<size_t>(INT_MAX);
+  Local<Array> arr = Array::New(iso, static_cast<int>(hint));
   uint32_t idx = 0;
   for (const auto& h : c->headers) {
     // FromMaybe, not Check: a failed Set under allocation pressure yields a

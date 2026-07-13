@@ -1,15 +1,27 @@
 name: fuzz
 
-# Sustained nightly fuzz campaign over the HTTP/1.1 and WebSocket parsers.
-# Runs the libFuzzer harnesses for a meaningful duration with a corpus that
-# accumulates coverage run-to-run. A finding fails the run (M5 hardening).
+# Sustained nightly fuzz campaign over the HTTP/1.1, WebSocket, TLS, and
+# permessage-deflate parsers. Runs the libFuzzer harnesses for a meaningful
+# duration with a corpus that accumulates coverage run-to-run. A finding fails
+# the run (M5 hardening).
+#
+# Two schedules share this file:
+#   - 06:00 UTC nightly       -> the `fuzz` job (discovery; grows the corpus).
+#   - 07:00 UTC Sundays       -> the `merge` job (minimizes the accumulated
+#                                corpus and publishes it as a durable artifact,
+#                                so coverage survives Actions-cache eviction).
+# workflow_dispatch runs both.
 on:
   schedule:
-    - cron: '0 6 * * *' # 06:00 UTC nightly
+    - cron: '0 6 * * *' # 06:00 UTC nightly (fuzz)
+    - cron: '0 7 * * 0' # 07:00 UTC Sundays (corpus merge)
   workflow_dispatch:
 
 jobs:
   fuzz:
+    # Skip on the weekly merge cron so the merge job owns the corpus cache that
+    # run (no two jobs writing the same cache key in one run).
+    if: github.event.schedule != '0 7 * * 0'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -28,8 +40,9 @@ jobs:
       # Persist the corpus so coverage accumulates. libFuzzer writes new
       # coverage-expanding inputs back into test/fuzz/corpus/<fuzzer>. A unique
       # key per run + a shared prefix restore-key means each run restores the
-      # newest corpus; the save step (below) writes back the grown one. Keys
-      # are per-fuzzer so parallel matrix legs never clobber each other.
+      # newest corpus (including the weekly-minimized one); the save step
+      # (below) writes back the grown one. Keys are per-fuzzer so parallel
+      # matrix legs never clobber each other.
       - name: Restore fuzz corpus
         uses: actions/cache/restore@v4
         with:
@@ -42,7 +55,7 @@ jobs:
       # -fno-sanitize-recover=all and runs the fuzzer for $FUZZ_SECONDS. A
       # crash/leak/timeout is a non-zero exit -> the job fails.
       - name: Fuzz ${{ matrix.fuzzer }}
-        run: FUZZ_SECONDS=300 sh test/fuzz/run.sh ${{ matrix.fuzzer }}
+        run: FUZZ_SECONDS=600 sh test/fuzz/run.sh ${{ matrix.fuzzer }}
 
       # Save the (possibly grown) corpus even when a finding fails the run, so
       # the coverage-expanding inputs discovered this run are not lost.
@@ -55,14 +68,63 @@ jobs:
 
       # libFuzzer drops crash-*/leak-*/timeout-*/oom-* in the working directory
       # (repo root) on a finding. Capture them for triage; ignore when clean.
+      # The artifact name is per-fuzzer: upload-artifact@v4 rejects two uploads
+      # sharing one name, so a fixed name would fail whenever >1 leg finds a bug.
       - name: Upload fuzz findings
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-findings
+          name: fuzz-findings-${{ matrix.fuzzer }}
           path: |
             crash-*
             leak-*
             timeout-*
             oom-*
           if-no-files-found: ignore
+
+  # Weekly corpus minimization. The nightly campaign only ever grows the corpus
+  # (and it lives solely in the evictable Actions cache); this job runs
+  # libFuzzer -merge=1 to keep the smallest input per coverage feature, then
+  # publishes the minimized corpus as a 90-day artifact so accumulated coverage
+  # is durable even if the cache is evicted. It also re-seeds the cache with the
+  # minimized corpus under a distinct key.
+  merge:
+    if: github.event.schedule == '0 7 * * 0' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fuzzer: [http, ws, tls, pmd]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang (+ OpenSSL/zlib headers for the tls/pmd harnesses)
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev zlib1g-dev
+
+      - name: Restore fuzz corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: test/fuzz/corpus/${{ matrix.fuzzer }}
+          key: fuzz-corpus-${{ matrix.fuzzer }}-merge-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.fuzzer }}-
+
+      - name: Minimize ${{ matrix.fuzzer }} corpus
+        run: FUZZ_MODE=merge sh test/fuzz/run.sh ${{ matrix.fuzzer }}
+
+      # Durable copy of the minimized corpus (survives cache eviction).
+      - name: Upload minimized corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-min-${{ matrix.fuzzer }}
+          path: test/fuzz/corpus/${{ matrix.fuzzer }}
+          retention-days: 90
+          if-no-files-found: warn
+
+      # Re-seed the cache with the minimized corpus under a distinct key so the
+      # nightly restore-key prefix picks it up without colliding with a fuzz run.
+      - name: Save minimized corpus to cache
+        uses: actions/cache/save@v4
+        with:
+          path: test/fuzz/corpus/${{ matrix.fuzzer }}
+          key: fuzz-corpus-${{ matrix.fuzzer }}-merged-${{ github.run_id }}

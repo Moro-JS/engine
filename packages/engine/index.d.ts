@@ -1,5 +1,12 @@
 // Type definitions for @morojs/engine.
 // The Moro-shaped native HTTP/1.1 + WebSocket binding (see docs/API.md).
+//
+// DRIFT CHECK (maintainers): this surface must stay in lockstep with what the
+// native binding actually parses (src/binding.cpp) and with docs/API.md. When a
+// serve() option or capability flag is added there, add it here in the same
+// change. TODO: wire a release-time gate (tools/) that diffs the getNum/getStr
+// option names + setCap flags in src/binding.cpp against ServeOptions /
+// EngineCapabilities here and fails the release on drift.
 
 export interface EngineCapabilities {
   /** The full serve() limit surface (maxHeadSize/maxHeaders/wsMaxMessageSize/
@@ -12,6 +19,12 @@ export interface EngineCapabilities {
   http2: boolean;
   /** WebSocket permessage-deflate (RFC 7692) via ServeOptions.wsDeflate. */
   wsDeflate: boolean;
+  /** The response-side / target-size hardening options are parsed:
+   *  ServeOptions.responseTimeoutMs, responseBackpressureLimit, and maxUriSize. */
+  responseLimits: boolean;
+  /** Explicit TLS cipher/group policy is parsed:
+   *  ServeOptions.ssl.ciphers, ciphersuites, and ecdhCurve. */
+  tlsPolicy: boolean;
 }
 
 export interface EngineProbeResult {
@@ -38,9 +51,17 @@ export interface ServeCallbacks {
   onAborted(reqId: number): void;
   /** A backpressured write() drained; safe to write more. */
   onWritable(reqId: number): void;
-  /** WebSocket opened after a successful Upgrade. */
+  /** WebSocket opened after a successful Upgrade.
+   *  DELIVERY GUARANTEE: onWsOpen is invoked SYNCHRONOUSLY, re-entrantly, during
+   *  the upgradeToWebSocket() call that returns the wsId — it has already fired
+   *  by the time upgradeToWebSocket() returns. Register per-socket state here
+   *  before that return, since inbound frames may arrive immediately after. */
   onWsOpen?(wsId: number, path: string): void;
-  /** WebSocket message (text -> string, binary -> ArrayBuffer). */
+  /** WebSocket message (text -> string, binary -> ArrayBuffer).
+   *  Frames the client sent in the SAME TCP segment as the handshake are
+   *  delivered here immediately after onWsOpen — also synchronously within the
+   *  upgradeToWebSocket() call — so a client that pipelines its first frame with
+   *  the Upgrade is never dropped. */
   onWsMessage?(wsId: number, data: string | ArrayBuffer, isBinary: boolean): void;
   /** WebSocket closed (code per RFC 6455 §7.4). */
   onWsClose?(wsId: number, code: number): void;
@@ -64,6 +85,15 @@ export interface ServeOptions {
    *  so slow-drip (slowloris) clients are bounded. Expiry answers 408 and
    *  closes. 0 disables. Default 300000 (Node's server.requestTimeout). */
   requestTimeoutMs?: number;
+  /** Budget in ms for DELIVERING queued outbound bytes (the response-side twin
+   *  of requestTimeoutMs; feature-detect via probe().capabilities.responseLimits).
+   *  Resets on drain progress — the write queue shrinking since the last sweep,
+   *  or a write completing — so only a drain making NO progress for the whole
+   *  budget is closed; a genuinely slow-but-steady reader of a large download or
+   *  SSE stream is never shed, only a stalled / zero-window peer (slow-read /
+   *  zero-window DoS defense). Also bounds a stalled WebSocket consumer and a
+   *  stalled close-frame flush. 0 disables. Default 300000. */
+  responseTimeoutMs?: number;
   /** Bind with SO_REUSEPORT so several engine instances (worker threads or
    *  processes) can share one port with kernel-load-balanced accepts —
    *  required for clustering. POSIX only; ignored on Windows. Default false. */
@@ -73,6 +103,19 @@ export interface ServeOptions {
   maxHeadSize?: number;
   /** Max header count; more is rejected (431). Must be > 0. Default 100. */
   maxHeaders?: number;
+  /** Dedicated cap on the request target (URI) length; over it answers 414.
+   *  Default 0 = no dedicated cap (maxHeadSize still bounds the whole head with
+   *  431). Feature-detect via probe().capabilities.responseLimits. */
+  maxUriSize?: number;
+  /** Opt-in hard cap in bytes on the not-yet-flushed HTTP outbound queue (the
+   *  HTTP mirror of wsBackpressureLimit); over it the connection is closed
+   *  immediately. Default 0 = unlimited. Leave 0 unless response sizes are
+   *  bounded — one large respond() legitimately queues its whole body; a queued
+   *  response holds an engine-side copy (~2x body peak for one slow drain,
+   *  bounded in time by responseTimeoutMs). Apps serving large payloads to
+   *  untrusted clients should set this cap or stream via writeHead()/write().
+   *  Feature-detect via probe().capabilities.responseLimits. */
+  responseBackpressureLimit?: number;
   /** Cap on a complete (reassembled) WebSocket message; larger messages fail
    *  the connection with close code 1009. Must be > 0. Default 16 MiB. */
   wsMaxMessageSize?: number;
@@ -110,6 +153,13 @@ export interface ServeOptions {
     requestCert?: boolean;
     /** Fail the handshake when the client cert doesn't verify (default true) */
     rejectUnauthorized?: boolean;
+    /** Explicit cipher/group policy for compliance baselines (PCI/FIPS/hardened
+     *  profiles; feature-detect via probe().capabilities.tlsPolicy). Same
+     *  semantics as Node's tls.createSecureContext; unset = the host Node's
+     *  OpenSSL defaults; invalid values THROW from serve(). */
+    ciphers?: string; // TLS <= 1.2 cipher list
+    ciphersuites?: string; // TLS 1.3 suites (colon-separated)
+    ecdhCurve?: string; // key-share groups, e.g. 'X25519:P-256'; 'auto' = default
   };
   /** WebSocket permessage-deflate (RFC 7692). Off by default.
    *  boolean to enable with defaults, or an options object. */
@@ -175,7 +225,9 @@ export function write(reqId: number, chunk: BodyInit): boolean;
 export function end(reqId: number, chunk?: BodyInit): void;
 
 // ---- WebSocket (RFC 6455) ----
-/** Upgrade the request's connection; returns wsId, or -1 if not a valid upgrade. */
+/** Upgrade the request's connection; returns wsId, or -1 if not a valid upgrade.
+ *  onWsOpen (and any early frames pipelined in the handshake's TCP segment, via
+ *  onWsMessage) fire SYNCHRONOUSLY during this call, before it returns. */
 export function upgradeToWebSocket(reqId: number): number;
 /** Send a frame; returns false on backpressure. */
 export function wsSend(wsId: number, data: string | ArrayBuffer | Uint8Array | Buffer, isBinary: boolean): boolean;

@@ -8,6 +8,7 @@
 
 #include <uv.h>
 
+#include <algorithm>
 #include <cstring>
 #include <ctime>
 #include <functional>
@@ -120,7 +121,12 @@ inline std::unordered_map<uint32_t, Connection*>& globalWebSockets() {
 // Per-connection state.
 struct Connection {
   Server* server = nullptr;
-  uv_tcp_t handle;              // must be first for uv_close(&handle)
+  // libuv stream handle. Recovering the Connection uses handle.data (set in
+  // onConnection), never a &handle->Connection pointer cast, so its offset in
+  // this struct is unconstrained - uv_close(&c->handle) needs no layout
+  // invariant. (uv_tcp_t's own first-member-is-uv_handle_t requirement is
+  // internal to libuv and unaffected by where `handle` sits here.)
+  uv_tcp_t handle;
   HttpParser parser;
   std::string readBuf;         // reused alloc target
   std::string pending;         // bytes received while a response is in flight
@@ -684,8 +690,19 @@ class Server {
 
     const uint32_t wsId = c->wsId;
     if (cb_.onWsOpen) cb_.onWsOpen(cb_.user, c, c->path);
-    // Frames the client sent in the same TCP segment as the handshake are already buffered in the HTTP parser - hand them to the WebSocket parser (copied out first: feedWebSocket may tear the connection down on a protocol error, after which c and its parser must not be touched; the copy is also the mutable storage the parser's in-place unmasking needs).
+    // Frames the client sent before the 101 went out must reach the WebSocket
+    // parser (copied out first: feedWebSocket may tear the connection down on a
+    // protocol error, after which c and its parser must not be touched; the
+    // copy is also the mutable storage the parser's in-place unmasking needs).
+    // Two sources, in receive order: bytes buffered in the HTTP parser from the
+    // same segment as the handshake request (leftover), then any frames the
+    // client sent in later segments while an async upgrade handler had not yet
+    // responded (c->pending). c->pending's only other drain, finishResponse, is
+    // unreachable once the 101 is written terminal=false, so without this it
+    // would be silently dropped -> WS desync.
     std::string early(c->parser.leftover());
+    early.append(c->pending);
+    c->pending.clear();
     c->parser = HttpParser(limits_);  // HTTP is done on this connection
     if (!early.empty()) feedWebSocket(c, early.data(), early.size());
     return wsId;
@@ -773,6 +790,18 @@ class Server {
                            : "Connection: close\r\n";
   }
 
+  // libuv's uv_buf_t carries the length in an `unsigned` (32-bit) field and
+  // uv_write/uv_try_write count bytes with an int, so a single buffer >= 4 GiB
+  // truncates the length (silent corruption + a hung client, since
+  // Content-Length then lies) and a >= 2 GiB completion check wraps. Response
+  // bodies are app-controlled with no cap, so payloads past this watermark are
+  // split into <= 1 GiB segments: the synchronous fast paths defer such a
+  // payload to the queued path, and queueWrite hands the segments to ONE
+  // uv_write (one WriteReq, one onWrite - terminal bookkeeping still fires
+  // exactly once). 1 GiB < INT_MAX, so every length/return cast below a
+  // segment boundary is exact.
+  static constexpr size_t kMaxWriteChunk = static_cast<size_t>(1) << 30;
+
   // Frame-level write: response/frame bytes from the HTTP/WS machinery. On a TLS connection the plaintext is encrypted first; `terminal` rides the (single) ciphertext buffer so the flush-then-finish semantics (onWrite -> finishResponse) are identical on both transports.
   void writeOut(Connection* c, std::string&& data, bool terminal) {
     if (c->closing) return;
@@ -808,7 +837,10 @@ class Server {
       return;
     }
 
-    if (c->pendingWrites == 0) {
+    // The single-buffer uv_try_write fast path only handles payloads that fit
+    // one uv_buf_t; an oversized body (>= 1 GiB) falls through to queueWrite,
+    // which splits it into <= 1 GiB segments (see kMaxWriteChunk).
+    if (c->pendingWrites == 0 && data.size() <= kMaxWriteChunk) {
       const bool canFinishSync =
           !terminal || (c->pending.empty() && c->parser.leftover().empty());
       if (canFinishSync) {
@@ -856,7 +888,9 @@ class Server {
       if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
       return;
     }
-    if (c->pendingWrites == 0) {
+    // See transportWrite: the single-buffer fast path is skipped for an
+    // oversized payload so queueWrite can split it into <= 1 GiB segments.
+    if (c->pendingWrites == 0 && data.size() <= kMaxWriteChunk) {
       const bool canFinishSync =
           !terminal || (c->pending.empty() && c->parser.leftover().empty());
       if (canFinishSync) {
@@ -884,11 +918,27 @@ class Server {
     wr->data = std::move(data);
     wr->terminal = terminal;
     wr->req.data = wr;
-    uv_buf_t buf = uv_buf_init(wr->data.empty() ? nullptr : &wr->data[0],
-                               static_cast<unsigned>(wr->data.size()));
     c->pendingWrites++;
-    int r = uv_write(&wr->req, reinterpret_cast<uv_stream_t*>(&c->handle),
-                     &buf, 1, onWrite);
+    int r;
+    if (wr->data.size() <= kMaxWriteChunk) {
+      uv_buf_t buf = uv_buf_init(wr->data.empty() ? nullptr : &wr->data[0],
+                                 static_cast<unsigned>(wr->data.size()));
+      r = uv_write(&wr->req, reinterpret_cast<uv_stream_t*>(&c->handle),
+                   &buf, 1, onWrite);
+    } else {
+      // Oversized payload: uv_buf_t's length is `unsigned`, so a single buf
+      // would truncate a >= 4 GiB body. Split into <= 1 GiB segments handed to
+      // ONE uv_write - the whole payload rides a single WriteReq and completes
+      // with a single onWrite, so `terminal` still fires exactly once.
+      std::vector<uv_buf_t> bufs;
+      bufs.reserve((wr->data.size() / kMaxWriteChunk) + 1);
+      for (size_t off = 0; off < wr->data.size(); off += kMaxWriteChunk) {
+        size_t seg = std::min(kMaxWriteChunk, wr->data.size() - off);
+        bufs.push_back(uv_buf_init(&wr->data[off], static_cast<unsigned>(seg)));
+      }
+      r = uv_write(&wr->req, reinterpret_cast<uv_stream_t*>(&c->handle),
+                   bufs.data(), static_cast<unsigned>(bufs.size()), onWrite);
+    }
     if (r != 0) {
       c->pendingWrites--;
       delete wr;
@@ -962,8 +1012,13 @@ class Server {
 
     ParseStatus st;
     if (!c->pending.empty()) {
-      st = c->parser.parse(c->pending.data(), c->pending.size());
-      c->pending.clear();
+      // Swap into a local (as dispatchBatch does) rather than parse()+clear():
+      // the parser copies the bytes in, so p's capacity is released at scope
+      // exit instead of a huge pipelined backlog staying pinned to an idle
+      // keep-alive connection.
+      std::string p;
+      p.swap(c->pending);
+      st = c->parser.parse(p.data(), p.size());
     } else {
       st = c->parser.parse(nullptr, 0);
     }
@@ -993,12 +1048,18 @@ class Server {
   // Flush the accumulated batch with one write. Tries synchronously straight from corkBuf (a full write keeps the buffer's capacity for the next batch); only a partial/backpressured remainder is copied out and queued.
   void flushCork(Connection* c) {
     if (c->corkBuf.empty() || c->closing) return;
-    if (c->pendingWrites == 0) {
+    // A single huge corked response (respond() appends the whole frame to
+    // corkBuf) can exceed one uv_buf_t; defer it to the queued path below,
+    // which splits into <= 1 GiB segments (see kMaxWriteChunk).
+    if (c->pendingWrites == 0 && c->corkBuf.size() <= kMaxWriteChunk) {
       uv_buf_t b =
           uv_buf_init(&c->corkBuf[0], static_cast<unsigned>(c->corkBuf.size()));
       int n = uv_try_write(reinterpret_cast<uv_stream_t*>(&c->handle), &b, 1);
       if (n == static_cast<int>(c->corkBuf.size())) {
         c->corkBuf.clear();
+        // Don't pin a large batch's capacity to an idle keep-alive connection
+        // (same 64 KiB watermark as releaseScratch / the parser / WS message_).
+        if (c->corkBuf.capacity() > 65536) c->corkBuf.shrink_to_fit();
         return;
       }
       if (n > 0) c->corkBuf.erase(0, static_cast<size_t>(n));
@@ -1159,6 +1220,13 @@ class Server {
     bool ok = c->wsParser->consume(
         reinterpret_cast<uint8_t*>(data), len,
         [&](std::string_view payload, bool isBinary, bool compressed) {
+          // Stop delivering once the connection is closing: JS may call
+          // wsClose() from inside onWsMessage (which sets wsClosing, fires
+          // onWsClose, and erases the wsId), yet consume() keeps handing us the
+          // remaining complete frames already in this read buffer - delivering
+          // them would fire onWsMessage on a closed/gone socket. The control
+          // path already guards Ping this way; mirror it here.
+          if (c->wsClosing || c->closing) return;
           if (compressed && c->pmd) {
             // Inflate (hard output cap = zip-bomb defense), then UTF-8-validate text post-inflate (the parser skipped it for compressed frames).
             std::string inflated;

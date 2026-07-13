@@ -72,9 +72,10 @@ serve(callbacks: {
     ecdhCurve?: string;                // key-share groups, e.g. 'X25519:P-256'; 'auto' = default
   };
 
-  // v1.3.0+ - WebSocket permessage-deflate (RFC 7692; capabilities.wsDeflate).
-  // Off by default (preserves the compression-oracle-free posture). boolean to
-  // enable with defaults, or an options object.
+  // WebSocket permessage-deflate (RFC 7692; feature-detect via
+  // probe().capabilities.wsDeflate). Off by default (preserves the
+  // compression-oracle-free posture). boolean to enable with defaults, or an
+  // options object.
   wsDeflate?: boolean | {
     serverNoContextTakeover?, clientNoContextTakeover?: boolean;
     serverMaxWindowBits?, clientMaxWindowBits?: number;   // 8..15
@@ -164,6 +165,14 @@ Everything runs on the Node/libuv main loop (uv handles registered on
 events — a single-threaded on-loop model. No locks, no cross-thread
 marshaling.
 
+One case is re-entrant rather than driven by a fresh I/O event:
+`upgradeToWebSocket()` calls `onWsOpen` (and, for frames pipelined in the
+handshake segment, `onWsMessage`) synchronously **from within the
+`upgradeToWebSocket()` call itself**, before it returns. The adapter therefore
+sees the socket opened — and possibly its first message — while still inside its
+`onRequest` handler. Still single-threaded and lock-free; just delivered on the
+same call stack instead of the next loop turn (see the WebSocket section).
+
 ## WebSocket (M4 surface, see src/websocket.h)
 
 ```ts
@@ -173,8 +182,20 @@ wsClose(wsId, code?: number, reason?: string): void;
 // serve() callbacks gain: onWsOpen(wsId, path), onWsMessage(wsId, data, isBinary),
 // onWsClose(wsId, code)
 ```
-permessage-deflate (RFC 7692) is supported from v1.3.0 - opt-in via
-options.wsDeflate (off by default, which declines the extension). When enabled,
-the engine inflates inbound compressed messages (with a zip-bomb output cap →
-close 1009) and compresses outbound sends over the threshold. Inbound text is
+
+**Delivery guarantee (re-entrant open).** `upgradeToWebSocket()` invokes
+`onWsOpen` **synchronously and re-entrantly**: the callback has already run by
+the time `upgradeToWebSocket()` returns the `wsId`. Register any per-socket
+state inside `onWsOpen` (or immediately after the call returns) — never on a
+later turn — because inbound frames can arrive at once. In particular, frames
+the client pipelined in the **same TCP segment** as the handshake are handed to
+`onWsMessage` right after `onWsOpen`, also synchronously within that same
+`upgradeToWebSocket()` call, so a client that sends its first frame together
+with the Upgrade is never dropped.
+
+permessage-deflate (RFC 7692) is opt-in via options.wsDeflate (off by default,
+which declines the extension). Feature-detect support with
+`probe().capabilities.wsDeflate` rather than by version. When enabled, the
+engine inflates inbound compressed messages (with a zip-bomb output cap → close
+1009) and compresses outbound sends over the threshold. Inbound text is
 UTF-8-validated after inflate (→ close 1007 on failure).

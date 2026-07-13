@@ -6,20 +6,30 @@ name: release
 # button). Binaries ship ONLY from this CI run with npm provenance — never from
 # a developer machine (CONTRIBUTING.md).
 #
-# Flow: rebuild every platform (same matrix as ci.yml) -> collect the .node
-# artifacts -> assemble the per-platform packages + sync all versions
-# (tools/prepare-release.mjs) -> publish each platform package, then the meta
-# package LAST so its optionalDependencies already resolve. Publishes are
-# idempotent (already-on-registry versions are skipped), so re-running is safe.
+# Flow: rebuild every platform (same matrix as ci.yml) -> load-smoke every
+# shipped binary + run conformance per OS (the same gates ci.yml enforces, so a
+# tag never publishes anything ci.yml would have failed) -> assemble the
+# per-platform packages + sync all versions (tools/prepare-release.mjs) ->
+# publish each platform package, then the meta package LAST so its
+# optionalDependencies already resolve. Publishes are idempotent
+# (already-on-registry versions are skipped), so re-running is safe.
+#
+# Alternative worth considering: instead of rebuilding, promote the exact
+# artifacts CI already built for this commit (workflow_run) or gate publish on
+# the tagged commit's `ci-success`. Rebuilding + re-smoking here is simpler and
+# self-contained, at the cost of a second build.
 on:
   release:
     types: [published]
 
+# Least privilege at the top; the publish job elevates to contents:write to
+# attach SHA256SUMS to the Release (see its job-level permissions).
 permissions:
   contents: read
-  id-token: write # npm provenance
+  id-token: write # npm provenance + trusted publishing (OIDC)
 
 jobs:
+  # ── Build every published binary flavor + its checksum manifest ─────────────
   darwin:
     # Node 25/26's V8 headers use braced-init template args (P2308) that need
     # clang 18+; the runner's Apple clang is older, so build with Homebrew LLVM.
@@ -35,10 +45,19 @@ jobs:
           node-version: 24
       - run: node tools/build.mjs --all --arch arm64
       - run: node tools/build.mjs --all --arch x64
+      # SHA-256 manifest of the exact bytes we ship; the publish job concatenates
+      # every flavor's manifest, re-verifies it against the collected binaries,
+      # and attaches SHA256SUMS to the GitHub Release.
+      - name: Checksum manifest
+        run: shasum -a 256 build/*.node > SHA256SUMS.darwin
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-darwin
           path: build/*.node
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums-darwin
+          path: SHA256SUMS.darwin
 
   linux-gnu:
     strategy:
@@ -55,10 +74,16 @@ jobs:
         with:
           node-version: 24
       - run: node tools/build.mjs --all
+      - name: Checksum manifest
+        run: shasum -a 256 build/*.node > SHA256SUMS.linux-${{ matrix.arch }}-gnu
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-linux-${{ matrix.arch }}-gnu
           path: build/*.node
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums-linux-${{ matrix.arch }}-gnu
+          path: SHA256SUMS.linux-${{ matrix.arch }}-gnu
 
   # docker-run instead of `container:`: JS actions can't run inside Alpine
   # containers on arm64 runners (no musl Node to inject). See ci.yml.
@@ -77,39 +102,222 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo node:24-alpine \
             sh -c "apk add --no-cache build-base && node tools/build.mjs --all"
+      - name: Checksum manifest
+        run: shasum -a 256 build/*.node > SHA256SUMS.linux-${{ matrix.arch }}-musl
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-linux-${{ matrix.arch }}-musl
           path: build/*.node
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums-linux-${{ matrix.arch }}-musl
+          path: SHA256SUMS.linux-${{ matrix.arch }}-musl
 
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ilammy/msvc-dev-cmd@v1
+      # Third-party action pinned to a full commit SHA (supply-chain integrity);
+      # Dependabot (.github/dependabot.yml) bumps the SHA + comment on new tags.
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
       - uses: actions/setup-node@v4
         with:
           node-version: 24
       - run: node tools/build.mjs --all
+      # Git Bash ships coreutils sha256sum; same `<hash>  <path>` format as the
+      # POSIX `shasum -a 256` legs, so the concatenated manifest stays uniform.
+      - name: Checksum manifest
+        shell: bash
+        run: sha256sum build/*.node > SHA256SUMS.windows-x64
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-windows-x64
           path: build/*.node
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums-windows-x64
+          path: SHA256SUMS.windows-x64
 
-  publish:
-    needs: [darwin, linux-gnu, linux-musl, windows]
+  # ── Publish gate: smoke every shipped binary + conformance per OS ───────────
+  # These mirror ci.yml's smoke/conformance jobs so a tagged build is held to the
+  # same bar as every commit before its binaries reach the registry. publish
+  # `needs:` all of them.
+
+  smoke:
+    needs: [darwin, linux-gnu, linux-musl]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-22.04]
+        node: [20, 22, 23, 24, 25, 26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: build/
+      - run: node test/smoke.mjs
+
+  smoke-musl:
+    needs: [linux-musl]
+    strategy:
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+        node: [20, 22, 23, 24, 25, 26]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-linux-*-musl
+          merge-multiple: true
+          path: build/
+      - name: Smoke test in Alpine container (musl)
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo node:${{ matrix.node }}-alpine \
+            node test/smoke.mjs
+
+  smoke-windows:
+    needs: [windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 23, 24, 25, 26]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries-windows-x64
+          path: build/
+      - run: node test/smoke.mjs
+
+  # darwin-x64 ships cross-compiled; load-smoke it under Rosetta 2 on the arm64
+  # macOS runner (Intel runners are scarce/retiring). See ci.yml.
+  smoke-darwin-x64:
+    needs: [darwin]
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 23, 24, 25, 26]
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries-darwin
+          path: build/
+      - run: arch -x86_64 node test/smoke.mjs
+
+  # Full conformance per OS for the running ABI (behavioral gate; the smoke
+  # matrix above load-tests the shipped binaries, this proves protocol behavior).
+  conformance-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: Build engine for this Node ABI
+        run: node tools/build.mjs
+      - run: npm run test:smoke && npm run test:conformance && npm run test:conformance-edge && npm run test:hardening && npm run test:regression && npm run test:ws-conformance && npm run test:limits && npm run test:tls && npm run test:tls-hardening && npm run test:ws-deflate
+
+  conformance-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
+        run: |
+          brew list llvm >/dev/null 2>&1 || brew install llvm
+          echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build engine for this Node ABI
+        run: node tools/build.mjs
+      - run: npm run test:smoke && npm run test:conformance && npm run test:conformance-edge && npm run test:hardening && npm run test:regression && npm run test:ws-conformance && npm run test:limits && npm run test:tls && npm run test:tls-hardening && npm run test:ws-deflate
+
+  conformance-windows:
+    needs: [windows]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries-windows-x64
+          path: build/
+      - run: npm run test:conformance && npm run test:conformance-edge && npm run test:hardening && npm run test:regression && npm run test:ws-conformance && npm run test:limits && npm run test:tls && npm run test:tls-hardening && npm run test:ws-deflate
+
+  # ── Publish ─────────────────────────────────────────────────────────────────
+  publish:
+    needs:
+      - darwin
+      - linux-gnu
+      - linux-musl
+      - windows
+      - smoke
+      - smoke-musl
+      - smoke-windows
+      - smoke-darwin-x64
+      - conformance-linux
+      - conformance-macos
+      - conformance-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # attach SHA256SUMS to the GitHub Release
+      id-token: write # npm provenance + trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
           registry-url: https://registry.npmjs.org
+      # Trusted publishing (OIDC) needs npm >= 11.5.1; guarantee it regardless of
+      # the Node image's bundled npm. Pin the 11.x line: npm@latest is now 12.x,
+      # which requires newer Node than some runners provide (11.x covers 20.17+/22.9+).
+      - name: Ensure a trusted-publishing-capable npm
+        run: npm install -g npm@11
       - uses: actions/download-artifact@v4
         with:
           pattern: binaries-*
           merge-multiple: true
           path: build/
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: checksums-*
+          merge-multiple: true
+          path: checksums/
+
+      # Concatenate every flavor's manifest, then re-verify it against the
+      # binaries we actually collected. A mismatch (or a missing/extra file)
+      # fails the release before anything is published.
+      - name: Assemble + verify SHA256SUMS
+        run: |
+          cat checksums/SHA256SUMS.* > SHA256SUMS
+          echo "Shipping these binaries:"
+          cat SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+
+      # Attach the verified manifest to the GitHub Release (needs contents:write).
+      - name: Attach SHA256SUMS to the Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" SHA256SUMS --clobber
 
       # Derive the release version from the tag (v1.2.3 -> 1.2.3) and assemble.
       # --check fails the release if any published platform got zero binaries.
@@ -122,6 +330,12 @@ jobs:
       # Publish every per-platform package first, then the meta package LAST so
       # its exact-pinned optionalDependencies already resolve on the registry.
       #
+      # Authentication is npm TRUSTED PUBLISHING (OIDC): with id-token:write set
+      # and no NODE_AUTH_TOKEN, npm >= 11.5.1 exchanges the workflow's OIDC token
+      # for a short-lived, scoped publish credential — no long-lived NPM_TOKEN
+      # secret. Each of the eight @morojs/engine* packages has a Trusted Publisher
+      # on npmjs.com pointing at Moro-JS/engine + this workflow (`release.yml`).
+      #
       # NOTE the leading `./` on every publish path: `npm publish packages/foo`
       # is parsed as a GitHub shorthand (owner/repo), NOT a local directory, and
       # fails trying to SSH-clone it. `./packages/foo` forces the folder reading.
@@ -130,8 +344,6 @@ jobs:
       # so if a later step fails mid-release, re-running completes it cleanly
       # instead of erroring on "cannot publish over previously published version".
       - name: Publish platform packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for dir in packages/engine-*/; do
             if ! ls "$dir"/*.node >/dev/null 2>&1; then
@@ -149,8 +361,6 @@ jobs:
           done
 
       - name: Publish meta package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           ver=$(node -p "require('./packages/engine/package.json').version")
           if npm view "@morojs/engine@$ver" version >/dev/null 2>&1; then

@@ -216,7 +216,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ilammy/msvc-dev-cmd@v1
+      # Third-party action pinned to a full commit SHA (supply-chain integrity);
+      # Dependabot (.github/dependabot.yml) bumps the SHA + comment on new tags.
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -290,8 +292,37 @@ jobs:
           path: build/
       - run: node test/smoke.mjs
 
-  # Full conformance on Windows for the running ABI (loopback-timing-sensitive
-  # suites run here too; expand cautiously if flaky).
+  # darwin-x64 ships cross-compiled from the arm64 build host (see the `darwin`
+  # job) but Intel macOS runners are scarce/retiring, so the main `smoke` matrix
+  # can't load-test it. Load-smoke it here under Rosetta 2 (pre-installed on
+  # GitHub's arm64 macOS runners): install an x64 Node and run the smoke through
+  # the x86_64 translation layer, so process.arch === 'x64' selects the
+  # darwin-x64 binary. Cheap, and it exercises a binary real Intel-Mac users get.
+  smoke-darwin-x64:
+    needs: [darwin]
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 23, 24, 25, 26]
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: x64 # x64 Node build; runs via Rosetta 2 on the arm64 host
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries-darwin
+          path: build/
+      - run: arch -x86_64 node test/smoke.mjs
+
+  # Full conformance on Windows for the running ABI — the same suite set the
+  # Linux/macOS conformance legs run (smoke excepted; smoke-windows covers load).
+  # The darwin/linux binaries get the whole suite, so the win32-x64 binary that
+  # ships to users must too. Loopback-timing-sensitive suites run here; if one
+  # proves flaky on the Windows runner, quarantine that single suite with a
+  # comment rather than dropping the set.
   conformance-windows:
     needs: [windows]
     runs-on: windows-latest
@@ -304,7 +335,7 @@ jobs:
         with:
           name: binaries-windows-x64
           path: build/
-      - run: npm run test:conformance && npm run test:ws-conformance && npm run test:limits && npm run test:tls
+      - run: npm run test:conformance && npm run test:conformance-edge && npm run test:hardening && npm run test:regression && npm run test:ws-conformance && npm run test:limits && npm run test:tls && npm run test:tls-hardening && npm run test:ws-deflate
 
   # Full conformance on macOS for the running ABI. The darwin binaries ship to
   # real users, so at least one darwin leg must run the whole suite (the smoke
@@ -346,6 +377,7 @@ jobs:
       - smoke
       - smoke-musl
       - smoke-windows
+      - smoke-darwin-x64
       - conformance-windows
       - conformance-macos
     runs-on: ubuntu-latest

@@ -124,30 +124,55 @@ function probe() {
   return { ...loaded.module.probe(), version: ENGINE_VERSION };
 }
 
+// The native binding's function exports (src/binding.cpp Initialize; mirrored by
+// the ESM named exports in index.mjs). ONLY these names force a native load —
+// anything else reads as undefined without loading, so `require`/`import` of
+// this package never throws on a platform with no prebuilt binary, even when a
+// module-interop probe (TypeScript `__importDefault` reads `__esModule`, Babel
+// `interopRequireDefault` reads `default`, `JSON.stringify` reads `toJSON`,
+// `util.inspect` reads assorted keys) walks the exports object. `probe` and
+// `version` are served from the target below and likewise never load.
+const NATIVE_API = new Set([
+  'serve',
+  'listen',
+  'close',
+  'stopListening',
+  'getMethod',
+  'getQuery',
+  'getHeaders',
+  'getHeader',
+  'getBody',
+  'getRemoteAddress',
+  'isAborted',
+  'respond',
+  'writeHead',
+  'write',
+  'end',
+  'upgradeToWebSocket',
+  'wsSend',
+  'wsClose',
+]);
+
 module.exports = new Proxy(
   { probe, version: ENGINE_VERSION },
   {
     get(target, prop) {
       if (prop in target) return target[prop];
-      // Structural probes must never force (and possibly fail) the native
-      // load: `then` is touched by `await`/Promise.resolve() on the module,
-      // and symbols by console.log/util.inspect. Real engine API props are
-      // string-named and never `then`.
-      if (typeof prop === 'symbol' || prop === 'then') return undefined;
-      // Everything else (serve, listen, ... as the engine grows) comes from the
-      // native binding, loaded on first touch. `probe` and `version` are served
-      // from the target above so neither forces a native load.
-      const binding = loadBinding();
-      return binding[prop];
+      // Only a known native API name forces the load. Everything else —
+      // symbols, `then` (awaiting the module), and interop probes like
+      // `__esModule`/`default`/`toJSON` — resolves to undefined WITHOUT loading,
+      // so importing this package can never throw on an unsupported platform.
+      if (typeof prop === 'string' && NATIVE_API.has(prop)) {
+        return loadBinding()[prop];
+      }
+      return undefined;
     },
     has(target, prop) {
-      // Keep `in` consistent with the get trap (so `'serve' in engine` works
-      // for feature detection) without forcing a native load: `then` and
-      // symbols read as undefined there, so report them absent here; every
-      // other string key is served from the binding on first touch.
+      // Keep `in` consistent with the get trap (so `'serve' in engine` works for
+      // feature detection) without forcing a native load: a key is present iff
+      // it is served from the target or is a known native API name.
       if (prop in target) return true;
-      if (typeof prop === 'symbol' || prop === 'then') return false;
-      return typeof prop === 'string';
+      return typeof prop === 'string' && NATIVE_API.has(prop);
     },
   }
 );

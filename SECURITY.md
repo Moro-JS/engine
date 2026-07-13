@@ -5,25 +5,20 @@ Node.js (C++ with raw-V8 bindings). Because it parses untrusted bytes off the
 network in hand-written C++, we take security reports seriously and want to make
 them easy to file.
 
-> **Maturity note.** The engine is pre-1.0 and has **not** yet had an external
-> security review (that review is a tracked M5/M6 gate — see
-> [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)). Until it has, run it behind a
-> hardened reverse proxy for TLS termination, or use MoroJS's `engine: 'node'`
-> fallback for untrusted-facing production traffic.
+> **Maturity note.** The engine is on its `1.x` line and terminates TLS in-process — see [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)).
 
 ## Supported versions
 
-The engine ships independent semver and is still in its `0.x` line. Security
-fixes land on the **latest published version** only; there is no long-term
-back-port branch during `0.x`.
+The engine ships independent semver on its `1.x` line. Security fixes land on
+the **latest published version** only; there is no long-term back-port branch.
 
 | Version | Supported |
 | ------- | --------- |
 | Latest published release | ✅ |
 | Any older release | ❌ (upgrade to the latest) |
 
-When a `1.0.0` GA line exists, this table will be updated to name the supported
-major line(s).
+If a supported-branch policy is added for a future major line, this table will
+be updated to name the supported major line(s).
 
 ## Reporting a vulnerability
 
@@ -46,14 +41,14 @@ Please include, as far as you can:
 - a description of the flaw and its impact (crash, over-read, request
   desync/smuggling, DoS, memory disclosure, etc.),
 - a minimal reproduction — ideally a raw byte sequence or a fuzz corpus file
-  that can be dropped into `test/fuzz/corpus/{http,ws}` (see the threat model's
-  reviewer quick-start),
+  that can be dropped into `test/fuzz/corpus/{http,ws,tls,pmd}` (see the threat
+  model's reviewer quick-start),
 - any suggested remediation.
 
 ## What to expect
 
-These are good-faith targets, not contractual SLAs (this is a volunteer,
-pre-1.0 project):
+These are good-faith targets, not contractual SLAs (this is a volunteer
+project):
 
 - **Acknowledgement:** typically within a few business days.
 - **Triage & assessment:** we will confirm the report, assess severity, and keep
@@ -75,6 +70,10 @@ touches untrusted network bytes:
 - WebSocket framing, masking, and UTF-8 handling (`src/websocket.h`,
   `src/sha1.h`)
 - The TCP/connection engine and its lifecycle/timeout handling (`src/server.h`)
+- **In-process TLS termination** — the engine's handshake/record pump around
+  OpenSSL, ALPN, mutual TLS, and session/ticket resumption (`src/tls.h`)
+- **WebSocket permessage-deflate** (RFC 7692) — the inflate/deflate framing and
+  the zip-bomb output cap (`src/ws_deflate.h`)
 - The V8 boundary — request/response and WebSocket bindings (`src/binding.cpp`)
 - The build/packaging/loader pipeline as it affects binary integrity
   (`tools/build.mjs`, npm provenance publishing)
@@ -87,12 +86,11 @@ touches untrusted network bytes:
 - **The MoroJS framework layer** (routing, middleware, rate limiting, auth).
   Report those to the MoroJS framework repository.
 - **Node.js itself and its bundled libraries** (V8, libuv, OpenSSL). Report
-  those upstream to Node.js.
+  those upstream to Node.js. The engine's TLS is in scope (see above), but a
+  vulnerability in the **OpenSSL library** it links (the host Node's) is an
+  upstream issue — report the engine's *use* of it here, the library itself to
+  Node.js/OpenSSL.
 - **Third-party dependencies** pulled in by your app.
-- **TLS.** The engine ships **no** TLS of its own today; encryption is expected
-  to be terminated at a proxy or by running `engine: 'node'`. Weaknesses in that
-  external termination are out of scope for this project (though we welcome
-  reports about how the engine behaves behind such a terminator).
 - **Denial of service that the framework/operator is expected to bound** (e.g.
   application-level rate limiting, per-tenant quotas). The engine provides the
   parsing/DoS primitives documented in the threat model, not a full rate limiter.

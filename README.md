@@ -32,11 +32,18 @@ server automatically wherever a prebuilt binary isn't available:
 ```js
 // moro config
 server: {
-  engine: 'auto',   // engine when loadable, Node http otherwise (default in 2.0)
-  // engine: 'native' - require the engine, fail fast
-  // engine: 'node'   - opt out
+  engine: 'moro',   // default - native engine when loadable, Node http otherwise
+  // engine: 'node' - always use Node http
+  // engine: 'uws'  - opt in to uWebSockets.js
 }
 ```
+
+MoroJS always degrades to the Node `http` server when the native engine can't
+load (the reason is logged at startup and exposed via
+`app.engine.fallbackReason`); there is **no** "fail fast" engine value. The
+legacy `'auto'`/`'native'` values map to `'moro'` with a deprecation warning.
+See [`packages/engine/README.md`](packages/engine/README.md) for the canonical
+config reference.
 
 ## Development
 
