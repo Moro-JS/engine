@@ -28,7 +28,7 @@ jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install clang
         run: sudo apt-get update && sudo apt-get install -y clang
       - name: C++ unit tests
@@ -44,8 +44,8 @@ jobs:
       matrix:
         node-version: [20, 22, 24, 26]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
       - name: Build engine for this Node ABI
@@ -69,7 +69,7 @@ jobs:
       ASAN_OPTIONS: abort_on_error=1:halt_on_error=1
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install clang
         run: sudo apt-get update && sudo apt-get install -y clang
       # test/run-unit.sh hardcodes -O2 with no CXXFLAGS/sanitizer hook, so
@@ -105,8 +105,8 @@ jobs:
       ASAN_OPTIONS: abort_on_error=1:halt_on_error=1:detect_leaks=0
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
       - name: Build addon with ASan/UBSan
@@ -136,7 +136,7 @@ jobs:
       matrix:
         fuzzer: [http, ws, tls, pmd]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install clang (+ OpenSSL/zlib headers for the tls/pmd harnesses)
         run: sudo apt-get update && sudo apt-get install -y clang libssl-dev zlib1g-dev
       - name: Fuzz-smoke ${{ matrix.fuzzer }} (20s)
@@ -150,17 +150,17 @@ jobs:
     # clang 18+; the runner's Apple clang is older, so build with Homebrew LLVM.
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
         run: |
           brew list llvm >/dev/null 2>&1 || brew install llvm
           echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
       - run: node tools/build.mjs --all --arch arm64
       - run: node tools/build.mjs --all --arch x64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binaries-darwin
           path: build/*.node
@@ -175,12 +175,12 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
       - run: node tools/build.mjs --all
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binaries-linux-${{ matrix.arch }}-gnu
           path: build/*.node
@@ -199,12 +199,12 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build in Alpine container (musl)
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo node:24-alpine \
             sh -c "apk add --no-cache build-base && node tools/build.mjs --all"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binaries-linux-${{ matrix.arch }}-musl
           path: build/*.node
@@ -215,15 +215,15 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Third-party action pinned to a full commit SHA (supply-chain integrity);
       # Dependabot (.github/dependabot.yml) bumps the SHA + comment on new tags.
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
       - run: node tools/build.mjs --all
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binaries-windows-x64
           path: build/*.node
@@ -242,11 +242,11 @@ jobs:
         node: [20, 22, 23, 24, 25, 26]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: binaries-*
           merge-multiple: true
@@ -263,8 +263,8 @@ jobs:
         node: [20, 22, 23, 24, 25, 26]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: binaries-linux-*-musl
           merge-multiple: true
@@ -282,11 +282,11 @@ jobs:
         node: [20, 22, 23, 24, 25, 26]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: binaries-windows-x64
           path: build/
@@ -306,12 +306,12 @@ jobs:
         node: [20, 22, 23, 24, 25, 26]
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
           architecture: x64 # x64 Node build; runs via Rosetta 2 on the arm64 host
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: binaries-darwin
           path: build/
@@ -327,11 +327,11 @@ jobs:
     needs: [windows]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: binaries-windows-x64
           path: build/
@@ -344,12 +344,12 @@ jobs:
   conformance-macos:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
         run: |
           brew list llvm >/dev/null 2>&1 || brew install llvm
           echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
       - name: Build engine for this Node ABI
