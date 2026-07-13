@@ -568,7 +568,16 @@ describe('@morojs/engine hardening conformance', { skip }, () => {
     });
   }
 
-  it('slow-read defense: a client that never reads its response is shed at the delivery deadline', T, async () => {
+  // Skipped on Windows: this drives outbound backpressure over 127.0.0.1, but
+  // Windows loopback has very large kernel buffers that absorb the 32 MB
+  // response whole, so the engine's write queue never backs up and the stall
+  // the sweep keys on can't be reproduced here. The defense is unchanged and
+  // verified on Unix; over a real network Windows still applies receive-window
+  // backpressure. A Windows variant that shrinks the socket buffers to force
+  // real backpressure is a follow-up.
+  it('slow-read defense: a client that never reads its response is shed at the delivery deadline',
+    { ...T, skip: process.platform === 'win32' && 'loopback absorbs the payload; outbound backpressure is not reproducible on Windows' },
+    async () => {
     // Async responder (the MoroJS shape): respond() runs after onRequest
     // returns, so the response takes the uncorked path and `active` stays set
     // until the terminal write flushes - the exact state the receive-side
@@ -773,7 +782,12 @@ describe('@morojs/engine hardening conformance', { skip }, () => {
     );
   });
 
-  it('responseBackpressureLimit (opt-in): outbound bytes past the cap shed the connection immediately', T, async () => {
+  // Skipped on Windows for the same reason as the slow-read shed test above:
+  // loopback absorbs the 32 MB response, so the outbound queue never crosses
+  // the 256 KB cap. The cap logic is unchanged and verified on Unix.
+  it('responseBackpressureLimit (opt-in): outbound bytes past the cap shed the connection immediately',
+    { ...T, skip: process.platform === 'win32' && 'loopback absorbs the payload; the outbound queue never crosses the cap on Windows' },
+    async () => {
     await withServer(
       (ctx) => { setImmediate(() => ctx.respond(200, null, BIG)); }, // async: uncorked write path
       { responseBackpressureLimit: 256 * 1024, responseTimeoutMs: 0 }, // deadline off: the cap alone must act
