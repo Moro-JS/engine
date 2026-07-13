@@ -35,12 +35,12 @@ jobs:
     # clang 18+; the runner's Apple clang is older, so build with Homebrew LLVM.
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
         run: |
           brew list llvm >/dev/null 2>&1 || brew install llvm
           echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
       - run: node tools/build.mjs --all --arch arm64
@@ -50,11 +50,11 @@ jobs:
       # and attaches SHA256SUMS to the GitHub Release.
       - name: Checksum manifest
         run: shasum -a 256 build/*.node > SHA256SUMS.darwin
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binaries-darwin
           path: build/*.node
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: checksums-darwin
           path: SHA256SUMS.darwin
@@ -69,18 +69,18 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
       - run: node tools/build.mjs --all
       - name: Checksum manifest
         run: shasum -a 256 build/*.node > SHA256SUMS.linux-${{ matrix.arch }}-gnu
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binaries-linux-${{ matrix.arch }}-gnu
           path: build/*.node
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: checksums-linux-${{ matrix.arch }}-gnu
           path: SHA256SUMS.linux-${{ matrix.arch }}-gnu
@@ -97,18 +97,18 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build in Alpine container (musl)
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo node:24-alpine \
             sh -c "apk add --no-cache build-base && node tools/build.mjs --all"
       - name: Checksum manifest
         run: shasum -a 256 build/*.node > SHA256SUMS.linux-${{ matrix.arch }}-musl
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binaries-linux-${{ matrix.arch }}-musl
           path: build/*.node
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: checksums-linux-${{ matrix.arch }}-musl
           path: SHA256SUMS.linux-${{ matrix.arch }}-musl
@@ -116,11 +116,11 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Third-party action pinned to a full commit SHA (supply-chain integrity);
       # Dependabot (.github/dependabot.yml) bumps the SHA + comment on new tags.
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
       - run: node tools/build.mjs --all
@@ -129,11 +129,11 @@ jobs:
       - name: Checksum manifest
         shell: bash
         run: sha256sum build/*.node > SHA256SUMS.windows-x64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binaries-windows-x64
           path: build/*.node
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: checksums-windows-x64
           path: SHA256SUMS.windows-x64
@@ -152,11 +152,11 @@ jobs:
         node: [20, 22, 23, 24, 25, 26]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: binaries-*
           merge-multiple: true
@@ -171,8 +171,8 @@ jobs:
         node: [20, 22, 23, 24, 25, 26]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: binaries-linux-*-musl
           merge-multiple: true
@@ -190,11 +190,11 @@ jobs:
         node: [20, 22, 23, 24, 25, 26]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: binaries-windows-x64
           path: build/
@@ -210,12 +210,12 @@ jobs:
         node: [20, 22, 23, 24, 25, 26]
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
           architecture: x64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: binaries-darwin
           path: build/
@@ -226,8 +226,8 @@ jobs:
   conformance-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
       - name: Build engine for this Node ABI
@@ -237,12 +237,12 @@ jobs:
   conformance-macos:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
         run: |
           brew list llvm >/dev/null 2>&1 || brew install llvm
           echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
       - name: Build engine for this Node ABI
@@ -253,11 +253,11 @@ jobs:
     needs: [windows]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: binaries-windows-x64
           path: build/
@@ -282,8 +282,8 @@ jobs:
       contents: write # attach SHA256SUMS to the GitHub Release
       id-token: write # npm provenance + trusted publishing (OIDC)
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
@@ -292,12 +292,12 @@ jobs:
       # which requires newer Node than some runners provide (11.x covers 20.17+/22.9+).
       - name: Ensure a trusted-publishing-capable npm
         run: npm install -g npm@11
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: binaries-*
           merge-multiple: true
           path: build/
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: checksums-*
           merge-multiple: true
