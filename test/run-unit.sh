@@ -6,6 +6,10 @@ set -e
 CXX="${CXX:-clang++}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
+echo "FlatMap unit tests ..."
+$CXX -std=c++20 -O2 "$DIR/flat-map-unit.cpp" -o /tmp/moro_fmtest
+/tmp/moro_fmtest
+
 echo "HTTP parser unit tests ..."
 $CXX -std=c++20 -O2 "$DIR/http-parser-unit.cpp" -o /tmp/moro_hptest
 /tmp/moro_hptest

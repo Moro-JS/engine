@@ -12,8 +12,10 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -89,18 +91,28 @@ struct HttpLimits {
   PmdOptions wsDeflate{};
 };
 
+// Limits for a default-constructed parser. Servers pass their own HttpLimits,
+// which the parser references (not copies) - see the constructor note.
+inline const HttpLimits& defaultHttpLimits() {
+  static const HttpLimits d{};
+  return d;
+}
+
 class HttpParser {
  public:
   using Limits = HttpLimits;
 
-  explicit HttpParser(HttpLimits limits = HttpLimits{}) : limits_(limits) {}
+  // Held by pointer, not value, so per-connection parsers don't each carry a
+  // copy of the struct. The referenced limits must outlive the parser (the
+  // Server's limits_ member does; the default lives for the process).
+  explicit HttpParser(const HttpLimits& limits = defaultHttpLimits())
+      : limits_(&limits) {}
 
   // Parsed request view, valid until reset().
   Method method = Method::OTHER;
   std::string methodStr;   // populated only when method == OTHER
-  std::string target;      // raw request target
-  std::string path;        // target up to '?'
-  std::string query;       // target after '?', or empty
+  std::string path;        // request target up to '?'
+  std::string query;       // request target after '?', or empty
   int minorVersion = 1;    // HTTP/1.<minorVersion>
   std::vector<Header> headers;
   std::string body;
@@ -147,7 +159,7 @@ class HttpParser {
   bool parseHeaderLine(std::string_view line);
   bool finalizeHeaders();  // resolve body framing (Content-Length vs chunked)
 
-  Limits limits_;
+  const Limits* limits_;
   std::string buf_;
   size_t consumed_ = 0;
   size_t scanPos_ = 0;      // where line scanning resumes within buf_
@@ -224,22 +236,44 @@ inline bool isTokenChar(unsigned char c) {
   }
 }
 
+// Byte lowercase table (identity except A-Z -> a-z), for the per-request
+// header-name lowering: a table lookup instead of a per-char compare/branch.
+inline constexpr std::array<unsigned char, 256> kLowercase = [] {
+  std::array<unsigned char, 256> t{};
+  for (size_t i = 0; i < 256; ++i) t[i] = static_cast<unsigned char>(i);
+  for (size_t i = 'A'; i <= 'Z'; ++i)
+    t[i] = static_cast<unsigned char>(i - 'A' + 'a');
+  return t;
+}();
+
 inline void HttpParser::reset() {
-  // Drop consumed bytes; keep any pipelined remainder as the new buffer start.
+  // Deferred compaction. erase(0, consumed_) here memmoved the ENTIRE
+  // unparsed backlog once per request - across a pipelined batch of P
+  // requests that is O(P^2) bytes moved. Every scan position and bounds
+  // check is already relative to consumed_, so the consumed prefix can
+  // simply stay in place as a dead region: drop it for free when the buffer
+  // is fully consumed (the common case), and compact only when the dead
+  // prefix has grown to at least the live remainder (bounding waste to
+  // half the buffer while keeping amortized moves linear).
   if (consumed_ > 0) {
-    buf_.erase(0, consumed_);
+    if (consumed_ == buf_.size()) {
+      buf_.clear();
+      consumed_ = 0;
+    } else if (consumed_ >= buf_.size() - consumed_) {
+      buf_.erase(0, consumed_);
+      consumed_ = 0;
+    }
   }
   // A huge request's buffered bytes (e.g. a 10 MB upload) must not stay
-  // pinned to an idle keep-alive connection (same policy as body/scratch);
+  // pinned to an idle keep-alive connection (same policy as body/scratch,
+  // but a higher 64 KiB watermark - pipelined leftovers live here);
   // only shrink when the remaining content is small. shrink_to_fit preserves
   // content, so a pipelined leftover survives.
   if (buf_.capacity() > 65536 && buf_.size() <= 65536) buf_.shrink_to_fit();
-  consumed_ = 0;
-  scanPos_ = 0;
+  scanPos_ = consumed_;
   state_ = State::RequestLine;
   method = Method::OTHER;
   methodStr.clear();
-  target.clear();
   path.clear();
   query.clear();
   minorVersion = 1;
@@ -247,7 +281,7 @@ inline void HttpParser::reset() {
   headerCount_ = 0;
   body.clear();
   // A huge body's capacity must not stay pinned to an idle keep-alive connection; small (typical) bodies keep theirs for reuse.
-  if (body.capacity() > 65536) body.shrink_to_fit();
+  if (body.capacity() > 16384) body.shrink_to_fit();
   keepAlive = true;
   errorStatus = 400;
   chunked_ = false;
@@ -294,7 +328,7 @@ inline bool HttpParser::parseRequestLine(std::string_view line) {
     const unsigned char u = static_cast<unsigned char>(c);
     if (u < 0x20 || u == 0x7f) return false;  // errorStatus stays 400
   }
-  if (limits_.maxUriSize && t.size() > limits_.maxUriSize) {
+  if (limits_->maxUriSize && t.size() > limits_->maxUriSize) {
     errorStatus = 414;
     return false;
   }
@@ -302,14 +336,15 @@ inline bool HttpParser::parseRequestLine(std::string_view line) {
   method = methodFrom(m);
   if (method == Method::OTHER) methodStr.assign(m);
 
-  target.assign(t);
-  size_t q = target.find('?');
-  if (q == std::string::npos) {
-    path = target;
+  // assign(), not =/substr(): assignment from a temporary would move, throwing
+  // away the destination string's reused capacity on every request.
+  size_t q = t.find('?');
+  if (q == std::string_view::npos) {
+    path.assign(t.data(), t.size());
     query.clear();
   } else {
-    path = target.substr(0, q);
-    query = target.substr(q + 1);
+    path.assign(t.data(), q);
+    query.assign(t.data() + q + 1, t.size() - q - 1);
   }
 
   // HTTP-version = "HTTP/" DIGIT "." DIGIT  (RFC 9112 §2.3)
@@ -353,19 +388,17 @@ inline bool HttpParser::parseHeaderLine(std::string_view line) {
   // Reuse a slot (and its strings' heap capacities) from a previous request when one is available - header parsing is allocation-free on a warm keep-alive connection.
   if (headerCount_ < headers.size()) {
     Header& h = headers[headerCount_];
-    h.name.clear();
-    for (char c : name) {
-      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-      h.name.push_back(c);
-    }
+    h.name.resize(name.size());
+    for (size_t i = 0; i < name.size(); ++i)
+      h.name[i] =
+          static_cast<char>(kLowercase[static_cast<unsigned char>(name[i])]);
     h.value.assign(value.data(), value.size());
   } else {
     Header h;
-    h.name.reserve(name.size());
-    for (char c : name) {
-      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-      h.name.push_back(c);
-    }
+    h.name.resize(name.size());
+    for (size_t i = 0; i < name.size(); ++i)
+      h.name[i] =
+          static_cast<char>(kLowercase[static_cast<unsigned char>(name[i])]);
     h.value.assign(value);
     headers.push_back(std::move(h));
   }
@@ -374,6 +407,74 @@ inline bool HttpParser::parseHeaderLine(std::string_view line) {
 }
 
 inline bool HttpParser::finalizeHeaders() {
+  // One pass over the headers (they were four), dispatching on the lowercased
+  // name's length then a memcmp. Error PRECEDENCE must match the old pass
+  // order - Host discipline first, then Content-Length parse errors - so a
+  // Content-Length failure is recorded in clError here and only reported
+  // after the Host check below.
+  size_t hostCount = 0;
+  bool sawClose = false, sawKeepAlive = false;
+  const char* te = nullptr;
+  size_t teCount = 0;
+  bool hasCL = false;
+  size_t clCount = 0;
+  size_t cl = 0;
+  int clError = 0;
+  for (const auto& h : headers) {
+    const std::string& n = h.name;
+    switch (n.size()) {
+      case 4:
+        if (memcmp(n.data(), "host", 4) == 0) ++hostCount;
+        break;
+      case 10:
+        // Connection handling (RFC 9110 §7.6.1). The field is a comma-separated list of connection options; tokenize every Connection header so "keep-alive, close" or "close, foo" are honored. A "close" token anywhere wins over "keep-alive"; otherwise a "keep-alive" token overrides the version default.
+        if (memcmp(n.data(), "connection", 10) == 0) {
+          std::string_view c = h.value;
+          size_t pos = 0;
+          while (pos <= c.size()) {
+            size_t comma = c.find(',', pos);
+            std::string_view tok =
+                trimOWS(c.substr(pos, comma == std::string_view::npos ? c.size() - pos : comma - pos));
+            if (iequals(tok, "close")) sawClose = true;
+            else if (iequals(tok, "keep-alive")) sawKeepAlive = true;
+            if (comma == std::string_view::npos) break;
+            pos = comma + 1;
+          }
+        }
+        break;
+      case 14:
+        // clError == 0 guard: the old dedicated pass stopped at its FIRST bad
+        // Content-Length; later CL headers must stay unparsed.
+        if (memcmp(n.data(), "content-length", 14) == 0 && clError == 0) {
+          clCount++;
+          // Reject conflicting duplicate Content-Length (RFC 9112 §6.3.5)
+          size_t parsed = 0;
+          if (h.value.empty()) { clError = 400; break; }
+          for (char c : h.value) {
+            if (c < '0' || c > '9') { clError = 400; break; }
+            parsed = parsed * 10 + static_cast<size_t>(c - '0');
+            // Reject once the value exceeds the body limit, DURING accumulation.
+            // A long digit string (allowed within maxHeadSize) would otherwise
+            // overflow size_t, wrap to a small value, slip past the post-loop 413
+            // check, and desync the body length -> request smuggling.
+            if (parsed > limits_->maxBodySize) { clError = 413; break; }
+          }
+          if (clError) break;
+          if (hasCL && parsed != cl) { clError = 400; break; }
+          cl = parsed;
+          hasCL = true;
+        }
+        break;
+      case 17:
+        // Count Transfer-Encoding headers: RFC 9112 §6.1 requires the FINAL coding to be chunked. The engine only supports a lone "chunked", so more than one TE header (e.g. "chunked" then "cow") is a smuggling vector and is rejected (below).
+        if (memcmp(n.data(), "transfer-encoding", 17) == 0) {
+          teCount++;
+          te = h.value.c_str();
+        }
+        break;
+    }
+  }
+
   // Host discipline (RFC 9112 §3.2): an HTTP/1.1 request MUST carry exactly
   // one Host header - answer 400 to zero (1.1+ only; 1.0 predates Host) or
   // more than one (any version). Absent/duplicate Host is a building block
@@ -381,66 +482,15 @@ inline bool HttpParser::finalizeHeaders() {
   // routes on it; the parser is the one place that can reject it before any
   // routing sees the request. Node's http server enforces the same
   // (requireHostHeader, default on).
-  size_t hostCount = 0;
-  for (const auto& h : headers) {
-    if (h.name == "host") ++hostCount;
-  }
   if (hostCount > 1 || (hostCount == 0 && minorVersion >= 1)) {
     errorStatus = 400;
     return false;
   }
 
-  // Connection handling (RFC 9110 §7.6.1). The field is a comma-separated list of connection options; tokenize every Connection header so "keep-alive, close" or "close, foo" are honored. A "close" token anywhere wins over "keep-alive"; otherwise a "keep-alive" token overrides the version default.
-  bool sawClose = false, sawKeepAlive = false;
-  for (const auto& h : headers) {
-    if (h.name != "connection") continue;
-    std::string_view c = h.value;
-    size_t pos = 0;
-    while (pos <= c.size()) {
-      size_t comma = c.find(',', pos);
-      std::string_view tok =
-          trimOWS(c.substr(pos, comma == std::string_view::npos ? c.size() - pos : comma - pos));
-      if (iequals(tok, "close")) sawClose = true;
-      else if (iequals(tok, "keep-alive")) sawKeepAlive = true;
-      if (comma == std::string_view::npos) break;
-      pos = comma + 1;
-    }
-  }
   if (sawClose) keepAlive = false;
   else if (sawKeepAlive) keepAlive = true;
 
-  // Count Transfer-Encoding headers: RFC 9112 §6.1 requires the FINAL coding to be chunked. The engine only supports a lone "chunked", so more than one TE header (e.g. "chunked" then "cow") is a smuggling vector and is rejected.
-  const char* te = nullptr;
-  size_t teCount = 0;
-  for (const auto& h : headers) {
-    if (h.name == "transfer-encoding") {
-      teCount++;
-      te = h.value.c_str();
-    }
-  }
-  bool hasCL = false;
-  size_t clCount = 0;
-  size_t cl = 0;
-  for (const auto& h : headers) {
-    if (h.name == "content-length") {
-      clCount++;
-      // Reject conflicting duplicate Content-Length (RFC 9112 §6.3.5)
-      size_t parsed = 0;
-      if (h.value.empty()) { errorStatus = 400; return false; }
-      for (char c : h.value) {
-        if (c < '0' || c > '9') { errorStatus = 400; return false; }
-        parsed = parsed * 10 + static_cast<size_t>(c - '0');
-        // Reject once the value exceeds the body limit, DURING accumulation.
-        // A long digit string (allowed within maxHeadSize) would otherwise
-        // overflow size_t, wrap to a small value, slip past the post-loop 413
-        // check, and desync the body length -> request smuggling.
-        if (parsed > limits_.maxBodySize) { errorStatus = 413; return false; }
-      }
-      if (hasCL && parsed != cl) { errorStatus = 400; return false; }
-      cl = parsed;
-      hasCL = true;
-    }
-  }
+  if (clError) { errorStatus = clError; return false; }
   (void)clCount;
 
   if (te != nullptr) {
@@ -462,7 +512,7 @@ inline bool HttpParser::finalizeHeaders() {
   } else if (hasCL) {
     contentLength_ = cl;
     hasBody_ = cl > 0;
-    if (cl > limits_.maxBodySize) { errorStatus = 413; return false; }
+    if (cl > limits_->maxBodySize) { errorStatus = 413; return false; }
   } else {
     hasBody_ = false;  // no body framing -> no body (RFC 9112 §6.3 point 6)
   }
@@ -477,7 +527,7 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
   while (state_ == State::RequestLine || state_ == State::Headers) {
     size_t nl = buf_.find('\n', scanPos_);
     if (nl == std::string::npos) {
-      if (buf_.size() - consumed_ > limits_.maxHeadSize) {
+      if (buf_.size() - consumed_ > limits_->maxHeadSize) {
         errorStatus = 431;  // Request Header Fields Too Large
         return ParseStatus::Error;
       }
@@ -495,7 +545,10 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
         continue;
       }
       if (!parseRequestLine(line)) {
-        if (errorStatus == 400 && buf_.size() > limits_.maxHeadSize)
+        // Relative to consumed_: with deferred compaction the buffer may
+        // still carry a dead prefix from prior requests, which must not
+        // count toward this request's head size.
+        if (errorStatus == 400 && buf_.size() - consumed_ > limits_->maxHeadSize)
           errorStatus = 431;
         return ParseStatus::Error;
       }
@@ -510,14 +563,14 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
         // already hold the request's body when a buffered batch is replayed
         // in one parse() call, and those bytes must not count against the
         // head limit.
-        if (headEnd_ - consumed_ > limits_.maxHeadSize) {
+        if (headEnd_ - consumed_ > limits_->maxHeadSize) {
           errorStatus = 431;
           return ParseStatus::Error;
         }
         // Trim stale reuse-slots from a prior, larger request BEFORE any
         // consumer can iterate the vector.
         headers.resize(headerCount_);
-        if (headerCount_ > limits_.maxHeaders) {
+        if (headerCount_ > limits_->maxHeaders) {
           errorStatus = 431;
           return ParseStatus::Error;
         }
@@ -525,7 +578,7 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
         state_ = chunked_ ? State::ChunkSize : State::Body;
         break;
       }
-      if (headerCount_ >= limits_.maxHeaders) {
+      if (headerCount_ >= limits_->maxHeaders) {
         errorStatus = 431;
         return ParseStatus::Error;
       }
@@ -539,7 +592,7 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
     // no-newline branch above can keep using buf_.size(): body bytes are
     // always preceded by the blank line's '\n', so an un-terminated remainder
     // is head bytes by construction.
-    if (scanPos_ - consumed_ > limits_.maxHeadSize && state_ != State::Body &&
+    if (scanPos_ - consumed_ > limits_->maxHeadSize && state_ != State::Body &&
         state_ != State::ChunkSize) {
       errorStatus = 431;
       return ParseStatus::Error;
@@ -587,7 +640,7 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
         else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
         else { errorStatus = 400; return ParseStatus::Error; }
         sz = sz * 16 + static_cast<size_t>(d);
-        if (sz > limits_.maxBodySize) { errorStatus = 413; return ParseStatus::Error; }
+        if (sz > limits_->maxBodySize) { errorStatus = 413; return ParseStatus::Error; }
       }
       chunkRemaining_ = sz;
       scanPos_ = nl + 1;
@@ -600,7 +653,7 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
     } else if (state_ == State::ChunkData) {
       size_t available = buf_.size() - scanPos_;
       if (available < chunkRemaining_ + 2) return ParseStatus::NeedMore;  // + CRLF
-      if (body.size() + chunkRemaining_ > limits_.maxBodySize) {
+      if (body.size() + chunkRemaining_ > limits_->maxBodySize) {
         errorStatus = 413;
         return ParseStatus::Error;
       }
@@ -619,7 +672,7 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
       // without this, an attacker streams "X:y\r\n" forever — each line passes a
       // per-line check while buf_ grows without bound (never trimmed until
       // reset()), the request never Completes, and RSS climbs to OOM.
-      if (buf_.size() - chunkTrailerStart_ > limits_.maxHeadSize) {
+      if (buf_.size() - chunkTrailerStart_ > limits_->maxHeadSize) {
         errorStatus = 431;
         return ParseStatus::Error;
       }

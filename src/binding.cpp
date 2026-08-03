@@ -66,6 +66,13 @@ struct JsServer {
   std::unordered_map<std::string, Global<String>> pathCache;
   static constexpr size_t kPathCacheMaxEntries = 512;
   static constexpr size_t kPathCacheMaxLen = 128;
+  // Same idea for request header NAMES (getHeaders/getHeader hot path when
+  // apps read req.headers): a bounded set in practice (host, accept, ...),
+  // so intern them instead of a String::NewFromUtf8 per name per request.
+  // Values are never cached - they vary per request. Same lifetime story.
+  std::unordered_map<std::string, Global<String>> headerNameCache;
+  static constexpr size_t kHeaderNameCacheMaxEntries = 256;
+  static constexpr size_t kHeaderNameCacheMaxLen = 64;
 };
 
 // thread_local, not process-global: worker_threads + reusePort (see
@@ -83,6 +90,15 @@ static void freeJsServer(void* user) {
   JsServer* js = static_cast<JsServer*>(user);
   g_servers.erase(js->id);
   delete js;
+}
+
+// Reverse lookup for binding functions that only hold a Connection (e.g.
+// getHeaders): g_servers is tiny (one entry per serve() on this thread), so
+// a scan beats storing a back-pointer on every connection.
+static JsServer* jsServerFor(const Server* srv) {
+  for (auto& [id, js] : g_servers)
+    if (js->server == srv) return js;
+  return nullptr;
 }
 
 // ---- helpers ----
@@ -111,6 +127,72 @@ static Local<String> str(Isolate* iso, const char* s) {
   return String::Empty(iso);
 }
 
+// Read a JS string's bytes into out IF it is a one-byte string whose content
+// is pure ASCII (where Latin-1 == UTF-8, so the copy is exact). Returns false
+// - leaving out untouched - when the caller must fall back to Utf8Value
+// (two-byte strings, or Latin-1 bytes >= 0x80 that UTF-8 encodes as two
+// bytes). Compared to Utf8Value this is malloc-free: it writes into the
+// caller's reused buffer instead of a fresh heap block per call.
+// Bounded by maxLen so a huge non-ASCII string can't pay a full wasted copy
+// before the fallback.
+static bool readAsciiOneByte(Isolate* iso, Local<String> str8,
+                             std::string& out, size_t maxLen) {
+  if (!str8->IsOneByte()) return false;
+  const int len = str8->Length();
+  if (len < 0 || static_cast<size_t>(len) > maxLen) return false;
+#if V8_MAJOR_VERSION >= 14
+  // WriteOneByte changed shape in V8 14 (Node 26) - same caution as
+  // ByteSource below. Take the Utf8Value fallback until that ABI is verified.
+  (void)iso;
+  return false;
+#else
+  out.resize(static_cast<size_t>(len));
+  str8->WriteOneByte(iso, reinterpret_cast<uint8_t*>(out.data()), 0, len,
+                     String::NO_NULL_TERMINATION);
+  for (unsigned char ch : out)
+    if (ch >= 0x80) return false;  // needs real UTF-8 encoding - fall back
+  return true;
+#endif
+}
+
+// Reused header-block buffer for Respond/WriteHead - the block was a fresh
+// std::string per response (heap-allocating past SSO for even one header).
+// buildHeaders can run arbitrary JS (array index getters / valueOf), which
+// can re-enter respond(); nested calls get a plain local so the outer block
+// is never clobbered. thread_local by the same ownership rules as the
+// registries. Plain std::string, so thread-exit destruction never touches V8.
+static thread_local std::string g_headerBlock;
+static thread_local bool g_headerBlockInUse = false;
+class HeaderBlockLease {
+ public:
+  HeaderBlockLease() {
+    if (!g_headerBlockInUse) {
+      g_headerBlockInUse = true;
+      owned_ = true;
+      g_headerBlock.clear();
+      block_ = &g_headerBlock;
+    } else {
+      block_ = &local_;
+    }
+  }
+  ~HeaderBlockLease() {
+    if (owned_) g_headerBlockInUse = false;
+  }
+  std::string& get() { return *block_; }
+
+ private:
+  std::string* block_ = nullptr;
+  std::string local_;
+  bool owned_ = false;
+};
+
+// Same pattern for the two small buildHeaders scratch strings (name/value
+// per pair). These never hold state across a JS call within one pair, but
+// buildHeaders itself nests via getters - the lease keeps nesting correct.
+static thread_local std::string g_hdrKeyScratch;
+static thread_local std::string g_hdrValScratch;
+static thread_local bool g_hdrScratchInUse = false;
+
 // Borrowed, zero-copy view of a JS value's bytes (string | ArrayBuffer |
 // TypedArray | DataView). A string's UTF-8 lives in the owned Utf8Value
 // member; ArrayBuffer backing stores are external allocations whose data
@@ -121,10 +203,29 @@ static Local<String> str(Isolate* iso, const char* s) {
 // ciphertext buffer / a queued WriteReq - see respond/appendResponse/
 // writeOutView in server.h) before any JS re-entry, so the borrow never
 // outlives this stack frame.
+// Reused body-bytes buffer for ByteSource's string path (a malloc+free per
+// response via String::Utf8Value otherwise). A ByteSource borrow never spans
+// a JS call (each binding entry point builds headers FIRST, then the body,
+// then hands both to the server synchronously), but the in-use flag makes
+// nesting fall back to Utf8Value rather than assume that.
+static thread_local std::string g_byteScratch;
+static thread_local bool g_byteScratchInUse = false;
+
 class ByteSource {
  public:
   ByteSource(Isolate* iso, Local<Value> v) {
     if (v->IsString()) {
+      // Malloc-free path for ASCII one-byte strings (typical JSON/text
+      // bodies) up to 64 KiB - larger or non-ASCII strings take Utf8Value.
+      if (!g_byteScratchInUse &&
+          readAsciiOneByte(iso, v.As<String>(), g_byteScratch, 65536)) {
+        g_byteScratchInUse = true;
+        usedScratch_ = true;
+        data_ = g_byteScratch.data();
+        size_ = g_byteScratch.size();
+        valid_ = true;
+        return;
+      }
       // String::Utf8Value is stable across V8 versions (Node 20..26); the
       // direct Utf8Length/WriteUtf8 API changed shape in V8 14 (Node 26).
       utf8_.emplace(iso, v);
@@ -153,6 +254,12 @@ class ByteSource {
       valid_ = true;
     }
   }
+  ~ByteSource() {
+    if (usedScratch_) g_byteScratchInUse = false;
+  }
+  ByteSource(const ByteSource&) = delete;
+  ByteSource& operator=(const ByteSource&) = delete;
+
   bool valid() const { return valid_; }
   // data() is null only when size() == 0 (null/undefined, an empty
   // ArrayBuffer, or a string whose UTF-8 conversion failed) - callers may
@@ -165,6 +272,7 @@ class ByteSource {
   const char* data_ = nullptr;
   size_t size_ = 0;
   bool valid_ = false;
+  bool usedScratch_ = false;
 };
 
 // Copy the bytes of a JS value (string | ArrayBuffer | TypedArray) into out.
@@ -231,35 +339,68 @@ static void buildHeaders(Isolate* iso, Local<Context> ctx, Local<Value> v,
   if (v.IsEmpty() || !v->IsArray()) return;
   Local<Array> arr = v.As<Array>();
   uint32_t n = arr->Length();
+  // Scratch lease: the Get()s below can run JS (element getters), which can
+  // re-enter respond() and therefore this function - nested calls get plain
+  // locals so the outer pair is never clobbered.
+  std::string localK, localV;
+  const bool ownScratch = !g_hdrScratchInUse;
+  if (ownScratch) g_hdrScratchInUse = true;
+  std::string& kbuf = ownScratch ? g_hdrKeyScratch : localK;
+  std::string& vbuf = ownScratch ? g_hdrValScratch : localV;
   for (uint32_t i = 0; i + 1 < n; i += 2) {
     Local<Value> kv, vv;
     if (!arr->Get(ctx, i).ToLocal(&kv)) continue;
     if (!arr->Get(ctx, i + 1).ToLocal(&vv)) continue;
-    String::Utf8Value k(iso, kv);
-    String::Utf8Value val(iso, vv);
-    if (*k == nullptr) continue;
-    if (!validHeaderName(*k, k.length())) continue;
-    if (*val && !validHeaderValue(*val, val.length())) continue;
+    // Malloc-free one-byte read for plain-ASCII strings (the overwhelmingly
+    // common case for header names and values); String::Utf8Value otherwise,
+    // which also preserves ToString coercion for non-string values. `kd`/`vd`
+    // stay valid across the (possible) JS run inside the value's coercion:
+    // nested buildHeaders calls use locals per the lease above.
+    const char* kd = nullptr;
+    int kn = 0;
+    std::optional<String::Utf8Value> kFall;
+    if (kv->IsString() && readAsciiOneByte(iso, kv.As<String>(), kbuf, 4096)) {
+      kd = kbuf.data();
+      kn = static_cast<int>(kbuf.size());
+    } else {
+      kFall.emplace(iso, kv);
+      kd = **kFall;  // may be nullptr - checked below, after the value
+      kn = kFall->length();  // conversion, matching the original ordering
+    }
+    const char* vd = nullptr;
+    int vn = 0;
+    std::optional<String::Utf8Value> vFall;
+    if (vv->IsString() && readAsciiOneByte(iso, vv.As<String>(), vbuf, 65536)) {
+      vd = vbuf.data();
+      vn = static_cast<int>(vbuf.size());
+    } else {
+      vFall.emplace(iso, vv);
+      vd = **vFall;  // may be nullptr (failed conversion) - same as before
+      vn = vFall->length();
+    }
+    if (kd == nullptr) continue;
+    if (!validHeaderName(kd, kn)) continue;
+    if (vd && !validHeaderValue(vd, vn)) continue;
     // Drop headers the engine owns or that are hop-by-hop: letting an app emit
     // Transfer-Encoding/Connection/Date/Keep-Alive would duplicate or conflict
     // with the framing the server writes itself (a Transfer-Encoding from the
     // app alongside the engine's Content-Length is a smuggling-grade ambiguity).
-    if (headerNameIs(*k, k.length(), "transfer-encoding") ||
-        headerNameIs(*k, k.length(), "connection") ||
-        headerNameIs(*k, k.length(), "keep-alive") ||
-        headerNameIs(*k, k.length(), "date")) {
+    if (headerNameIs(kd, kn, "transfer-encoding") ||
+        headerNameIs(kd, kn, "connection") ||
+        headerNameIs(kd, kn, "keep-alive") ||
+        headerNameIs(kd, kn, "date")) {
       continue;
     }
     // Case-insensitive check for content-length
-    if (k.length() == 14) {
-      bool match = headerNameIs(*k, k.length(), "content-length");
+    if (kn == 14) {
+      bool match = headerNameIs(kd, kn, "content-length");
       if (match) {
         // Parse strictly as decimal digits; anything else is ignored and the
         // server computes the length itself.
         long long parsed = 0;
-        bool ok = *val != nullptr && val.length() > 0 && val.length() <= 18;
-        for (int j = 0; ok && j < val.length(); ++j) {
-          const char d = (*val)[j];
+        bool ok = vd != nullptr && vn > 0 && vn <= 18;
+        for (int j = 0; ok && j < vn; ++j) {
+          const char d = vd[j];
           if (d < '0' || d > '9') ok = false;
           else parsed = parsed * 10 + (d - '0');
         }
@@ -267,11 +408,12 @@ static void buildHeaders(Isolate* iso, Local<Context> ctx, Local<Value> v,
         continue;  // never copied into the block
       }
     }
-    block.append(*k, k.length());
+    block.append(kd, static_cast<size_t>(kn));
     block.append(": ");
-    if (*val) block.append(*val, val.length());
+    if (vd) block.append(vd, static_cast<size_t>(vn));
     block.append("\r\n");
   }
+  if (ownScratch) g_hdrScratchInUse = false;
 }
 
 // ---- Server-side callbacks that trampoline into JS ----
@@ -683,7 +825,18 @@ static Connection* connFrom(const FunctionCallbackInfo<Value>& args) {
 static void GetMethod(const FunctionCallbackInfo<Value>& args) {
   Connection* c = connFrom(args);
   if (!c) return;
-  args.GetReturnValue().Set(str(args.GetIsolate(), c->methodStr));
+  // methodStr is only populated for Method::OTHER (see parseRequestLine);
+  // known methods answer from the canonical table, indexed by the Method
+  // enum (keep in sync with it).
+  static const char* const kMethodNames[] = {"GET",   "POST", "PUT",
+                                             "DELETE", "PATCH", "HEAD",
+                                             "OPTIONS"};
+  if (c->method == Method::OTHER) {
+    args.GetReturnValue().Set(str(args.GetIsolate(), c->methodStr));
+  } else {
+    args.GetReturnValue().Set(str(
+        args.GetIsolate(), kMethodNames[static_cast<uint8_t>(c->method)]));
+  }
 }
 
 static void GetQuery(const FunctionCallbackInfo<Value>& args) {
@@ -702,11 +855,28 @@ static void GetHeaders(const FunctionCallbackInfo<Value>& args) {
   size_t hint = c->headers.size() * 2;
   if (hint > static_cast<size_t>(INT_MAX)) hint = static_cast<size_t>(INT_MAX);
   Local<Array> arr = Array::New(iso, static_cast<int>(hint));
+  JsServer* js = jsServerFor(c->server);
   uint32_t idx = 0;
   for (const auto& h : c->headers) {
+    // Names come from a small bounded set in practice - serve them from the
+    // per-server interning cache (same pattern and lifetime as pathCache).
+    Local<String> nameStr;
+    if (js && h.name.size() <= JsServer::kHeaderNameCacheMaxLen) {
+      auto it = js->headerNameCache.find(h.name);
+      if (it != js->headerNameCache.end()) {
+        nameStr = it->second.Get(iso);
+      } else {
+        nameStr = str(iso, h.name);
+        if (js->headerNameCache.size() < JsServer::kHeaderNameCacheMaxEntries) {
+          js->headerNameCache.emplace(h.name, Global<String>(iso, nameStr));
+        }
+      }
+    } else {
+      nameStr = str(iso, h.name);
+    }
     // FromMaybe, not Check: a failed Set under allocation pressure yields a
     // hole in the array instead of aborting the whole Node process.
-    (void)arr->Set(ctx, idx++, str(iso, h.name)).FromMaybe(false);
+    (void)arr->Set(ctx, idx++, nameStr).FromMaybe(false);
     (void)arr->Set(ctx, idx++, str(iso, h.value)).FromMaybe(false);
   }
   args.GetReturnValue().Set(arr);
@@ -758,7 +928,8 @@ static void Respond(const FunctionCallbackInfo<Value>& args) {
   Connection* c = connFrom(args);
   if (!c) return;
   int status = args[1]->Int32Value(ctx).FromMaybe(200);
-  std::string headers;
+  HeaderBlockLease headersLease;
+  std::string& headers = headersLease.get();
   long long customCL = -1;
   buildHeaders(iso, ctx, args[2], headers, customCL);
   // The body borrow is taken AFTER buildHeaders: buildHeaders can run
@@ -776,7 +947,8 @@ static void WriteHead(const FunctionCallbackInfo<Value>& args) {
   Connection* c = connFrom(args);
   if (!c) return;
   int status = args[1]->Int32Value(ctx).FromMaybe(200);
-  std::string headers;
+  HeaderBlockLease headersLease;
+  std::string& headers = headersLease.get();
   long long customCL = -1;
   buildHeaders(iso, ctx, args[2], headers, customCL);
   c->server->writeHead(c, status, headers, customCL);

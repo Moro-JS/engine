@@ -92,7 +92,8 @@ close(serverId: number): void;   // full teardown: stop accepting AND close ever
 
 // ---- request data (lazy; single crossing each) ----
 // methodIdx indexes METHODS = ['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS','OTHER']
-getMethod(reqId): string | undefined;     // for methodIdx 7 (OTHER)
+getMethod(reqId): string | undefined;     // canonical method name; the extra crossing is
+                                          // only NEEDED for methodIdx 7 (OTHER)
 getQuery(reqId): string;                  // raw query string, '' if none
 getHeaders(reqId): string[];              // flat [k1,v1,k2,v2,...], keys lowercased
 getHeader(reqId, lowercaseName: string): string | undefined;

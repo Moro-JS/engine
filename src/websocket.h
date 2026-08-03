@@ -580,8 +580,8 @@ class WsParser {
     onMessage(std::string_view(message_), messageIsBinary_, messageCompressed_);
     message_.clear();
     // One huge message must not pin its capacity to an idle connection (same
-    // 64 KiB watermark as server.h's releaseScratch).
-    if (message_.capacity() > 65536) message_.shrink_to_fit();
+    // 16 KiB watermark as server.h's releaseScratch).
+    if (message_.capacity() > 16384) message_.shrink_to_fit();
     inMessage_ = false;
     messageCompressed_ = false;
     return true;

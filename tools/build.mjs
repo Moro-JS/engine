@@ -180,13 +180,37 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null }) {
         '-fno-rtti',
       ];
 
+  // Opt-in profile-guided optimization (POSIX/clang only, never on by
+  // default): MORO_PGO=generate instruments the build and writes raw profiles
+  // to MORO_PGO_DIR (default build/pgo); after running the bench + test
+  // workload, merge with `llvm-profdata merge -o moro.profdata <dir>/*.profraw`
+  // and rebuild with MORO_PGO=use MORO_PGO_PROFILE=<path>/moro.profdata.
+  // Branch-heavy parser/state-machine code typically gains 5-15% from PGO.
+  const pgoMode = process.env.MORO_PGO || '';
+  const pgoFlags = [];
+  if (!sanitize && platform !== 'win32') {
+    if (pgoMode === 'generate') {
+      const dir = process.env.MORO_PGO_DIR || join(buildDir, 'pgo');
+      pgoFlags.push(`-fprofile-generate=${dir}`);
+    } else if (pgoMode === 'use') {
+      const profile = process.env.MORO_PGO_PROFILE;
+      if (!profile) throw new Error('MORO_PGO=use requires MORO_PGO_PROFILE=<file.profdata>');
+      pgoFlags.push(`-fprofile-use=${profile}`);
+    } else if (pgoMode) {
+      throw new Error(`MORO_PGO must be "generate" or "use", got "${pgoMode}"`);
+    }
+  }
+
   const common = [
     '-std=c++20',
     ...modeFlags,
+    ...pgoFlags,
     // x64 ISA floor: x86-64-v2 (SSE4.2/POPCNT, ~2009 Nehalem and later;
-    // RHEL 9's baseline). arm64 stays at the compiler's default armv8-a.
-    // Release-only so the sanitizer lane's flags stay exactly as-is.
+    // RHEL 9's baseline). arm64 ISA floor: armv8.2-a (Neoverse/Graviton2,
+    // Apple Silicon and later). Release-only so the sanitizer lane's flags
+    // stay exactly as-is.
     ...(!sanitize && arch === 'x64' ? ['-march=x86-64-v2'] : []),
+    ...(!sanitize && arch === 'arm64' ? ['-march=armv8.2-a'] : []),
     '-fvisibility=hidden',
     `-I${includeDir}`,
     '-DBUILDING_NODE_EXTENSION',

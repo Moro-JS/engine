@@ -13,6 +13,8 @@
 #include <ctime>
 #include <functional>
 #include <memory>
+
+#include "flat_map.h"
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -32,24 +34,52 @@ namespace moro {
 namespace engine {
 
 // Cached RFC 9110 §5.6.7 Date header, refreshed at most once per second.
-inline const std::string& httpDate() {
+// Holds the COMPLETE "Date: ...\r\n" line so the hot path appends it once.
+// time(nullptr), not uv_now: uv_now is loop time, not wall-clock.
+inline const std::string& httpDateLine() {
   static thread_local std::string cached;
   static thread_local time_t cachedAt = 0;
   time_t now = time(nullptr);
   if (now != cachedAt || cached.empty()) {
-    char buf[40];
+    char buf[48];
     struct tm gmt;
 #if defined(_WIN32)
     gmtime_s(&gmt, &now);
 #else
     gmtime_r(&now, &gmt);
 #endif
-    // e.g. "Sun, 06 Jul 2026 21:00:00 GMT"
-    strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", &gmt);
+    // e.g. "Date: Sun, 06 Jul 2026 21:00:00 GMT\r\n"
+    strftime(buf, sizeof(buf), "Date: %a, %d %b %Y %H:%M:%S GMT\r\n", &gmt);
     cached.assign(buf);
     cachedAt = now;
   }
   return cached;
+}
+
+// Append v in decimal - digits written backwards into a stack buffer, one
+// append, no std::to_string temporary on the hot path.
+inline void appendDecimal(std::string& out, unsigned long long v) {
+  char buf[20];  // max digits of a 64-bit value
+  char* p = buf + sizeof(buf);
+  do {
+    *--p = static_cast<char>('0' + (v % 10));
+    v /= 10;
+  } while (v != 0);
+  out.append(p, static_cast<size_t>(buf + sizeof(buf) - p));
+}
+
+// Append the chunked-framing size line "<hex>\r\n" (lowercase, minimal
+// digits - byte-identical to the snprintf("%zx\r\n") it replaces).
+inline void appendChunkSize(std::string& out, size_t v) {
+  char buf[sizeof(size_t) * 2 + 2];  // max hex digits + CRLF
+  char* p = buf + sizeof(buf);
+  *--p = '\n';
+  *--p = '\r';
+  do {
+    *--p = "0123456789abcdef"[v & 0xF];
+    v >>= 4;
+  } while (v != 0);
+  out.append(p, static_cast<size_t>(buf + sizeof(buf) - p));
 }
 
 inline const char* reasonPhrase(int status) {
@@ -94,17 +124,13 @@ inline uint32_t& globalReqCounter() {
   static thread_local uint32_t counter = 0;
   return counter;
 }
-inline std::unordered_map<uint32_t, Connection*>& globalRequests() {
-  // Pre-sized with a low load factor: this map takes an insert + an erase on
-  // EVERY request, so rehashes and collision chains sit directly on the hot
-  // path. 4096 buckets at 0.5 load ≈ 2048 concurrent in-flight requests
-  // before the first rehash.
-  static thread_local std::unordered_map<uint32_t, Connection*> map = [] {
-    std::unordered_map<uint32_t, Connection*> m;
-    m.max_load_factor(0.5f);
-    m.reserve(2048);
-    return m;
-  }();
+// reqId registry: flat open-addressing map (see flat_map.h) - no per-op
+// allocation where std::unordered_map paid a node malloc/free per request.
+// Key 0 is the empty sentinel; reqIds are never 0 (surfaceRequest skips it).
+using FlatReqMap = FlatMap<Connection*>;
+
+inline FlatReqMap& globalRequests() {
+  static thread_local FlatReqMap map;
   return map;
 }
 
@@ -128,7 +154,13 @@ struct Connection {
   // internal to libuv and unaffected by where `handle` sits here.)
   uv_tcp_t handle;
   HttpParser parser;
-  std::string readBuf;         // reused alloc target
+#if defined(_WIN32)
+  // Per-connection receive buffer (uninitialized on purpose - uv only reads
+  // back what the socket filled). Windows/IOCP posts this into an overlapped
+  // WSARecv that outlives the alloc callback, so it cannot be shared.
+  std::unique_ptr<char[]> readBuf;
+  size_t readBufSize = 0;
+#endif
   std::string pending;         // bytes received while a response is in flight
 
   // Snapshot of the request currently surfaced to JS (valid for the reqId's lifetime; the parser is reset for the next request).
@@ -343,9 +375,7 @@ class Server {
   }
 
   static Connection* lookup(uint32_t reqId) {
-    auto& map = globalRequests();
-    auto it = map.find(reqId);
-    return it == map.end() ? nullptr : it->second;
+    return globalRequests().find(reqId);
   }
 
   std::string remoteAddress(Connection* c) {
@@ -381,6 +411,8 @@ class Server {
     // every pipelined batch. (TLS must go through writeOutView so the frame is
     // encrypted before it reaches corkBuf.)
     if (c->corked && !c->tls) {
+      c->corkBuf.reserve(c->corkBuf.size() + bodyLen + headersBlock.size() +
+                         128);
       appendResponse(c->corkBuf, c, status, headersBlock, customCL, body,
                      bodyLen, bodyless);
       c->responseStarted = true;
@@ -411,9 +443,7 @@ class Server {
                       const std::string& headersBlock, long long customCL,
                       const char* body, size_t bodyLen, bool bodyless) {
     appendStatusLine(out, status);
-    out += "Date: ";
-    out += httpDate();
-    out += "\r\n";
+    out += httpDateLine();
     out += headersBlock;
     if (!bodyless) {
       const unsigned long long cl =
@@ -421,11 +451,11 @@ class Server {
               ? static_cast<unsigned long long>(customCL)
               : static_cast<unsigned long long>(bodyLen);
       out += "Content-Length: ";
-      out += std::to_string(cl);
+      appendDecimal(out, cl);
       out += "\r\n";
     } else if (customCL >= 0) {
       out += "Content-Length: ";
-      out += std::to_string(static_cast<unsigned long long>(customCL));
+      appendDecimal(out, static_cast<unsigned long long>(customCL));
       out += "\r\n";
     }
     out += connectionHeader(c);
@@ -436,7 +466,7 @@ class Server {
   // One huge response must not pin its capacity to an idle connection; small
   // (typical) responses keep theirs so the next build is allocation-free.
   static void releaseScratch(Connection* c) {
-    if (c->scratch.capacity() > 65536) {
+    if (c->scratch.capacity() > 16384) {
       c->scratch.clear();
       c->scratch.shrink_to_fit();
     }
@@ -460,21 +490,19 @@ class Server {
     std::string& out = c->scratch;
     out.clear();
     appendStatusLine(out, status);
-    out += "Date: ";
-    out += httpDate();
-    out += "\r\n";
+    out += httpDateLine();
     out += headersBlock;
     if (c->bodylessStatus) {
       if (customCL >= 0) {
         out += "Content-Length: ";
-        out += std::to_string(static_cast<unsigned long long>(customCL));
+        appendDecimal(out, static_cast<unsigned long long>(customCL));
         out += "\r\n";
       }
     } else if (c->chunkedResponse) {
       out += "Transfer-Encoding: chunked\r\n";
     } else {
       out += "Content-Length: ";
-      out += std::to_string(static_cast<unsigned long long>(customCL));
+      appendDecimal(out, static_cast<unsigned long long>(customCL));
       out += "\r\n";
     }
     out += connectionHeader(c);
@@ -494,9 +522,7 @@ class Server {
     std::string& out = c->scratch;
     out.clear();
     if (c->chunkedResponse) {
-      char sizeLine[24];
-      int n = snprintf(sizeLine, sizeof(sizeLine), "%zx\r\n", len);
-      out.append(sizeLine, n);
+      appendChunkSize(out, len);
       out.append(data, len);
       out += "\r\n";
     } else {
@@ -527,20 +553,16 @@ class Server {
     if (!c->responseStarted) {
       // end() without writeHead(): a 200 with the given body as the full payload
       appendStatusLine(out, 200);
-      out += "Date: ";
-      out += httpDate();
-      out += "\r\n";
+      out += httpDateLine();
       out += "Content-Length: ";
-      out += std::to_string(c->isHead ? 0 : len);
+      appendDecimal(out, c->isHead ? 0 : len);
       out += "\r\n";
       out += connectionHeader(c);
       out += "\r\n";
       if (!c->isHead && len) out.append(data, len);
     } else if (c->chunkedResponse) {
       if (!c->isHead && !c->bodylessStatus && len) {
-        char sizeLine[24];
-        int n = snprintf(sizeLine, sizeof(sizeLine), "%zx\r\n", len);
-        out.append(sizeLine, n);
+        appendChunkSize(out, len);
         out.append(data, len);
         out += "\r\n";
       }
@@ -1058,8 +1080,9 @@ class Server {
       if (n == static_cast<int>(c->corkBuf.size())) {
         c->corkBuf.clear();
         // Don't pin a large batch's capacity to an idle keep-alive connection
-        // (same 64 KiB watermark as releaseScratch / the parser / WS message_).
-        if (c->corkBuf.capacity() > 65536) c->corkBuf.shrink_to_fit();
+        // (same 16 KiB watermark as releaseScratch / the parser body / WS
+        // message_).
+        if (c->corkBuf.capacity() > 16384) c->corkBuf.shrink_to_fit();
         return;
       }
       if (n > 0) c->corkBuf.erase(0, static_cast<size_t>(n));
@@ -1127,10 +1150,35 @@ class Server {
   }
 
   static void onAlloc(uv_handle_t* handle, size_t suggested, uv_buf_t* buf) {
+#if defined(_WIN32)
+    // IOCP holds the buffer in an outstanding overlapped read, so it must be
+    // per-connection. new[] not std::string::resize: resize value-initializes,
+    // and the memset made all 64 KiB resident for every connection.
     Connection* c = static_cast<Connection*>(handle->data);
-    if (c->readBuf.size() < suggested) c->readBuf.resize(suggested);
-    buf->base = &c->readBuf[0];
-    buf->len = static_cast<unsigned>(c->readBuf.size());
+    if (c->readBufSize < suggested) {
+      c->readBuf.reset(new char[suggested]);
+      c->readBufSize = suggested;
+    }
+    buf->base = c->readBuf.get();
+    buf->len = static_cast<unsigned>(c->readBufSize);
+#else
+    // One receive buffer per loop thread, shared by every connection. Safe on
+    // POSIX: libuv calls alloc_cb immediately before the synchronous read and
+    // the bytes are fully consumed before the next alloc - the parser/pending
+    // copy what they keep, and the WS parser's in-place unmasking finishes
+    // inside the same read callback (see dispatchPlaintext). Uninitialized on
+    // purpose: only pages the kernel actually fills become resident, and the
+    // O(connections) x 64 KiB zero-filled footprint collapses to O(1).
+    (void)handle;
+    static thread_local std::unique_ptr<char[]> sharedBuf;
+    static thread_local size_t sharedSize = 0;
+    if (sharedSize < suggested) {
+      sharedBuf.reset(new char[suggested]);
+      sharedSize = suggested;
+    }
+    buf->base = sharedBuf.get();
+    buf->len = static_cast<unsigned>(sharedSize);
+#endif
   }
 
   static void onRead(uv_stream_t* handle, ssize_t nread, const uv_buf_t* buf) {
@@ -1187,8 +1235,9 @@ class Server {
       // Zero-copy WS receive: the parser unmasks complete frames IN PLACE in
       // this buffer, so feedWebSocket takes mutable bytes. The const here is
       // only an artifact of this shared signature — both actual sources are
-      // mutable storage we own: c->readBuf for plaintext reads (onAlloc
-      // hands its storage to uv_read) and TlsSession::onCiphertext's local
+      // mutable storage we own: the loop's shared receive buffer for
+      // plaintext reads (onAlloc hands it to uv_read; per-connection on
+      // win32) and TlsSession::onCiphertext's local
       // decrypt scratch (a stack buffer) for TLS. Neither is reused until
       // the next uv_read / TLS record, after consume() has returned.
       feedWebSocket(c, const_cast<char*>(data), len);
@@ -1319,7 +1368,7 @@ class Server {
     auto& reqMap = globalRequests();
     do {
       c->reqId = ++globalReqCounter();
-    } while (c->reqId == 0 || reqMap.count(c->reqId));
+    } while (c->reqId == 0 || reqMap.contains(c->reqId));
     c->method = c->parser.method;
     // Swap, don't copy: the parser is reset before its next request anyway (reset() clears every swapped-in field, keeping its heap capacity), so the previous snapshot's buffers become the parser's scratch for the NEXT request - snapshots are allocation-free on a warm connection.
     c->methodStr.swap(c->parser.methodStr);
@@ -1331,7 +1380,7 @@ class Server {
     c->reqKeepAlive = c->parser.keepAlive;
     c->active = true;
     c->requestTicks = 0;  // the request-receive budget is per request
-    globalRequests()[c->reqId] = c;
+    globalRequests().insert(c->reqId, c);
 
     if (cb_.onRequest) cb_.onRequest(cb_.user, c);
   }
@@ -1341,9 +1390,8 @@ class Server {
     std::string& out = c->scratch;
     out.clear();
     appendStatusLine(out, status);
-    out += "Date: ";
-    out += httpDate();
-    out += "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    out += httpDateLine();
+    out += "Content-Length: 0\r\nConnection: close\r\n\r\n";
     c->responseEnded = true;
     writeOutView(c, out, /*terminal=*/true);
   }
