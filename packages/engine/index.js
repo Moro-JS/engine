@@ -61,6 +61,22 @@ function tryLoad() {
   const name = binaryName();
   const attempts = [];
 
+  // 0. Explicit binary (build/diagnostics only, never needed by users): the
+  //    PGO training run loads an instrumented build from a side directory,
+  //    and A/B runs can pin a specific .node. A path that fails to load is a
+  //    hard error - falling through to a different binary would defeat the
+  //    point of asking for this one.
+  const explicit = process.env.MORO_ENGINE_BINARY;
+  if (explicit) {
+    try {
+      return { module: require(explicit), from: explicit };
+    } catch (err) {
+      const error = new Error(`@morojs/engine: MORO_ENGINE_BINARY=${explicit} failed to load: ${err.message}`);
+      error.code = 'MORO_ENGINE_BINARY_MISSING';
+      return { error };
+    }
+  }
+
   // 1. Per-platform npm package
   const pkg = platformPackageName();
   try {
@@ -138,6 +154,8 @@ const NATIVE_API = new Set([
   'close',
   'stopListening',
   'getMethod',
+  'getBatchBuffers',
+  'getPath',
   'getQuery',
   'getHeaders',
   'getHeader',
@@ -148,6 +166,14 @@ const NATIVE_API = new Set([
   'writeHead',
   'write',
   'end',
+  'setStaticRoute',
+  'clearStaticRoutes',
+  'prepareResponse',
+  'releaseTemplates',
+  'respondPrepared',
+  'respondPreparedEmpty',
+  'writeHeadPrepared',
+  'endWith',
   'upgradeToWebSocket',
   'wsSend',
   'wsClose',
@@ -163,7 +189,13 @@ module.exports = new Proxy(
       // `__esModule`/`default`/`toJSON` — resolves to undefined WITHOUT loading,
       // so importing this package can never throw on an unsupported platform.
       if (typeof prop === 'string' && NATIVE_API.has(prop)) {
-        return loadBinding()[prop];
+        // Cache the native function on the target so every later read
+        // short-circuits on `prop in target` above: the call site then sees
+        // one constant function (inline-cacheable, fast-call eligible)
+        // instead of a fresh trap invocation per call.
+        const fn = loadBinding()[prop];
+        target[prop] = fn;
+        return fn;
       }
       return undefined;
     },

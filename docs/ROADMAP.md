@@ -97,6 +97,25 @@ Ongoing / recommended:
 ## Platform coverage
 
 Binaries build locally for darwin/arm64 across all 6 ABIs. The CI matrix
-(`.github/workflows/build.yml`) covers darwin x64+arm64, linux gnu x64+arm64,
-linux musl x64+arm64, and a Node 20–26 smoke matrix. Windows (MSVC) is the one
-remaining build leg to wire up.
+(`.github/workflows/ci.yml`, mirrored by `release.yml`) covers darwin
+x64+arm64, linux gnu x64+arm64 (clang-18 + lld, PGO-trained in the release
+lane), linux musl x64+arm64, and win32 x64 (MSVC), with a Node 20–26 smoke
+matrix on every flavour, full conformance legs on Linux/macOS/Windows, ASan/
+UBSan lanes, an in-repo h1spec job, and a strict PGO cycle.
+
+## io_uring: from opt-in to default
+
+1.2 ships the io_uring transport opt-in (`MORO_ENGINE_TRANSPORT=uring`);
+see `docs/DESIGN.md` "io_uring measurements" for the numbers that keep libuv
+the default. Work that could flip the default, in order of expected payoff:
+
+- `IORING_SETUP_DEFER_TASKRUN` behind a registered eventfd (`uv_poll` on the
+  eventfd, one `read` + one `io_uring_enter(GETEVENTS)` per loop turn): task
+  work runs batched inside our own enter instead of a signal-driven round
+  trip per completion.
+- Ring-submitted sends batched per loop turn (`IORING_OP_SEND` + `SUBMIT_ALL`
+  in the prepare flush) instead of one `sendto` per response; the corked
+  pipelined path already writes once per batch.
+- `IORING_RECVSEND_BUNDLE` (6.10+) for multi-segment receives.
+- Re-run `bench/transport-ab.sh` on bare-metal Linux (the VM numbers are
+  relative only) before any default change.

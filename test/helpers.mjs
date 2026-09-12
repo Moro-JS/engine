@@ -25,12 +25,26 @@ export async function loadEngine() {
   } catch {
     return null;
   }
+  let info;
   try {
-    const info = engine.probe();
+    info = engine.probe();
     if (!info || info.ok !== true) return null;
     if (typeof engine.serve !== 'function') return null;
   } catch {
     return null;
+  }
+  // Test-only: a lane that means to exercise one transport must fail loudly,
+  // never silently run the other (the uring lanes set MORO_ENGINE_TRANSPORT=
+  // uring and REQUIRE=uring; io_uring is opt-in, so a lane that forgot the
+  // opt-in would otherwise pass on libuv without anyone noticing).
+  const required = process.env.MORO_ENGINE_REQUIRE_TRANSPORT;
+  if (required) {
+    const actual = info.transport ?? 'uv';
+    if (actual !== required) {
+      throw new Error(
+        `MORO_ENGINE_REQUIRE_TRANSPORT=${required} but the engine runs '${actual}' (${info.transportReason ?? 'no reason reported'})`
+      );
+    }
   }
   return engine;
 }

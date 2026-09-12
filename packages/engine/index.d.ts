@@ -3,10 +3,10 @@
 //
 // DRIFT CHECK (maintainers): this surface must stay in lockstep with what the
 // native binding actually parses (src/binding.cpp) and with docs/API.md. When a
-// serve() option or capability flag is added there, add it here in the same
-// change. TODO: wire a release-time gate (tools/) that diffs the getNum/getStr
-// option names + setCap flags in src/binding.cpp against ServeOptions /
-// EngineCapabilities here and fails the release on drift.
+// serve() option, capability flag, or native export is added there, add it
+// here in the same change. `npm run check:exports` (tools/check-exports.mjs,
+// run by CI and by tools/release.mjs) diffs the binding against this file,
+// index.js NATIVE_API and index.mjs, and fails on drift.
 
 export interface EngineCapabilities {
   /** The full serve() limit surface (maxHeadSize/maxHeaders/wsMaxMessageSize/
@@ -25,6 +25,45 @@ export interface EngineCapabilities {
   /** Explicit TLS cipher/group policy is parsed:
    *  ServeOptions.ssl.ciphers, ciphersuites, and ecdhCurve. */
   tlsPolicy: boolean;
+  /** setStaticRoute() / clearStaticRoutes() are available. */
+  staticRoutes: boolean;
+  /** prepareResponse() / releaseTemplates() / respondPrepared() /
+   *  respondPreparedEmpty() / writeHeadPrepared() / endWith() are available. */
+  responseTemplates: boolean;
+  /** onAborted / onWritable are delivered on a later loop turn - never
+   *  re-entrantly from inside respond()/writeHead()/write()/end(). close()
+   *  still delivers pending onAborted calls before it returns. False only
+   *  under the MORO_ENGINE_NOTIFY=sync diagnostics switch. */
+  asyncNotify: boolean;
+  /** A server left open when its environment is torn down
+   *  (worker.terminate(), process.exit() inside a worker thread) is closed by
+   *  an environment cleanup hook, so the engine is safe inside worker_threads. */
+  workerThreads: boolean;
+  /** V8 fast API calls are installed on the hot entry points (respondPrepared,
+   *  respondPreparedEmpty, writeHeadPrepared, write, end, endWith, isAborted):
+   *  optimised callers invoke the engine directly, skipping the V8 callback
+   *  machinery. Informational - behaviour is identical either way. See
+   *  EngineProbeResult.fastApi for why it is off. */
+  fastCalls: boolean;
+  /** Batched pipelined dispatch: the onRequestBatch callback, getBatchBuffers()
+   *  and getPath(). Off under MORO_ENGINE_BATCH=0. */
+  batchDispatch: boolean;
+}
+
+export interface FastApiInfo {
+  /** Built with the V8 fast-call targets (tools/build.mjs fetched the
+   *  per-tag v8-fast-api-calls.h; `--no-fast-api` turns this off). */
+  compiled: boolean;
+  /** Fast targets registered on this load. */
+  installed: boolean;
+  /** 'ok' | 'not-compiled' | 'env-disabled' (MORO_ENGINE_FASTCALL=0) |
+   *  'sync-notify' (MORO_ENGINE_NOTIFY=sync forbids it) |
+   *  'v8-mismatch' (host V8 major.minor != the compiled one). */
+  reason: string;
+  /** V8 major.minor this binary was compiled against, e.g. '13.6'. */
+  compiledV8: string;
+  /** V8 major.minor of the running Node. */
+  runtimeV8: string;
 }
 
 export interface EngineProbeResult {
@@ -39,6 +78,22 @@ export interface EngineProbeResult {
   /** Feature flags for consumers to gate option passing on (feature-detect;
    *  treat absent as all-false). */
   capabilities?: EngineCapabilities;
+  /** How onAborted / onWritable reach JS: 'deferred' (a later loop turn, the
+   *  default) or 'sync' (MORO_ENGINE_NOTIFY=sync, re-entrant, diagnostics). */
+  notify?: 'deferred' | 'sync';
+  /** Fast-call build/install diagnostics. */
+  fastApi?: FastApiInfo;
+  /** I/O transport in use: 'uring' (Linux 6.1+ with io_uring permitted by the
+   *  sandbox) or 'uv' (libuv streams - macOS, Windows, older kernels,
+   *  seccomp-blocked containers, MORO_ENGINE_TRANSPORT=uv). Behaviour and wire
+   *  bytes are identical; only the syscall layer differs. */
+  transport?: 'uv' | 'uring';
+  /** Why the transport is not io_uring ('ok' when it is). */
+  transportReason?: string;
+  /** Per-thread fast/slow hit counters per hot entry point - present only when
+   *  MORO_ENGINE_FASTCALL_STATS=1 was set when the addon loaded (test/CI proof
+   *  that the fast path is taken). */
+  fastCallStats?: Record<string, { fast: number; slow: number }>;
   /** Load failure detail when ok is false */
   error?: string;
 }
@@ -47,9 +102,27 @@ export interface ServeCallbacks {
   /** A complete request (head + body) arrived. methodIdx indexes
    *  ['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS','OTHER']. */
   onRequest(reqId: number, methodIdx: number, path: string): void;
-  /** The client disconnected before the response completed. */
+  /** Batched pipelined dispatch (capabilities.batchDispatch). When registered,
+   *  complete pipelined requests are parsed ahead and delivered as ONE call:
+   *  `count` slots described in getBatchBuffers().descriptors (three
+   *  Uint32 per slot: reqId, methodIdx, pathIdx into `paths`, or 0xFFFFFFFF
+   *  meaning "call getPath(reqId)"). Answer slot 0, then read `control[0]`:
+   *  it is the index of the slot the engine has activated (only a
+   *  synchronously completed response activates the next one) - continue at
+   *  that index, or return when it still equals the slot you just dispatched
+   *  (that handler is async; the remaining slots are delivered later). A
+   *  request that stands alone still arrives here with count 1; onRequest is
+   *  used only when this callback is absent. Return the slots consumed. */
+  onRequestBatch?(count: number): number;
+  /** The client disconnected, or the engine tore the request down (write
+   *  error, responseBackpressureLimit, timeout, close()), before the response
+   *  completed. Delivered on a LATER loop turn, never re-entrantly from
+   *  inside a respond()/write()/end() call; isAborted(reqId) is already true
+   *  when it runs. Exception: close() delivers the onAborted of every
+   *  in-flight request synchronously, before close() returns. */
   onAborted(reqId: number): void;
-  /** A backpressured write() drained; safe to write more. */
+  /** A backpressured write() drained; safe to write more. Delivered on a
+   *  later loop turn (never from inside the write() that reported false). */
   onWritable(reqId: number): void;
   /** WebSocket opened after a successful Upgrade.
    *  DELIVERY GUARANTEE: onWsOpen is invoked SYNCHRONOUSLY, re-entrantly, during
@@ -203,6 +276,18 @@ export function stopListening(serverId: number): void;
 
 // ---- per-request accessors (valid until the response ends / aborts) ----
 export function getMethod(reqId: number): string | undefined;
+/** The batch-dispatch buffers of a server (the same objects every call):
+ *  descriptors (3 x 16 Uint32), control (1 Uint32), paths (string[]). See
+ *  ServeCallbacks.onRequestBatch. Feature-detect via
+ *  probe().capabilities.batchDispatch. */
+export function getBatchBuffers(serverId: number): {
+  descriptors: Uint32Array;
+  control: Uint32Array;
+  paths: string[];
+};
+/** The active request's path, for a batch descriptor whose pathIdx is
+ *  0xFFFFFFFF (the path was too long or the table full). */
+export function getPath(reqId: number): string;
 export function getQuery(reqId: number): string;
 /** Flat [k0,v0,k1,v1,...] with lowercased keys. */
 export function getHeaders(reqId: number): string[];
@@ -223,6 +308,59 @@ export function writeHead(reqId: number, status: number, headersFlat: string[] |
 /** Stream a chunk; returns false on backpressure (wait for onWritable). */
 export function write(reqId: number, chunk: BodyInit): boolean;
 export function end(reqId: number, chunk?: BodyInit): void;
+
+// ---- Static routes ----
+/** Register a fixed response for one (method, path), answered entirely inside
+ *  the engine: no JS call, no routing, no header building per request. The
+ *  header block and body are materialised once, here, so the response is
+ *  byte-identical to the same reply sent via respond().
+ *
+ *  Only an exact method match short-circuits - anything else (a HEAD against a
+ *  registered GET included) still reaches onRequest, so method policy stays in
+ *  JS. Re-registering the same (method, path) replaces it.
+ *
+ *  `method` is the engine's method index: GET 0, POST 1, PUT 2, DELETE 3,
+ *  PATCH 4, HEAD 5, OPTIONS 6.
+ *
+ *  Feature-detect via probe().capabilities.staticRoutes. */
+export function setStaticRoute(
+  serverId: number,
+  method: number,
+  path: string,
+  status?: number,
+  headersFlat?: string[] | null,
+  body?: BodyInit | null
+): void;
+/** Drop every static route registered on this server. */
+export function clearStaticRoutes(serverId: number): void;
+
+// ---- Prepared response templates ----
+/** Materialise status + headers ONCE (the same header builder respond() uses,
+ *  so the wire bytes are identical) and get back a template id to replay per
+ *  request with respondPrepared()/respondPreparedEmpty()/writeHeadPrepared().
+ *  Ids are per server, dense from 1, and stay valid until releaseTemplates()
+ *  (or close()). Throws a RangeError when the per-server store is full (4096).
+ *  A Content-Length in `headersFlat` is honoured on HEAD/bodyless replies only,
+ *  exactly as with respond(). Feature-detect via
+ *  probe().capabilities.responseTemplates. */
+export function prepareResponse(
+  serverId: number,
+  status: number,
+  headersFlat: string[] | null
+): number;
+/** Invalidate every template id issued by prepareResponse() on this server. */
+export function releaseTemplates(serverId: number): void;
+/** respond() with a prepared template instead of a header array. An invalid
+ *  tplId (0, released, another server's) answers 500 with an empty body and
+ *  leaves keep-alive intact - it never throws and never hangs the request. */
+export function respondPrepared(reqId: number, tplId: number, body: BodyInit | null): void;
+/** respondPrepared() with no body (Content-Length: 0). */
+export function respondPreparedEmpty(reqId: number, tplId: number): void;
+/** writeHead() with a prepared template (streaming follows with write()/end()). */
+export function writeHeadPrepared(reqId: number, tplId: number): void;
+/** Exactly end(reqId, chunk): a fixed-arity twin for call sites that always
+ *  pass a chunk. */
+export function endWith(reqId: number, chunk: BodyInit): void;
 
 // ---- WebSocket (RFC 6455) ----
 /** Upgrade the request's connection; returns wsId, or -1 if not a valid upgrade.
@@ -248,6 +386,8 @@ declare const engine: {
   close: typeof close;
   stopListening: typeof stopListening;
   getMethod: typeof getMethod;
+  getBatchBuffers: typeof getBatchBuffers;
+  getPath: typeof getPath;
   getQuery: typeof getQuery;
   getHeaders: typeof getHeaders;
   getHeader: typeof getHeader;
@@ -258,6 +398,14 @@ declare const engine: {
   writeHead: typeof writeHead;
   write: typeof write;
   end: typeof end;
+  setStaticRoute: typeof setStaticRoute;
+  clearStaticRoutes: typeof clearStaticRoutes;
+  prepareResponse: typeof prepareResponse;
+  releaseTemplates: typeof releaseTemplates;
+  respondPrepared: typeof respondPrepared;
+  respondPreparedEmpty: typeof respondPreparedEmpty;
+  writeHeadPrepared: typeof writeHeadPrepared;
+  endWith: typeof endWith;
   upgradeToWebSocket: typeof upgradeToWebSocket;
   wsSend: typeof wsSend;
   wsClose: typeof wsClose;

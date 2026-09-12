@@ -13,8 +13,17 @@ valid from the `onRequest` call until `respond()`/`end()` returns or
 // ---- server lifecycle ----
 serve(callbacks: {
   onRequest(reqId: number, methodIdx: number, path: string): void;
+  onRequestBatch?(count: number): number;   // see "Batched pipelined dispatch"
   onAborted(reqId: number): void;      // client disconnected / server tore the request down
   onWritable(reqId: number): void;     // write() backpressure drained
+  // onAborted / onWritable are delivered on a LATER loop turn, never re-entrantly
+  // from inside a respond()/writeHead()/write()/end() call (a write failure or a
+  // responseBackpressureLimit trip inside respond() surfaces after respond()
+  // returned; isAborted(reqId) is already true inside onAborted). The one
+  // exception: close() delivers the onAborted of every in-flight request
+  // synchronously, before close() returns. capabilities.asyncNotify; the
+  // MORO_ENGINE_NOTIFY=sync env var restores the pre-1.2 re-entrant delivery
+  // for bisecting (probe().notify reports which mode is active).
 }, options?: {
   maxBodySize?: number;        // default 10MB; larger bodies 413 natively
   idleTimeoutMs?: number;      // default 120000; 0 disables (resets on any byte)
@@ -113,6 +122,33 @@ end(reqId, chunk?: string | ArrayBuffer | Uint8Array | Buffer): void;
 
 isAborted(reqId): boolean;
 
+// ---- static routes (capabilities.staticRoutes) ----
+// A fixed response for one (method, path), answered entirely inside the engine:
+// no JS call, no routing, no per-request header building. Header block + body are
+// materialised ONCE here with the same code respond() uses, so the bytes on the
+// wire are identical to respond(status, headersFlat, body). Only an exact method
+// match short-circuits (a HEAD against a registered GET still reaches onRequest,
+// so method policy stays in JS); re-registering a (method, path) replaces it.
+// method is the engine's index: GET 0, POST 1, PUT 2, DELETE 3, PATCH 4, HEAD 5, OPTIONS 6.
+setStaticRoute(serverId, method: number, path: string, status?: number,
+               headersFlat?: string[] | null, body?: string | ArrayBuffer | Uint8Array | Buffer | null): void;
+clearStaticRoutes(serverId): void;
+
+// ---- prepared response templates (capabilities.responseTemplates) ----
+// The part of a response that never varies - status + the app header block - is
+// materialised ONCE with the same header builder respond() uses and replayed per
+// request with a body; the bytes on the wire are identical to
+// respond(status, headersFlat, body), the per-request header walk is gone. Ids
+// are per server (dense from 1) and valid until releaseTemplates()/close().
+// An INVALID id (0, released, another server's) answers 500 with an empty body
+// and keeps the connection's keep-alive state - never a throw, never a hung request.
+prepareResponse(serverId, status: number, headersFlat: string[] | null): number; // -> tplId; RangeError when the 4096/server store is full
+releaseTemplates(serverId): void;
+respondPrepared(reqId, tplId: number, body: string | ArrayBuffer | Uint8Array | Buffer | null): void;
+respondPreparedEmpty(reqId, tplId: number): void;     // Content-Length: 0
+writeHeadPrepared(reqId, tplId: number): void;        // then write()/end() as usual
+endWith(reqId, chunk: string | ArrayBuffer | Uint8Array | Buffer): void; // exactly end(reqId, chunk)
+
 // ---- diagnostics ----
 // On success: { ok: true, version, abi, platform, arch, capabilities }
 // On failure (no binary for this platform/ABI): { ok: false, abi, platform, arch, error }
@@ -120,10 +156,29 @@ isAborted(reqId): boolean;
 // gate option passing on instead of version-sniffing:
 //   { limits: boolean, tls: boolean, http2: boolean, wsDeflate: boolean,
 //     responseLimits: boolean,  // responseTimeoutMs / responseBackpressureLimit / maxUriSize parsed
-//     tlsPolicy: boolean }      // ssl.ciphers / ssl.ciphersuites / ssl.ecdhCurve parsed
+//     tlsPolicy: boolean,       // ssl.ciphers / ssl.ciphersuites / ssl.ecdhCurve parsed
+//     staticRoutes: boolean,    // setStaticRoute() / clearStaticRoutes()
+//     responseTemplates: boolean, // prepareResponse() & co.
+//     fastCalls: boolean }      // V8 fast API calls installed on the hot entry points (informational)
+// fastApi: { compiled, installed, reason, compiledV8, runtimeV8 } - why fast calls are on/off
+//   reason: 'ok' | 'not-compiled' | 'env-disabled' (MORO_ENGINE_FASTCALL=0) |
+//           'sync-notify' (MORO_ENGINE_NOTIFY=sync) | 'v8-mismatch'
+// fastCallStats: { <fn>: { fast, slow } } - only with MORO_ENGINE_FASTCALL_STATS=1 at load
+// transport: 'uring' | 'uv' - the I/O transport (io_uring on Linux 6.1+ when the sandbox
+//   permits it, libuv otherwise); transportReason says why it is not uring ('ok' when it is).
+//   Behaviour and wire bytes are identical either way. MORO_ENGINE_TRANSPORT=uv forces libuv.
+//     asyncNotify: boolean,     // onAborted/onWritable delivered on a later turn (never re-entrant)
+//     workerThreads: boolean }  // servers left open at thread/env teardown are closed by a cleanup hook
+// notify: 'deferred' | 'sync' - the onAborted/onWritable delivery mode in effect
 probe(): { ok: boolean, version?: string, abi, platform, arch,
            capabilities?: { limits: boolean, tls: boolean, http2: boolean, wsDeflate: boolean,
-                            responseLimits: boolean, tlsPolicy: boolean },
+                            responseLimits: boolean, tlsPolicy: boolean, staticRoutes: boolean,
+                            responseTemplates: boolean, asyncNotify: boolean, workerThreads: boolean,
+                            fastCalls: boolean },
+           notify?: 'deferred' | 'sync',
+           fastApi?: { compiled: boolean, installed: boolean, reason: string, compiledV8: string, runtimeV8: string },
+           fastCallStats?: { [fn: string]: { fast: number, slow: number } },
+           transport?: 'uv' | 'uring', transportReason?: string,
            error?: string };
 version: string;
 ```
@@ -161,10 +216,30 @@ version: string;
 
 ## Threading
 
-Everything runs on the Node/libuv main loop (uv handles registered on
-`node::GetCurrentEventLoop`). Callbacks are invoked synchronously from I/O
-events — a single-threaded on-loop model. No locks, no cross-thread
-marshaling.
+Everything runs on the loop of the thread that called `serve()` (uv handles
+registered on `node::GetCurrentEventLoop`) — the main loop, or a
+`worker_threads` loop. Callbacks are invoked from I/O events on that loop — a
+single-threaded on-loop model per thread. No locks, no cross-thread
+marshaling. Registries (serverIds, reqIds, wsIds) are per thread; an id never
+crosses threads.
+
+**Worker threads** (`capabilities.workerThreads`): each thread may run its own
+engine (with `reusePort` several threads share one port). A server still open
+when its thread's environment is torn down — `worker.terminate()`,
+`process.exit()` inside the worker, an uncaught error — is closed by an
+environment cleanup hook the engine registers per `serve()`, and its uv
+handles are reaped before Node closes the loop. Without that hook Node would
+abort the whole process (`uv_loop_close() while having open handles`). No
+JS callback runs during that teardown (Node forbids JS execution there).
+
+**Delivery timing.** `onAborted` and `onWritable` are delivered on a later
+loop turn, never re-entrantly from inside a binding call: a `respond()` that
+fails its write (or trips `responseBackpressureLimit`) returns first, and the
+abort arrives from a `uv_async` callback afterwards. `close()` is the one
+exception — it delivers every pending `onAborted` synchronously before
+returning, so a caller may drop its per-request routing state right after.
+`MORO_ENGINE_NOTIFY=sync` (diagnostics only) restores the pre-1.2 re-entrant
+delivery; `probe().notify` reports the mode.
 
 One case is re-entrant rather than driven by a fresh I/O event:
 `upgradeToWebSocket()` calls `onWsOpen` (and, for frames pipelined in the
@@ -200,3 +275,98 @@ which declines the extension). Feature-detect support with
 engine inflates inbound compressed messages (with a zip-bomb output cap → close
 1009) and compresses outbound sends over the threshold. Inbound text is
 UTF-8-validated after inflate (→ close 1007 on failure).
+
+## Adding a native export (maintainers)
+
+A native function is declared in four places and `npm run check:exports`
+fails until all four agree: `Initialize` in `src/binding.cpp`, the
+`NATIVE_API` allow-list in `packages/engine/index.js` (a name missing there
+reads as `undefined` without ever loading the addon), the live-binding
+re-exports in `packages/engine/index.mjs`, and `packages/engine/index.d.ts`
+(both the `export function` and the `declare const engine` block). A
+capability flag is declared in `Probe()` (`setCap`) and in
+`EngineCapabilities`; a `serve()` option in the option parser and in
+`ServeOptions`. Document the behaviour here in the same change.
+
+## Fast API calls (capabilities.fastCalls)
+
+The hot entry points — `respondPrepared`, `respondPreparedEmpty`,
+`writeHeadPrepared`, `write`, `end`, `endWith`, `isAborted` — are registered
+with a V8 fast-call target (`src/fast_api.h`): an optimised JS caller
+(Maglev/TurboFan) invokes the engine's C++ directly, with no
+`FunctionCallbackInfo`, no HandleScope and no argument boxing, whenever the
+arguments already have the declared machine types (Smi ids, a sequential
+one-byte string body). Anything else — a two-byte or cons string, a Buffer,
+an unoptimised caller — takes the regular callback, which does exactly the
+same work; the bytes on the wire never depend on which path ran. A fast
+target can never call back into JS, which is why delivery of
+`onAborted`/`onWritable` is deferred (above) and why fast calls are refused
+under `MORO_ENGINE_NOTIFY=sync`. The fast-call ABI is per V8 version, so the
+targets are installed only when the running V8's major.minor matches the one
+the binary was compiled against (`probe().fastApi`); the plain callbacks are
+always there. `MORO_ENGINE_FASTCALL=0` disables installation (diagnostics);
+`MORO_ENGINE_FASTCALL_STATS=1` exposes per-function fast/slow hit counters in
+`probe().fastCallStats`.
+
+## Batched pipelined dispatch (capabilities.batchDispatch)
+
+Register `onRequestBatch(count)` alongside `onRequest` and the engine parses
+complete pipelined requests ahead of the active one (up to 16 per
+connection) and delivers them in ONE call instead of one `onRequest` per
+request. The batch is described in the buffers `getBatchBuffers(serverId)`
+returns once per server:
+
+```js
+const { descriptors, control, paths } = engine.getBatchBuffers(serverId);
+// descriptors: Uint32Array, three per slot: reqId, methodIdx, pathIdx
+// control:     Uint32Array(1) - the slot the engine has activated
+// paths:       string[] - interned paths, indexed by pathIdx
+onRequestBatch(count) {
+  let i = 0;
+  for (;;) {
+    const reqId = descriptors[3 * i], methodIdx = descriptors[3 * i + 1], pi = descriptors[3 * i + 2];
+    const path = pi === 0xffffffff ? engine.getPath(reqId) : paths[pi];
+    handle(reqId, methodIdx, path);          // same code as onRequest
+    const next = control[0];
+    if (next === i) return i + 1;            // this handler is async: stop here
+    if (next >= count) return count;         // every slot answered
+    i = next;                                // continue at the slot the engine activated
+  }
+}
+```
+
+Only the active slot's reqId is live; the engine activates the next slot
+(and advances `control`) when the previous response completes synchronously,
+so responses stay in request order. A handler that goes async ends the
+batch: the remaining slots are delivered later, in a new batch, when that
+response completes - none are dropped or duplicated. A static route inside a
+batch is answered by the engine (the control cell skips it). Requests that
+are not pipelined arrive as batches of one. `onRequest` alone (no
+`onRequestBatch`) keeps the one-call-per-request delivery. Byte parity with
+sequential dispatch is proven by `test/batch-dispatch.test.mjs`.
+`MORO_ENGINE_BATCH=0` turns the capability off (diagnostics).
+
+## I/O transports
+
+Everything above runs on one of two transports, chosen once per process.
+libuv is the default everywhere; io_uring is opt-in in 1.2
+(`MORO_ENGINE_TRANSPORT=uring`), for the reasons measured in
+`docs/DESIGN.md` ("io_uring measurements"):
+
+- **libuv streams** (`transport: 'uv'`): everywhere. macOS, Windows, Linux
+  kernels before 6.1, and any Linux sandbox that blocks `io_uring_setup`
+  (Docker's default seccomp profile since 24/25, gVisor,
+  `kernel.io_uring_disabled`).
+- **io_uring** (`transport: 'uring'`): Linux 6.1+, when `MORO_ENGINE_TRANSPORT=uring`
+  is set and a feature probe and a behavioural self-test pass at startup
+  (`src/uring.h`); any refusal falls back to libuv with the reason. One ring per loop
+  thread, polled through a libuv poll handle so the engine stays on Node's
+  loop; multishot accept, multishot receive into kernel-provided buffers,
+  one outstanding send per connection, cancel-then-close on teardown. One
+  `io_uring_enter` per loop iteration replaces the read/write/epoll trio per
+  request and the accept/epoll_ctl/close set per connection.
+
+Behaviour, timeouts, backpressure and the bytes on the wire are identical:
+the transport is a syscall layer, selected silently, never required.
+`MORO_ENGINE_TRANSPORT=uv` forces libuv (A/B runs, bisecting); `probe()`
+reports which one is active and why.

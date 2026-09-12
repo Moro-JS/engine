@@ -11,11 +11,17 @@
 #include <v8.h>
 
 #include <climits>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
+#include "fast_api.h"
 #include "server.h"
+#include "text.h"
+#include "v8_compat.h"
 #include "win_delay_load_hook.h"
 
 namespace moro {
@@ -50,6 +56,7 @@ struct JsServer {
   Isolate* isolate;
   Global<Context> context;
   Global<Function> onRequest;
+  Global<Function> onRequestBatch;
   Global<Function> onAborted;
   Global<Function> onWritable;
   Global<Function> onWsOpen;
@@ -57,6 +64,12 @@ struct JsServer {
   Global<Function> onWsClose;
   Server* server;
   uint32_t id = 0;
+  // Set by the environment cleanup hook: the isolate is being torn down and
+  // JS may no longer run, so every callback into JS becomes a no-op.
+  bool tearingDown = false;
+  // When the cleanup hook is waiting for this server to finish closing, it
+  // points here so freeJsServer can report completion.
+  bool* closedFlag = nullptr;
   // Interned per-path JS strings: real apps route a BOUNDED set of paths, so
   // the per-request String::NewFromUtf8 (allocation + GC pressure) is paid
   // once per unique path instead of once per request. Bounded: only paths
@@ -73,6 +86,21 @@ struct JsServer {
   std::unordered_map<std::string, Global<String>> headerNameCache;
   static constexpr size_t kHeaderNameCacheMaxEntries = 256;
   static constexpr size_t kHeaderNameCacheMaxLen = 64;
+
+  // Batched dispatch (getBatchBuffers / onRequestBatch): one descriptor
+  // triple (reqId, methodIdx, pathIdx) per slot, the control cell the engine
+  // advances as slots complete (Server::setBatchControl), and the path table
+  // JS indexes with pathIdx (the interned strings of pathCache; a path the
+  // cache will not hold is kNoPathIdx and JS asks getPath(reqId)). V8-owned
+  // ArrayBuffers: their storage never moves, so the raw pointers below stay
+  // valid for the server's lifetime.
+  Global<ArrayBuffer> batchDesc;
+  Global<ArrayBuffer> batchCtl;
+  Global<Array> batchPaths;
+  uint32_t* desc = nullptr;
+  uint32_t* ctl = nullptr;
+  std::unordered_map<std::string, uint32_t> pathIndex;
+  static constexpr uint32_t kNoPathIdx = 0xFFFFFFFFu;
 };
 
 // thread_local, not process-global: worker_threads + reusePort (see
@@ -82,14 +110,67 @@ struct JsServer {
 static thread_local std::unordered_map<uint32_t, JsServer*> g_servers;
 static thread_local uint32_t g_serverIdCounter = 0;
 
+// Notification delivery mode (see Server::setDeferredNotify). Read once from
+// MORO_ENGINE_NOTIFY in Initialize; process-wide because the environment is.
+static bool g_notifyDeferred = true;
+// Batched pipelined dispatch (Server::dispatchBatch); MORO_ENGINE_BATCH=0
+// turns it off (diagnostics kill switch; requests are then surfaced one by
+// one exactly as in 1.1).
+static bool g_batchEnabled = true;
+// Fast-call install state (see fast_api.h and Initialize).
+static bool g_fastCompiled = MORO_FAST_API_ENABLED != 0;
+static bool g_fastInstalled = false;
+static const char* g_fastReason = "not-initialised";
+static bool g_countCalls = false;  // MORO_ENGINE_FASTCALL_STATS=1
+static int g_runtimeV8Major = 0;
+static int g_runtimeV8Minor = 0;
+
+static void cleanupJsServer(void* arg);
+
+#if defined(__linux__)
+// Registered once per thread when the first io_uring server is created. It
+// is added BEFORE that server's own hook (hooks run in reverse order), so
+// every server closes and reaps its cancel/close completions through the
+// ring first; then the ring's poll/prepare handles and mappings go.
+static void cleanupUringLoop(void*) { Server::UringLoop::shutdownForThread(); }
+static thread_local bool g_uringHookRegistered = false;
+#endif
+
 // Invoked by Server once it is fully closed and self-deleted. Releases the
 // per-server JS state (the Global<> destructors Reset the handles, unpinning
 // the callbacks/context for GC) and drops the registry entry - no leak across
 // serve()/close() cycles. Must NOT touch js->server (already deleted).
 static void freeJsServer(void* user) {
   JsServer* js = static_cast<JsServer*>(user);
+  // A normal close() no longer needs the teardown hook; removing a hook that
+  // is currently running (the teardown path) is a no-op in Node.
+  node::RemoveEnvironmentCleanupHook(js->isolate, cleanupJsServer, js);
+  if (js->closedFlag) *js->closedFlag = true;
   g_servers.erase(js->id);
   delete js;
+}
+
+// Environment teardown with a server still open: a worker thread terminated
+// (worker.terminate(), process.exit() inside the worker, an uncaught error)
+// or the main environment exiting. Node closes its own handles and then
+// CHECK-aborts the whole process if the loop still holds any - which an
+// addon-owned listener/connection would be. So: close the server here and
+// spin the loop until its last uv handle is reaped and freeJsServer ran.
+// uv_run never blocks in that state (closing handles keep the poll timeout
+// at zero). JS execution is forbidden by Node during cleanup, hence
+// tearingDown suppresses every callback into JS (nothing to route them to).
+static void cleanupJsServer(void* arg) {
+  JsServer* js = static_cast<JsServer*>(arg);
+  js->tearingDown = true;
+  Server* srv = js->server;
+  if (!srv) return;
+  uv_loop_t* loop = srv->loop();
+  bool closed = false;
+  js->closedFlag = &closed;
+  // No-op if JS already called close(): that close's completion still runs
+  // freeJsServer, which flips the flag.
+  srv->close(freeJsServer, js);
+  while (!closed) uv_run(loop, UV_RUN_ONCE);
 }
 
 // Reverse lookup for binding functions that only hold a Connection (e.g.
@@ -140,19 +221,12 @@ static bool readAsciiOneByte(Isolate* iso, Local<String> str8,
   if (!str8->IsOneByte()) return false;
   const int len = str8->Length();
   if (len < 0 || static_cast<size_t>(len) > maxLen) return false;
-#if V8_MAJOR_VERSION >= 14
-  // WriteOneByte changed shape in V8 14 (Node 26) - same caution as
-  // ByteSource below. Take the Utf8Value fallback until that ABI is verified.
-  (void)iso;
-  return false;
-#else
   out.resize(static_cast<size_t>(len));
-  str8->WriteOneByte(iso, reinterpret_cast<uint8_t*>(out.data()), 0, len,
-                     String::NO_NULL_TERMINATION);
-  for (unsigned char ch : out)
-    if (ch >= 0x80) return false;  // needs real UTF-8 encoding - fall back
-  return true;
-#endif
+  // v8compat picks WriteOneByte / WriteOneByteV2 per ABI (the API changed
+  // shape in V8 13.6 and the old spelling is gone in 14.6).
+  v8compat::writeOneByte(iso, str8, reinterpret_cast<uint8_t*>(out.data()),
+                         static_cast<uint32_t>(len));
+  return text::isAscii(reinterpret_cast<const uint8_t*>(out.data()), out.size());
 }
 
 // Reused header-block buffer for Respond/WriteHead - the block was a fresh
@@ -202,7 +276,13 @@ static thread_local bool g_hdrScratchInUse = false;
 // into engine-owned buffers (Connection::scratch / corkBuf / the TLS
 // ciphertext buffer / a queued WriteReq - see respond/appendResponse/
 // writeOutView in server.h) before any JS re-entry, so the borrow never
-// outlives this stack frame.
+// outlives this stack frame. The HTTP response entry points reach JS through
+// exactly two doors, both shut while a borrow is alive: onAborted/onWritable
+// are deferred to a later loop turn (Server::queueNotify), and the next
+// pipelined request is never surfaced from inside a response call
+// (canFinishSync in transportWrite/writeOutView refuses to finish a terminal
+// write synchronously while a backlog exists; the loop's completeWrite does
+// it). Verified by test/notify-deferred.test.mjs and the fast-api suite.
 // Reused body-bytes buffer for ByteSource's string path (a malloc+free per
 // response via String::Utf8Value otherwise). A ByteSource borrow never spans
 // a JS call (each binding entry point builds headers FIRST, then the body,
@@ -213,12 +293,72 @@ static thread_local bool g_byteScratchInUse = false;
 
 class ByteSource {
  public:
-  ByteSource(Isolate* iso, Local<Value> v) {
+  // `borrow`: take the zero-copy String::ValueView path. A ValueView pins the
+  // V8 heap (no allocation, hence no JS) for its lifetime, so it is legal
+  // only on entry points whose engine call cannot reach JS: the HTTP
+  // response functions under deferred notification. Sync notification mode
+  // (MORO_ENGINE_NOTIFY=sync) delivers onAborted re-entrantly from inside
+  // respond()/write(), and wsSend() sheds a stalled consumer through the
+  // synchronous onWsClose - both must copy instead.
+  ByteSource(Isolate* iso, Local<Value> v, bool borrow = g_notifyDeferred) {
     if (v->IsString()) {
-      // Malloc-free path for ASCII one-byte strings (typical JSON/text
-      // bodies) up to 64 KiB - larger or non-ASCII strings take Utf8Value.
-      if (!g_byteScratchInUse &&
-          readAsciiOneByte(iso, v.As<String>(), g_byteScratch, 65536)) {
+      Local<String> s = v.As<String>();
+#if MORO_V8_HAS_VALUE_VIEW
+      if (!borrow) {
+        // Copy path (see above): the same malloc-free ASCII fast copy the
+        // pre-ValueView V8s use, else Utf8Value.
+        if (!g_byteScratchInUse && readAsciiOneByte(iso, s, g_byteScratch, 65536)) {
+          g_byteScratchInUse = true;
+          usedScratch_ = true;
+          data_ = g_byteScratch.data();
+          size_ = g_byteScratch.size();
+          valid_ = true;
+          return;
+        }
+        utf8_.emplace(iso, v);
+        if (**utf8_) {
+          data_ = **utf8_;
+          size_ = static_cast<size_t>(utf8_->length());
+        }
+        valid_ = true;
+        return;
+      }
+      // Zero-copy: borrow the flat one-byte string's bytes straight out of
+      // the V8 heap (String::ValueView flattens a cons string first). ASCII
+      // is UTF-8 already, so the view IS the body - no copy at any size. The
+      // pointer is valid only while no JS runs and no GC moves the string:
+      // every binding entry point takes this borrow AFTER buildHeaders (the
+      // one place that can run JS) and hands it to the engine, which copies
+      // before returning. Latin-1 bytes >= 0x80 are UTF-8-encoded into the
+      // scratch buffer - the exact bytes Utf8Value would produce.
+      if (s->IsOneByte()) {
+        view_.emplace(iso, s);
+        if (view_->is_one_byte()) {
+          const uint8_t* p = view_->data8();
+          const size_t n = view_->length();
+          if (text::isAscii(p, n)) {
+            data_ = reinterpret_cast<const char*>(p);
+            size_ = n;
+            valid_ = true;
+            return;
+          }
+          if (!g_byteScratchInUse) {
+            g_byteScratchInUse = true;
+            usedScratch_ = true;
+            text::latin1ToUtf8(p, n, g_byteScratch);
+            view_.reset();
+            data_ = g_byteScratch.data();
+            size_ = g_byteScratch.size();
+            valid_ = true;
+            return;
+          }
+        }
+        view_.reset();
+      }
+#else
+      // Node 20/22 (V8 < 12.9, no ValueView): malloc-free copy for ASCII
+      // one-byte strings up to 64 KiB; larger or non-ASCII take Utf8Value.
+      if (!g_byteScratchInUse && readAsciiOneByte(iso, s, g_byteScratch, 65536)) {
         g_byteScratchInUse = true;
         usedScratch_ = true;
         data_ = g_byteScratch.data();
@@ -226,8 +366,9 @@ class ByteSource {
         valid_ = true;
         return;
       }
-      // String::Utf8Value is stable across V8 versions (Node 20..26); the
-      // direct Utf8Length/WriteUtf8 API changed shape in V8 14 (Node 26).
+#endif
+      // Two-byte strings (and a nested borrow): String::Utf8Value, stable
+      // across every supported V8.
       utf8_.emplace(iso, v);
       if (**utf8_) {
         data_ = **utf8_;
@@ -255,7 +396,12 @@ class ByteSource {
     }
   }
   ~ByteSource() {
-    if (usedScratch_) g_byteScratchInUse = false;
+    if (usedScratch_) {
+      // Don't let one huge non-ASCII body pin its capacity for the thread's
+      // lifetime (same 64 KiB watermark as the engine's own scratch buffers).
+      if (g_byteScratch.capacity() > 65536) std::string().swap(g_byteScratch);
+      g_byteScratchInUse = false;
+    }
   }
   ByteSource(const ByteSource&) = delete;
   ByteSource& operator=(const ByteSource&) = delete;
@@ -269,6 +415,9 @@ class ByteSource {
 
  private:
   std::optional<String::Utf8Value> utf8_;
+#if MORO_V8_HAS_VALUE_VIEW
+  std::optional<String::ValueView> view_;
+#endif
   const char* data_ = nullptr;
   size_t size_ = 0;
   bool valid_ = false;
@@ -418,9 +567,11 @@ static void buildHeaders(Isolate* iso, Local<Context> ctx, Local<Value> v,
 
 // ---- Server-side callbacks that trampoline into JS ----
 
-static void invokeJs(JsServer* js, Global<Function>& fn, Connection* c,
+static void reportCaught(Isolate* iso, TryCatch& tc, const char* where);
+
+static void invokeJs(JsServer* js, Global<Function>& fn, uint32_t reqId,
                      bool withExtra, int32_t methodIdx, const std::string& path) {
-  if (fn.IsEmpty()) return;
+  if (fn.IsEmpty() || js->tearingDown) return;
   Isolate* iso = js->isolate;
   HandleScope scope(iso);
   Local<Context> ctx = js->context.Get(iso);
@@ -445,13 +596,13 @@ static void invokeJs(JsServer* js, Global<Function>& fn, Connection* c,
       pathStr = str(iso, path);
     }
     Local<Value> argv[3] = {
-        Integer::NewFromUnsigned(iso, c->reqId),
+        Integer::NewFromUnsigned(iso, reqId),
         Integer::New(iso, methodIdx),
         pathStr,
     };
     (void)f->Call(ctx, ctx->Global(), 3, argv);
   } else {
-    Local<Value> argv[1] = {Integer::NewFromUnsigned(iso, c->reqId)};
+    Local<Value> argv[1] = {Integer::NewFromUnsigned(iso, reqId)};
     (void)f->Call(ctx, ctx->Global(), 1, argv);
   }
   // Swallow handler exceptions - one bad request must not tear down the loop.
@@ -464,15 +615,87 @@ static void invokeJs(JsServer* js, Global<Function>& fn, Connection* c,
 
 static void cbOnRequest(void* user, Connection* c) {
   JsServer* js = static_cast<JsServer*>(user);
-  invokeJs(js, js->onRequest, c, true, static_cast<int32_t>(c->method), c->path);
+  if (js->tearingDown) return;
+  // (Static routes were already answered by Server::surfaceRequest.)
+  invokeJs(js, js->onRequest, c->reqId, true, static_cast<int32_t>(c->method), c->path);
 }
-static void cbOnAborted(void* user, Connection* c) {
-  JsServer* js = static_cast<JsServer*>(user);
-  invokeJs(js, js->onAborted, c, false, 0, std::string());
+
+// The batch buffers, created on first need (getBatchBuffers() or the first
+// batch) and handed to the engine as its control cell.
+static void ensureBatchBuffers(JsServer* js, Isolate* iso, Local<Context> ctx) {
+  if (js->desc) return;
+  Local<ArrayBuffer> d = ArrayBuffer::New(iso, 3 * Server::kMaxStaged * sizeof(uint32_t));
+  Local<ArrayBuffer> c = ArrayBuffer::New(iso, sizeof(uint32_t));
+  Local<Array> paths = Array::New(iso, static_cast<int>(JsServer::kPathCacheMaxEntries));
+  js->batchDesc.Reset(iso, d);
+  js->batchCtl.Reset(iso, c);
+  js->batchPaths.Reset(iso, paths);
+  js->desc = static_cast<uint32_t*>(d->Data());
+  js->ctl = static_cast<uint32_t*>(c->Data());
+  std::memset(js->desc, 0, 3 * Server::kMaxStaged * sizeof(uint32_t));
+  *js->ctl = 0;
+  if (js->server) js->server->setBatchControl(js->ctl);
+  (void)ctx;
 }
-static void cbOnWritable(void* user, Connection* c) {
+
+// Index of `path` in the JS path table (interning it on first sight, under
+// the same bounds as pathCache), or kNoPathIdx when it is not cacheable.
+static uint32_t pathIndexFor(JsServer* js, Isolate* iso, Local<Context> ctx, const std::string& path) {
+  if (path.size() > JsServer::kPathCacheMaxLen) return JsServer::kNoPathIdx;
+  auto it = js->pathIndex.find(path);
+  if (it != js->pathIndex.end()) return it->second;
+  if (js->pathIndex.size() >= JsServer::kPathCacheMaxEntries) return JsServer::kNoPathIdx;
+  const uint32_t idx = static_cast<uint32_t>(js->pathIndex.size());
+  Local<String> pathStr;
+  auto cached = js->pathCache.find(path);
+  if (cached != js->pathCache.end()) {
+    pathStr = cached->second.Get(iso);
+  } else {
+    pathStr = str(iso, path);
+    if (js->pathCache.size() < JsServer::kPathCacheMaxEntries) js->pathCache.emplace(path, Global<String>(iso, pathStr));
+  }
+  (void)js->batchPaths.Get(iso)->Set(ctx, idx, pathStr).FromMaybe(false);
+  js->pathIndex.emplace(path, idx);
+  return idx;
+}
+
+// One JS call for a batch: slot 0 is the connection's active request, slots
+// 1..count-1 its staged ring in order. JS returns after answering the slots
+// it could answer synchronously (the engine tracks that itself through the
+// control cell and c->active, so the return value is not load-bearing).
+static void cbOnRequestBatch(void* user, Connection* c, uint32_t count) {
   JsServer* js = static_cast<JsServer*>(user);
-  invokeJs(js, js->onWritable, c, false, 0, std::string());
+  if (js->tearingDown || js->onRequestBatch.IsEmpty()) return;
+  Isolate* iso = js->isolate;
+  HandleScope scope(iso);
+  Local<Context> ctx = js->context.Get(iso);
+  Context::Scope ctxScope(ctx);
+  ensureBatchBuffers(js, iso, ctx);
+  if (count > Server::kMaxStaged) count = Server::kMaxStaged;
+  uint32_t* d = js->desc;
+  d[0] = c->reqId;
+  d[1] = static_cast<uint32_t>(c->method);
+  d[2] = pathIndexFor(js, iso, ctx, c->path);
+  for (uint32_t k = 1; k < count; k++) {
+    const StagedRequest& sr = c->staged[(c->stagedHead + k - 1) % Server::kMaxStaged];
+    d[3 * k] = sr.reqId;
+    d[3 * k + 1] = static_cast<uint32_t>(sr.method);
+    d[3 * k + 2] = pathIndexFor(js, iso, ctx, sr.path);
+  }
+  TryCatch tryCatch(iso);
+  Local<Value> argv[1] = {Integer::NewFromUnsigned(iso, count)};
+  (void)js->onRequestBatch.Get(iso)->Call(ctx, ctx->Global(), 1, argv);
+  reportCaught(iso, tryCatch, "onRequestBatch");
+}
+// Delivered from Server::drainNotifications (a uv_async callback, or
+// synchronously from close()), by reqId: the Connection may be gone already.
+static void cbOnAborted(void* user, uint32_t reqId) {
+  JsServer* js = static_cast<JsServer*>(user);
+  invokeJs(js, js->onAborted, reqId, false, 0, std::string());
+}
+static void cbOnWritable(void* user, uint32_t reqId) {
+  JsServer* js = static_cast<JsServer*>(user);
+  invokeJs(js, js->onWritable, reqId, false, 0, std::string());
 }
 
 // Log (never rethrow) an exception left by a JS callback, so a throwing WS
@@ -485,6 +708,7 @@ static void reportCaught(Isolate* iso, TryCatch& tc, const char* where) {
 
 static void cbOnWsOpen(void* user, Connection* c, const std::string& path) {
   JsServer* js = static_cast<JsServer*>(user);
+  if (js->tearingDown) return;
   if (js->onWsOpen.IsEmpty()) return;
   Isolate* iso = js->isolate;
   HandleScope scope(iso);
@@ -499,6 +723,7 @@ static void cbOnWsOpen(void* user, Connection* c, const std::string& path) {
 static void cbOnWsMessage(void* user, Connection* c, const char* data,
                           size_t len, bool isBinary) {
   JsServer* js = static_cast<JsServer*>(user);
+  if (js->tearingDown) return;
   if (js->onWsMessage.IsEmpty()) return;
   Isolate* iso = js->isolate;
   HandleScope scope(iso);
@@ -540,6 +765,7 @@ static void cbOnWsMessage(void* user, Connection* c, const char* data,
 
 static void cbOnWsClose(void* user, Connection* c, int code) {
   JsServer* js = static_cast<JsServer*>(user);
+  if (js->tearingDown) return;
   if (js->onWsClose.IsEmpty()) return;
   Isolate* iso = js->isolate;
   HandleScope scope(iso);
@@ -575,6 +801,7 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
       out.Reset(iso, v.As<Function>());
   };
   grab("onRequest", js->onRequest);
+  grab("onRequestBatch", js->onRequestBatch);
   grab("onAborted", js->onAborted);
   grab("onWritable", js->onWritable);
   grab("onWsOpen", js->onWsOpen);
@@ -746,6 +973,7 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
   ServerCallbacks scb;
   scb.user = js;
   scb.onRequest = cbOnRequest;
+  if (g_batchEnabled && !js->onRequestBatch.IsEmpty()) scb.onRequestBatch = cbOnRequestBatch;
   scb.onAborted = cbOnAborted;
   scb.onWritable = cbOnWritable;
 
@@ -754,10 +982,20 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
   scb.onWsClose = cbOnWsClose;
 
   js->server = new Server(loop, scb, limits);
+  js->server->setDeferredNotify(g_notifyDeferred);
+  js->server->setBatchDispatch(g_batchEnabled);
+#if defined(__linux__)
+  if (js->server->transportKind() == TransportKind::Uring && !g_uringHookRegistered) {
+    g_uringHookRegistered = true;
+    node::AddEnvironmentCleanupHook(iso, cleanupUringLoop, nullptr);
+  }
+#endif
   if (tlsCtx.valid()) js->server->adoptTls(std::move(tlsCtx));
   uint32_t id = ++g_serverIdCounter;
   js->id = id;
   g_servers[id] = js;
+  // Removed again in freeJsServer when JS closes the server itself.
+  node::AddEnvironmentCleanupHook(iso, cleanupJsServer, js);
   args.GetReturnValue().Set(Integer::NewFromUnsigned(iso, id));
 }
 
@@ -917,6 +1155,7 @@ static void GetRemoteAddress(const FunctionCallbackInfo<Value>& args) {
 }
 
 static void IsAborted(const FunctionCallbackInfo<Value>& args) {
+  if (g_countCalls) ++fastcall::g_slowHits[fastcall::kIsAborted];
   Connection* c = connFrom(args);
   args.GetReturnValue().Set(c == nullptr);  // gone from registry == aborted/ended
 }
@@ -956,6 +1195,7 @@ static void WriteHead(const FunctionCallbackInfo<Value>& args) {
 
 // write(reqId, chunk) -> boolean backpressure
 static void Write(const FunctionCallbackInfo<Value>& args) {
+  if (g_countCalls) ++fastcall::g_slowHits[fastcall::kWrite];
   Isolate* iso = args.GetIsolate();
   Connection* c = connFrom(args);
   if (!c) { args.GetReturnValue().Set(false); return; }
@@ -967,10 +1207,137 @@ static void Write(const FunctionCallbackInfo<Value>& args) {
 
 // end(reqId, chunk?)
 static void End(const FunctionCallbackInfo<Value>& args) {
+  if (g_countCalls) ++fastcall::g_slowHits[fastcall::kEnd];
   Isolate* iso = args.GetIsolate();
   Connection* c = connFrom(args);
   if (!c) return;
   // A missing/null/undefined chunk borrows nothing: end(nullptr, 0).
+  ByteSource chunk(iso, args[1]);
+  c->server->end(c, chunk.data(), chunk.size());
+}
+
+// setStaticRoute(serverId, methodIdx, path, status, headersFlat|null, body|null)
+//
+// Registers a fixed response for one (method, path). The header block and body
+// are materialised HERE, once, using the same buildHeaders() the JS respond()
+// path uses - so a static route emits a byte-identical response, just without
+// the JS round trip. Re-registering the same (method, path) replaces it.
+static void SetStaticRoute(const FunctionCallbackInfo<Value>& args) {
+  Isolate* iso = args.GetIsolate();
+  Local<Context> ctx = iso->GetCurrentContext();
+  JsServer* js = serverFrom(args);
+  if (!js || !js->server) return;
+  if (args.Length() < 3 || !args[2]->IsString()) {
+    iso->ThrowException(
+        str(iso, "setStaticRoute(serverId, method, path, status, headers, body)"));
+    return;
+  }
+
+  const int32_t method = args[1]->Int32Value(ctx).FromMaybe(0);
+  ResponseTemplate tpl;
+  tpl.status = args.Length() > 3 ? args[3]->Int32Value(ctx).FromMaybe(200) : 200;
+
+  String::Utf8Value pathV(iso, args[2]);
+  if (!*pathV) return;
+  std::string path(*pathV, static_cast<size_t>(pathV.length()));
+
+  // buildHeaders can run arbitrary JS (element getters). Take the body borrow
+  // after it, for the same reason Respond() does.
+  buildHeaders(iso, ctx, args.Length() > 4 ? args[4] : Local<Value>(), tpl.headers,
+               tpl.customCL);
+  std::string bodyBytes;
+  if (args.Length() > 5) {
+    ByteSource body(iso, args[5]);
+    if (body.valid() && body.size()) bodyBytes.assign(body.data(), body.size());
+  }
+  js->server->setStaticRoute(method, std::move(path), std::move(tpl), std::move(bodyBytes));
+}
+
+// clearStaticRoutes(serverId) - drops every static route on this server.
+static void ClearStaticRoutes(const FunctionCallbackInfo<Value>& args) {
+  JsServer* js = serverFrom(args);
+  if (js && js->server) js->server->clearStaticRoutes();
+}
+
+// ---- prepared response templates ----
+
+// prepareResponse(serverId, status, headersFlat|null) -> tplId (>= 1)
+//
+// Materialises status + header block ONCE (same buildHeaders as respond(), so
+// the wire bytes are identical); respondPrepared() replays it per request with
+// a body and skips the per-request header walk. Ids are per server. Throws a
+// RangeError when the store is full (TemplateStore::kMax) - registration is a
+// setup-time act, so a full store is a caller bug, not a runtime condition.
+static void PrepareResponse(const FunctionCallbackInfo<Value>& args) {
+  Isolate* iso = args.GetIsolate();
+  Local<Context> ctx = iso->GetCurrentContext();
+  JsServer* js = serverFrom(args);
+  if (!js || !js->server) {
+    iso->ThrowException(str(iso, "invalid serverId"));
+    return;
+  }
+  ResponseTemplate tpl;
+  tpl.status = args.Length() > 1 ? args[1]->Int32Value(ctx).FromMaybe(200) : 200;
+  buildHeaders(iso, ctx, args.Length() > 2 ? args[2] : Local<Value>(), tpl.headers,
+               tpl.customCL);
+  const uint32_t id = js->server->prepareTemplate(std::move(tpl));
+  if (id == 0) {
+    iso->ThrowException(v8::Exception::RangeError(
+        str(iso, "prepareResponse: template store is full (4096 per server); "
+                 "releaseTemplates() or reuse ids")));
+    return;
+  }
+  args.GetReturnValue().Set(Integer::NewFromUnsigned(iso, id));
+}
+
+// releaseTemplates(serverId) - invalidates every template id on this server.
+static void ReleaseTemplates(const FunctionCallbackInfo<Value>& args) {
+  JsServer* js = serverFrom(args);
+  if (js && js->server) js->server->releaseTemplates();
+}
+
+// respondPrepared(reqId, tplId, body|null) - respond() with a template.
+// An invalid tplId answers 500 (see Server::respondTemplate).
+static void RespondPrepared(const FunctionCallbackInfo<Value>& args) {
+  if (g_countCalls) ++fastcall::g_slowHits[fastcall::kRespondPrepared];
+  Isolate* iso = args.GetIsolate();
+  Local<Context> ctx = iso->GetCurrentContext();
+  Connection* c = connFrom(args);
+  if (!c) return;
+  const uint32_t tplId = args[1]->Uint32Value(ctx).FromMaybe(0);
+  ByteSource body(iso, args[2]);
+  c->server->respondTemplate(c, tplId, body.data(), body.size());
+}
+
+// respondPreparedEmpty(reqId, tplId) - respond() with a template and no body.
+static void RespondPreparedEmpty(const FunctionCallbackInfo<Value>& args) {
+  if (g_countCalls) ++fastcall::g_slowHits[fastcall::kRespondPreparedEmpty];
+  Isolate* iso = args.GetIsolate();
+  Local<Context> ctx = iso->GetCurrentContext();
+  Connection* c = connFrom(args);
+  if (!c) return;
+  const uint32_t tplId = args[1]->Uint32Value(ctx).FromMaybe(0);
+  c->server->respondTemplate(c, tplId, nullptr, 0);
+}
+
+// writeHeadPrepared(reqId, tplId) - writeHead() with a template (streaming).
+static void WriteHeadPrepared(const FunctionCallbackInfo<Value>& args) {
+  if (g_countCalls) ++fastcall::g_slowHits[fastcall::kWriteHeadPrepared];
+  Isolate* iso = args.GetIsolate();
+  Local<Context> ctx = iso->GetCurrentContext();
+  Connection* c = connFrom(args);
+  if (!c) return;
+  const uint32_t tplId = args[1]->Uint32Value(ctx).FromMaybe(0);
+  c->server->writeHeadTemplate(c, tplId);
+}
+
+// endWith(reqId, chunk) - exactly end(reqId, chunk), as a fixed-arity twin so
+// a call site that always passes a chunk has one shape (fast-call eligible).
+static void EndWith(const FunctionCallbackInfo<Value>& args) {
+  if (g_countCalls) ++fastcall::g_slowHits[fastcall::kEndWith];
+  Isolate* iso = args.GetIsolate();
+  Connection* c = connFrom(args);
+  if (!c) return;
   ByteSource chunk(iso, args[1]);
   c->server->end(c, chunk.data(), chunk.size());
 }
@@ -999,7 +1366,9 @@ static void WsSend(const FunctionCallbackInfo<Value>& args) {
   Connection* c = wsFrom(args);
   if (!c) { args.GetReturnValue().Set(false); return; }
   bool isBinary = args.Length() >= 3 && args[2]->BooleanValue(iso);
-  ByteSource data(iso, args[1]);
+  // Never a borrow: wsSend() can shed the peer (wsBackpressureLimit) through
+  // the synchronous onWsClose callback while `data` is alive.
+  ByteSource data(iso, args[1], /*borrow=*/false);
   bool ok = true;
   if (data.valid()) ok = c->server->wsSend(c, data.data(), data.size(), isBinary);
   args.GetReturnValue().Set(ok);
@@ -1020,6 +1389,39 @@ static void WsClose(const FunctionCallbackInfo<Value>& args) {
     if (*r) reason.assign(*r, r.length());
   }
   c->server->wsClose(c, code, reason.data(), reason.size());
+}
+
+// getBatchBuffers(serverId) -> { descriptors: Uint32Array(3*16), control:
+// Uint32Array(1), paths: string[] } - the same objects every call.
+static void GetBatchBuffers(const FunctionCallbackInfo<Value>& args) {
+  Isolate* iso = args.GetIsolate();
+  Local<Context> ctx = iso->GetCurrentContext();
+  uint32_t id = args[0]->Uint32Value(ctx).FromMaybe(0);
+  auto it = g_servers.find(id);
+  if (it == g_servers.end()) {
+    iso->ThrowException(v8::Exception::RangeError(str(iso, "getBatchBuffers: unknown serverId")));
+    return;
+  }
+  JsServer* js = it->second;
+  ensureBatchBuffers(js, iso, ctx);
+  Local<Object> out = Object::New(iso);
+  (void)out->Set(ctx, str(iso, "descriptors"),
+                 v8::Uint32Array::New(js->batchDesc.Get(iso), 0, 3 * Server::kMaxStaged)).FromMaybe(false);
+  (void)out->Set(ctx, str(iso, "control"), v8::Uint32Array::New(js->batchCtl.Get(iso), 0, 1)).FromMaybe(false);
+  (void)out->Set(ctx, str(iso, "paths"), js->batchPaths.Get(iso)).FromMaybe(false);
+  args.GetReturnValue().Set(out);
+}
+
+// getPath(reqId) -> the active request's path (for a batch descriptor whose
+// pathIdx is 0xFFFFFFFF: the path was not cacheable).
+static void GetPath(const FunctionCallbackInfo<Value>& args) {
+  Isolate* iso = args.GetIsolate();
+  Connection* c = connFrom(args);
+  if (!c) {
+    args.GetReturnValue().Set(str(iso, ""));
+    return;
+  }
+  args.GetReturnValue().Set(str(iso, c->path));
 }
 
 // ---- diagnostics ----
@@ -1060,34 +1462,175 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   setCap("responseLimits", true);
   // ssl.ciphers / ssl.ciphersuites / ssl.ecdhCurve are parsed.
   setCap("tlsPolicy", true);
+  // setStaticRoute()/clearStaticRoutes() are available.
+  setCap("staticRoutes", true);
+  // prepareResponse()/releaseTemplates()/respondPrepared()/
+  // respondPreparedEmpty()/writeHeadPrepared()/endWith() are available.
+  setCap("responseTemplates", true);
+  // onAborted/onWritable are delivered on a later loop turn (never
+  // re-entrantly from inside respond/write/end); false under
+  // MORO_ENGINE_NOTIFY=sync.
+  setCap("asyncNotify", g_notifyDeferred);
+  // A server left open when its environment is torn down (worker.terminate(),
+  // process.exit() inside a worker thread) is closed by a cleanup hook, so the
+  // engine is safe to run inside worker_threads.
+  setCap("workerThreads", true);
+  // V8 fast API calls installed on the hot entry points (respondPrepared,
+  // respondPreparedEmpty, writeHeadPrepared, write, end, endWith, isAborted).
+  setCap("fastCalls", g_fastInstalled);
+  // Batched pipelined dispatch: getBatchBuffers()/getPath() and the
+  // onRequestBatch callback (Server::dispatchBatch).
+  setCap("batchDispatch", g_batchEnabled);
   set("capabilities", caps);
+  set("notify", str(iso, g_notifyDeferred ? "deferred" : "sync"));
+  // I/O transport in use on this host: 'uring' (Linux, io_uring usable) or
+  // 'uv' (libuv streams), with the reason when it is not uring.
+  set("transport", str(iso, Server::transportName(Server::preferredTransport())));
+  set("transportReason", str(iso, Server::transportReason()));
+  {
+    Local<Object> fa = Object::New(iso);
+    auto setFa = [&](const char* k, Local<Value> v) {
+      (void)fa->Set(ctx, str(iso, k), v).FromMaybe(false);
+    };
+    setFa("compiled", v8::Boolean::New(iso, g_fastCompiled));
+    setFa("installed", v8::Boolean::New(iso, g_fastInstalled));
+    setFa("reason", str(iso, g_fastReason));
+    setFa("compiledV8", str(iso, std::to_string(V8_MAJOR_VERSION) + "." + std::to_string(V8_MINOR_VERSION)));
+    setFa("runtimeV8", str(iso, std::to_string(g_runtimeV8Major) + "." + std::to_string(g_runtimeV8Minor)));
+    set("fastApi", fa);
+  }
+  if (g_countCalls) {
+    // Per-thread fast/slow hit counters (MORO_ENGINE_FASTCALL_STATS=1 at load).
+    Local<Object> stats = Object::New(iso);
+    for (int i = 0; i < fastcall::kCount; ++i) {
+      Local<Object> pair = Object::New(iso);
+      (void)pair->Set(ctx, str(iso, "fast"), Number::New(iso, static_cast<double>(fastcall::g_fastHits[i]))).FromMaybe(false);
+      (void)pair->Set(ctx, str(iso, "slow"), Number::New(iso, static_cast<double>(fastcall::g_slowHits[i]))).FromMaybe(false);
+      (void)stats->Set(ctx, str(iso, fastcall::fnName(i)), pair).FromMaybe(false);
+    }
+    set("fastCallStats", stats);
+  }
   args.GetReturnValue().Set(result);
 }
 
+// The native surface, in one table: name, the regular callback, and (for the
+// hot entry points) the V8 fast-call target plus its counting variant. The
+// export-drift gate (tools/check-exports.mjs) reads this table.
+struct ExportDef {
+  const char* name;
+  v8::FunctionCallback slow;
+  const v8::CFunction* fast;          // nullptr: regular callback only
+  const v8::CFunction* fastCounting;  // installed under MORO_ENGINE_FASTCALL_STATS=1
+};
+
+#if MORO_FAST_API_ENABLED
+#define MORO_FASTDEF(Name)                                                            \
+  static const v8::CFunction kFast_##Name = v8::CFunction::Make(&fastcall::Name<false>); \
+  static const v8::CFunction kFastC_##Name = v8::CFunction::Make(&fastcall::Name<true>);
+MORO_FASTDEF(RespondPrepared)
+MORO_FASTDEF(RespondPreparedEmpty)
+MORO_FASTDEF(WriteHeadPrepared)
+MORO_FASTDEF(Write)
+MORO_FASTDEF(End)
+MORO_FASTDEF(EndWith)
+MORO_FASTDEF(IsAborted)
+#undef MORO_FASTDEF
+#define MORO_FAST(Name) &kFast_##Name, &kFastC_##Name
+#else
+#define MORO_FAST(Name) nullptr, nullptr
+#endif
+
+static const ExportDef kExports[] = {
+    {"serve", Serve, nullptr, nullptr},
+    {"listen", Listen, nullptr, nullptr},
+    {"close", Close, nullptr, nullptr},
+    {"stopListening", StopListening, nullptr, nullptr},
+    {"getMethod", GetMethod, nullptr, nullptr},
+    {"getBatchBuffers", GetBatchBuffers, nullptr, nullptr},
+    {"getPath", GetPath, nullptr, nullptr},
+    {"getQuery", GetQuery, nullptr, nullptr},
+    {"getHeaders", GetHeaders, nullptr, nullptr},
+    {"getHeader", GetHeader, nullptr, nullptr},
+    {"getBody", GetBody, nullptr, nullptr},
+    {"getRemoteAddress", GetRemoteAddress, nullptr, nullptr},
+    {"isAborted", IsAborted, MORO_FAST(IsAborted)},
+    {"respond", Respond, nullptr, nullptr},
+    {"writeHead", WriteHead, nullptr, nullptr},
+    {"write", Write, MORO_FAST(Write)},
+    {"end", End, MORO_FAST(End)},
+    {"setStaticRoute", SetStaticRoute, nullptr, nullptr},
+    {"clearStaticRoutes", ClearStaticRoutes, nullptr, nullptr},
+    {"prepareResponse", PrepareResponse, nullptr, nullptr},
+    {"releaseTemplates", ReleaseTemplates, nullptr, nullptr},
+    {"respondPrepared", RespondPrepared, MORO_FAST(RespondPrepared)},
+    {"respondPreparedEmpty", RespondPreparedEmpty, MORO_FAST(RespondPreparedEmpty)},
+    {"writeHeadPrepared", WriteHeadPrepared, MORO_FAST(WriteHeadPrepared)},
+    {"endWith", EndWith, MORO_FAST(EndWith)},
+    {"upgradeToWebSocket", UpgradeToWebSocket, nullptr, nullptr},
+    {"wsSend", WsSend, nullptr, nullptr},
+    {"wsClose", WsClose, nullptr, nullptr},
+    {"probe", Probe, nullptr, nullptr},
+};
+#undef MORO_FAST
+
 static void Initialize(Local<Object> exports, Local<Value> module,
                        Local<Context> context) {
-  NODE_SET_METHOD(exports, "serve", Serve);
-  NODE_SET_METHOD(exports, "listen", Listen);
-  NODE_SET_METHOD(exports, "close", Close);
-  NODE_SET_METHOD(exports, "stopListening", StopListening);
-  NODE_SET_METHOD(exports, "getMethod", GetMethod);
-  NODE_SET_METHOD(exports, "getQuery", GetQuery);
-  NODE_SET_METHOD(exports, "getHeaders", GetHeaders);
-  NODE_SET_METHOD(exports, "getHeader", GetHeader);
-  NODE_SET_METHOD(exports, "getBody", GetBody);
-  NODE_SET_METHOD(exports, "getRemoteAddress", GetRemoteAddress);
-  NODE_SET_METHOD(exports, "isAborted", IsAborted);
-  NODE_SET_METHOD(exports, "respond", Respond);
-  NODE_SET_METHOD(exports, "writeHead", WriteHead);
-  NODE_SET_METHOD(exports, "write", Write);
-  NODE_SET_METHOD(exports, "end", End);
-  NODE_SET_METHOD(exports, "upgradeToWebSocket", UpgradeToWebSocket);
-  NODE_SET_METHOD(exports, "wsSend", WsSend);
-  NODE_SET_METHOD(exports, "wsClose", WsClose);
-  NODE_SET_METHOD(exports, "probe", Probe);
-
   // Context::GetIsolate() was removed in V8 14 (Node 26); GetCurrent() is stable
   Isolate* iso = Isolate::GetCurrent();
+
+  // Diagnostics-only: MORO_ENGINE_NOTIFY=sync restores re-entrant
+  // onAborted/onWritable delivery (pre-1.2 behaviour) for bisecting.
+  const char* notifyEnv = std::getenv("MORO_ENGINE_NOTIFY");
+  const char* batchEnv = std::getenv("MORO_ENGINE_BATCH");
+  g_batchEnabled = !(batchEnv && std::strcmp(batchEnv, "0") == 0);
+  g_notifyDeferred = !(notifyEnv && std::strcmp(notifyEnv, "sync") == 0);
+
+  // Fast calls are installed only when every precondition holds; otherwise
+  // the plain callbacks are registered and probe().fastApi.reason says why.
+  //   not-compiled: built without the fast-API header (--no-fast-api)
+  //   env-disabled: MORO_ENGINE_FASTCALL=0 (diagnostics kill switch)
+  //   sync-notify:  MORO_ENGINE_NOTIFY=sync - a binding call could re-enter
+  //                 JS, which a fast target must never do
+  //   v8-mismatch:  the host's V8 major.minor differs from the one this binary
+  //                 was compiled against (the fast-call ABI is not stable
+  //                 across V8 versions; plain callbacks are)
+  const char* statsEnv = std::getenv("MORO_ENGINE_FASTCALL_STATS");
+  g_countCalls = statsEnv && std::strcmp(statsEnv, "1") == 0;
+  const char* fcEnv = std::getenv("MORO_ENGINE_FASTCALL");
+  const bool fcDisabled = fcEnv && std::strcmp(fcEnv, "0") == 0;
+  const bool v8Match = v8compat::runtimeVersionMatches(&g_runtimeV8Major, &g_runtimeV8Minor);
+  g_fastReason = !g_fastCompiled   ? "not-compiled"
+                 : fcDisabled      ? "env-disabled"
+                 : !g_notifyDeferred ? "sync-notify"
+                 : !v8Match        ? "v8-mismatch"
+                                   : "ok";
+  g_fastInstalled = std::strcmp(g_fastReason, "ok") == 0;
+
+  for (const ExportDef& e : kExports) {
+    const v8::CFunction* cf =
+        g_fastInstalled ? (g_countCalls ? e.fastCounting : e.fast) : nullptr;
+    if (cf == nullptr) {
+      NODE_SET_METHOD(exports, e.name, e.slow);
+      continue;
+    }
+    // Same recipe as NODE_SET_METHOD (FunctionTemplate -> GetFunction ->
+    // SetName), plus the CFunction that optimised callers may dispatch to.
+    Local<v8::FunctionTemplate> ft = v8::FunctionTemplate::New(
+        iso, e.slow, Local<Value>(), Local<v8::Signature>(), 0,
+        // V8 refuses a CFunction on a constructible template ("Fast API calls
+        // are not supported for constructor functions"); these are plain
+        // functions, never `new`ed.
+        v8::ConstructorBehavior::kThrow, v8::SideEffectType::kHasSideEffect, cf);
+    Local<Function> fn;
+    if (!ft->GetFunction(context).ToLocal(&fn)) {
+      NODE_SET_METHOD(exports, e.name, e.slow);
+      continue;
+    }
+    Local<String> name = str(iso, e.name);
+    fn->SetName(name);
+    (void)exports->Set(context, name, fn).FromMaybe(false);
+  }
+
   (void)exports->Set(context, str(iso, "version"), str(iso, kEngineVersion))
       .FromMaybe(false);
   (void)module;

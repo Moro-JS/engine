@@ -18,6 +18,21 @@ assert.strictEqual(String(result.abi), String(process.versions.modules), 'ABI mi
 assert.strictEqual(result.platform, process.platform);
 assert.ok(engine.version, 'version export missing');
 
+// Every published binary is built with the V8 fast-call targets, and on a
+// host whose V8 matches the compiled one they must be installed. The smoke
+// matrix (every OS x every Node line) is therefore the per-ABI proof that the
+// install guard accepts the real runtime. The kill switch is the only
+// legitimate reason for 'installed: false' here.
+if (result.fastApi?.compiled && process.env.MORO_ENGINE_FASTCALL !== '0' && process.env.MORO_ENGINE_NOTIFY !== 'sync') {
+  assert.strictEqual(
+    result.fastApi.installed,
+    true,
+    `fast API calls not installed: ${result.fastApi.reason} (compiled V8 ${result.fastApi.compiledV8}, runtime ${result.fastApi.runtimeV8})`
+  );
+  assert.strictEqual(result.capabilities?.fastCalls, true);
+}
+assert.strictEqual(result.notify, process.env.MORO_ENGINE_NOTIFY === 'sync' ? 'sync' : 'deferred');
+
 if (result.capabilities?.tls) {
   const fx = (n) => fileURLToPath(new URL(`./fixtures/tls/${n}`, import.meta.url));
   const sid = engine.serve(

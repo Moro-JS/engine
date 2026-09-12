@@ -1,0 +1,11 @@
+{
+  "_comment": "Deterministic 'io_uring blocked' profile for the fallback-seccomp CI lane: allow everything, deny the three io_uring syscalls with EPERM (what Docker's default profile has done since 25.0 / containerd 1.7). The engine must silently select the libuv transport under this profile.",
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "syscalls": [
+    {
+      "names": ["io_uring_setup", "io_uring_enter", "io_uring_register"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}

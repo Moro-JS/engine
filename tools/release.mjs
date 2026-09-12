@@ -80,6 +80,7 @@ if (sh(`git tag -l v${next}`)) die(`tag v${next} already exists`);
 
 if (!skipChecks) {
   console.log('build + smoke gate (skip with --skip-checks):');
+  run('node tools/check-exports.mjs');
   run('node tools/build.mjs');
   run('node test/smoke.mjs');
 } else {

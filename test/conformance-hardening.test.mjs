@@ -293,6 +293,13 @@ describe('@morojs/engine hardening conformance', { skip }, () => {
       async ({ port, serverId }) => {
         const existing = await openRaw(port);
         try {
+          // One round trip first: the client's 'connect' fires when the TCP
+          // handshake completes, which can be before the server has accept()ed
+          // the socket out of the backlog - closing the listener at that
+          // instant would reset it (kernel behaviour, both transports). A
+          // served response proves the connection is established server-side.
+          await existing.send(get('/'));
+          assert.equal(parseResponse(await existing.read({ until: responsesComplete(1) })).status, 200);
           engine.stopListening(serverId);
           await delay(50);
           // New connection: refused (listener closed).

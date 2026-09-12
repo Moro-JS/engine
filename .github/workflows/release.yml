@@ -43,8 +43,10 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: node tools/build.mjs --all --arch arm64
-      - run: node tools/build.mjs --all --arch x64
+      # PGO cycle (lenient: a profile problem keeps the plain build). The x64
+      # binaries are cross-built from the arm64 host's training profile.
+      - run: node tools/pgo.mjs --all --arch arm64
+      - run: node tools/pgo.mjs --all --arch x64
       # SHA-256 manifest of the exact bytes we ship; the publish job concatenates
       # every flavor's manifest, re-verifies it against the collected binaries,
       # and attaches SHA256SUMS to the GitHub Release.
@@ -70,10 +72,17 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      - name: Install clang-18 + lld + llvm-profdata
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+          sudo apt-get install -y lld-18 llvm-18
+          echo "CXX=clang++-18" >> "$GITHUB_ENV"
+          echo "LLVM_PROFDATA=llvm-profdata-18" >> "$GITHUB_ENV"
+          sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: node tools/build.mjs --all
+      - run: node tools/pgo.mjs --all
       - name: Checksum manifest
         run: shasum -a 256 build/*.node > SHA256SUMS.linux-${{ matrix.arch }}-gnu
       - uses: actions/upload-artifact@v7
@@ -101,7 +110,7 @@ jobs:
       - name: Build in Alpine container (musl)
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo node:24-alpine \
-            sh -c "apk add --no-cache build-base && node tools/build.mjs --all"
+            sh -c "apk add --no-cache build-base clang lld llvm && node tools/pgo.mjs --all"
       - name: Checksum manifest
         run: shasum -a 256 build/*.node > SHA256SUMS.linux-${{ matrix.arch }}-musl
       - uses: actions/upload-artifact@v7
@@ -123,7 +132,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: node tools/build.mjs --all
+      # MSVC PGO stays opt-in (MORO_PGO_WINDOWS) until the pgort runtime is
+      # verified on the runner; pgo.mjs then keeps the plain build.
+      - run: node tools/pgo.mjs --all
       # Git Bash ships coreutils sha256sum; same `<hash>  <path>` format as the
       # POSIX `shasum -a 256` legs, so the concatenated manifest stays uniform.
       - name: Checksum manifest
@@ -224,30 +235,34 @@ jobs:
   # Full conformance per OS for the running ABI (behavioral gate; the smoke
   # matrix above load-tests the shipped binaries, this proves protocol behavior).
   conformance-linux:
-    runs-on: ubuntu-latest
+    needs: [linux-gnu]
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - name: Build engine for this Node ABI
-        run: node tools/build.mjs
-      - run: npm run test:smoke && npm run test:conformance && npm run test:conformance-edge && npm run test:hardening && npm run test:regression && npm run test:ws-conformance && npm run test:limits && npm run test:tls && npm run test:tls-hardening && npm run test:ws-deflate
+      # The exact binaries being published (PGO'd), not a fresh local build.
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries-linux-x64-gnu
+          path: build/
+      - run: npm run test:smoke && npm run test:suites
 
   conformance-macos:
+    needs: [darwin]
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v7
-      - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
-        run: |
-          brew list llvm >/dev/null 2>&1 || brew install llvm
-          echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - name: Build engine for this Node ABI
-        run: node tools/build.mjs
-      - run: npm run test:smoke && npm run test:conformance && npm run test:conformance-edge && npm run test:hardening && npm run test:regression && npm run test:ws-conformance && npm run test:limits && npm run test:tls && npm run test:tls-hardening && npm run test:ws-deflate
+      # The exact binaries being published (PGO'd), not a fresh local build.
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries-darwin
+          path: build/
+      - run: npm run test:smoke && npm run test:suites
 
   conformance-windows:
     needs: [windows]
@@ -261,7 +276,7 @@ jobs:
         with:
           name: binaries-windows-x64
           path: build/
-      - run: npm run test:conformance && npm run test:conformance-edge && npm run test:hardening && npm run test:regression && npm run test:ws-conformance && npm run test:limits && npm run test:tls && npm run test:tls-hardening && npm run test:ws-deflate
+      - run: npm run test:suites
 
   # ── Publish ─────────────────────────────────────────────────────────────────
   publish:

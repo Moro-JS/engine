@@ -28,7 +28,7 @@ jobs:
       matrix:
         # One job per harness so nightlies parallelize; new fuzzers (h2) join
         # this list as their phases land.
-        fuzzer: [http, ws, tls, pmd]
+        fuzzer: [http, ws, tls, pmd, uring]
     steps:
       - uses: actions/checkout@v7
 
@@ -94,7 +94,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        fuzzer: [http, ws, tls, pmd]
+        fuzzer: [http, ws, tls, pmd, uring]
     steps:
       - uses: actions/checkout@v7
 

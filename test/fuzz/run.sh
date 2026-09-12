@@ -13,6 +13,7 @@
 #   sh test/fuzz/run.sh tls      # TLS transform (needs OpenSSL dev headers:
 #                                #   apt install libssl-dev / brew install openssl)
 #   sh test/fuzz/run.sh pmd      # permessage-deflate inflate path (needs zlib: -lz)
+#   sh test/fuzz/run.sh uring    # io_uring ring mechanics vs the fake kernel
 #
 # FUZZ_MODE=merge minimizes the target's corpus in place instead of fuzzing:
 #   FUZZ_MODE=merge sh test/fuzz/run.sh pmd
@@ -89,9 +90,14 @@ if [ "$TARGET" = all ] || [ "$TARGET" = pmd ]; then
   run_target pmd fuzz_ws_deflate.cc "-lz"
   ran=1
 fi
+if [ "$TARGET" = all ] || [ "$TARGET" = uring ]; then
+  # io_uring ring mechanics against the fake kernel (no Linux needed).
+  run_target uring fuzz_uring_ring.cc
+  ran=1
+fi
 
 if [ "$ran" = 0 ]; then
-  echo "unknown fuzz target: $TARGET (expected http|ws|tls|pmd|all)" >&2
+  echo "unknown fuzz target: $TARGET (expected http|ws|tls|pmd|uring|all)" >&2
   exit 2
 fi
 

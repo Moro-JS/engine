@@ -10,6 +10,27 @@ echo "FlatMap unit tests ..."
 $CXX -std=c++20 -O2 "$DIR/flat-map-unit.cpp" -o /tmp/moro_fmtest
 /tmp/moro_fmtest
 
+echo "text helper unit tests ..."
+$CXX -std=c++20 -O2 "$DIR/text-unit.cpp" -o /tmp/moro_texttest
+/tmp/moro_texttest
+
+echo "response-template unit tests ..."
+$CXX -std=c++20 -O2 "$DIR/response-template-unit.cpp" -o /tmp/moro_tpltest
+/tmp/moro_tpltest
+
+echo "io_uring fake-kernel unit tests ..."
+$CXX -std=c++20 -O2 "$DIR/uring-fake-unit.cpp" -o /tmp/moro_uringfaketest
+/tmp/moro_uringfaketest
+
+# Real-kernel io_uring unit: Linux only; self-skips where io_uring is
+# unavailable (prints the probe reason), fails under
+# MORO_ENGINE_REQUIRE_TRANSPORT=uring.
+if [ "$(uname -s)" = "Linux" ]; then
+  echo "io_uring real-kernel unit tests ..."
+  $CXX -std=c++20 -O2 "$DIR/uring-unit.cpp" -o /tmp/moro_uringtest
+  /tmp/moro_uringtest
+fi
+
 echo "HTTP parser unit tests ..."
 $CXX -std=c++20 -O2 "$DIR/http-parser-unit.cpp" -o /tmp/moro_hptest
 /tmp/moro_hptest

@@ -19,12 +19,32 @@ if (mode === 'engine') {
   const engine = (await import(new URL('../packages/engine/index.mjs', import.meta.url)))
     .default;
   const headers = ['content-type', 'application/json'];
-  const sid = engine.serve({
+  // Batched dispatch when the engine has it (MORO_ENGINE_BATCH=0 turns it
+  // off): the canonical loop over getBatchBuffers() descriptors.
+  const batchOn = engine.probe().capabilities?.batchDispatch === true;
+  let buffers = null;
+  const callbacks = {
     onRequest(reqId) {
       engine.respond(reqId, 200, headers, BODY);
     },
     onAborted() {},
-  });
+  };
+  if (batchOn) {
+    callbacks.onRequestBatch = (count) => {
+      const d = buffers.descriptors;
+      const ctl = buffers.control;
+      let i = 0;
+      for (;;) {
+        engine.respond(d[3 * i], 200, headers, BODY);
+        const next = ctl[0];
+        if (next === i) return i + 1;
+        if (next >= count) return count;
+        i = next;
+      }
+    };
+  }
+  const sid = engine.serve(callbacks);
+  if (batchOn) buffers = engine.getBatchBuffers(sid);
   const port = engine.listen(sid, '127.0.0.1', PORT);
   console.log('LISTENING', port);
 } else if (mode === 'node') {

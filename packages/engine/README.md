@@ -70,6 +70,16 @@ optional-dependency lockfile bug ([npm/cli#4828](https://github.com/npm/cli/issu
 Node ABIs: 115/127/131/137/141/147 (Node 20/22/23/24/25/26). Any other
 platform/ABI falls back to Node's `http` server via MoroJS.
 
+## I/O transport
+
+The engine runs on libuv streams by default. On Linux 6.1+ an io_uring
+transport is available opt-in (`MORO_ENGINE_TRANSPORT=uring`): it is probed
+once per process by a feature check and a self-test, and anywhere it is
+unavailable (kernels before 6.1, gVisor, containers under Docker's default
+seccomp profile, which blocks `io_uring_setup`) the engine silently stays on
+libuv. Neither transport changes a byte on the wire. `probe().transport`
+reports which one is live and `probe().transportReason` why.
+
 ## License
 
 MIT licensed.

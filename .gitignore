@@ -13,3 +13,5 @@ timeout-*
 slow-unit-*
 # Per-machine perf baselines (recorded locally via bench/run.sh --record)
 bench/baselines.json
+# h1spec driver clone (test/h1spec/run.sh; no upstream license, never vendored)
+test/h1spec/h1spec/

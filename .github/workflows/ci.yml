@@ -33,12 +33,22 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang
       - name: C++ unit tests
         run: sh test/run-unit.sh
+      # The native surface is declared in four places (binding, NATIVE_API,
+      # index.mjs, index.d.ts) plus caps/options in two; drift fails the gate.
+      - name: Export-drift gate
+        run: npm run check:exports
 
   # Build the addon for the running Node's ABI, then run the conformance
   # suites against the real built engine. Linux builds use g++ (build.mjs
   # default), which ships on ubuntu-latest.
   integration:
     runs-on: ubuntu-latest
+    env:
+      CXX: g++ # correctness lane; the shipping Linux lanes build with clang-18 (see linux-gnu)
+      # ubuntu-latest (24.04, kernel 6.8) would auto-select io_uring: this lane
+      # is the libuv path, and REQUIRE makes a silent switch a failure.
+      MORO_ENGINE_TRANSPORT: uv
+      MORO_ENGINE_REQUIRE_TRANSPORT: uv
     strategy:
       fail-fast: false
       matrix:
@@ -54,8 +64,114 @@ jobs:
       # assert those exports exist on this leg before running the TLS suites.
       - name: Assert node exports OpenSSL symbols
         run: nm -D "$(command -v node)" | grep -q SSL_CTX_new
-      - name: Smoke + HTTP + WebSocket + limits + TLS + pmd conformance
-        run: npm run test:smoke && npm run test:conformance && npm run test:conformance-edge && npm run test:hardening && npm run test:regression && npm run test:ws-conformance && npm run test:limits && npm run test:tls && npm run test:tls-hardening && npm run test:ws-deflate
+      - name: Smoke + every node --test suite (package.json test:suites)
+        run: npm run test:smoke && npm run test:suites
+
+  # The same suites with each diagnostics kill switch flipped, so the fallback
+  # paths (plain callbacks, re-entrant notification delivery) stay green too.
+  integration-variants:
+    runs-on: ubuntu-latest
+    env:
+      CXX: g++
+      MORO_ENGINE_TRANSPORT: uv
+      MORO_ENGINE_REQUIRE_TRANSPORT: uv
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: fastcall-off
+            envvar: MORO_ENGINE_FASTCALL=0
+          - name: notify-sync
+            envvar: MORO_ENGINE_NOTIFY=sync
+          - name: batch-off
+            envvar: MORO_ENGINE_BATCH=0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Build engine for this Node ABI
+        run: node tools/build.mjs
+      - name: Smoke + every node --test suite (${{ matrix.name }})
+        run: env ${{ matrix.envvar }} sh -c 'npm run test:smoke && npm run test:suites'
+
+  # The io_uring transport: every suite on kernels that have it (24.04 =
+  # 6.8), REQUIRE makes a silent fallback to libuv a failure. Runs on both
+  # arches; the musl build gets its own container lane below.
+  integration-uring:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        node-version: [20, 22, 24, 26]
+    runs-on: ${{ matrix.runner }}
+    env:
+      CXX: g++
+      MORO_ENGINE_TRANSPORT: uring
+      MORO_ENGINE_REQUIRE_TRANSPORT: uring
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Build engine for this Node ABI
+        run: node tools/build.mjs
+      - name: Kernel + transport in use
+        run: uname -r && node -e "console.log(require('./packages/engine').probe())"
+      - name: Real-kernel ring unit
+        run: sh test/run-unit.sh
+      - name: Smoke + every node --test suite on io_uring
+        run: npm run test:smoke && npm run test:suites
+      - name: Connection-churn soak on io_uring
+        run: npm run test:soak
+
+  # Silent degradation proof: Docker's default seccomp profile blocks
+  # io_uring_setup (an explicit profile here so the lane is deterministic
+  # across Docker versions); the engine must select libuv, report why, and
+  # pass the suites. Then the same container with seccomp lifted must run
+  # io_uring - which is exactly what the-benchmarker needs to exercise it.
+  fallback-seccomp:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build engine (host ABI 24) inside the container image
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo node:24-bookworm \
+            sh -c "apt-get update -qq >/dev/null && apt-get install -y -qq g++ >/dev/null && CXX=g++ node tools/build.mjs"
+      - name: io_uring blocked by seccomp -> libuv, with the reason
+        run: |
+          docker run --rm --security-opt seccomp=test/ci/seccomp-block-io_uring.json \
+            -v "$PWD:/repo" -w /repo -e MORO_ENGINE_TRANSPORT=uring -e MORO_ENGINE_REQUIRE_TRANSPORT=uv node:24-bookworm \
+            sh -c "node -e \"const p=require('./packages/engine').probe(); console.log(p.transport, '-', p.transportReason); if (p.transport!=='uv' || !/EPERM|ENOSYS/.test(p.transportReason)) process.exit(1)\" && npm run test:smoke && node --test test/conformance.test.mjs test/probe-transport.test.mjs"
+      - name: seccomp lifted -> io_uring inside the container
+        run: |
+          docker run --rm --security-opt seccomp=unconfined \
+            -v "$PWD:/repo" -w /repo -e MORO_ENGINE_TRANSPORT=uring -e MORO_ENGINE_REQUIRE_TRANSPORT=uring node:24-bookworm \
+            sh -c "uname -r && npm run test:smoke && npm run test:suites"
+
+  # musl build on io_uring (covers the musl syscall() wrappers).
+  conformance-musl-uring:
+    needs: [linux-musl]
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binaries-linux-*-musl
+          merge-multiple: true
+          path: build/
+      - name: Smoke + suites on io_uring (Alpine)
+        run: |
+          docker run --rm --security-opt seccomp=unconfined -v "$PWD:/repo" -w /repo \
+            -e MORO_ENGINE_TRANSPORT=uring -e MORO_ENGINE_REQUIRE_TRANSPORT=uring node:24-alpine \
+            sh -c "uname -r && npm run test:smoke && npm run test:suites && npm run test:soak"
 
   # ── Sanitizers ──────────────────────────────────────────────────────────────
 
@@ -75,6 +191,21 @@ jobs:
       # test/run-unit.sh hardcodes -O2 with no CXXFLAGS/sanitizer hook, so
       # compile the two pure-C++ unit tests directly with the sanitizers.
       # -fno-sanitize-recover=all makes any finding a non-zero exit.
+      - name: text helper unit tests (ASan/UBSan)
+        run: |
+          clang++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            test/text-unit.cpp -o /tmp/moro_text_asan
+          /tmp/moro_text_asan
+      - name: response-template unit tests (ASan/UBSan)
+        run: |
+          clang++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            test/response-template-unit.cpp -o /tmp/moro_tpl_asan
+          /tmp/moro_tpl_asan
+      - name: io_uring fake-kernel unit tests (ASan/UBSan)
+        run: |
+          clang++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            test/uring-fake-unit.cpp -o /tmp/moro_uring_asan
+          /tmp/moro_uring_asan
       - name: HTTP parser unit tests (ASan/UBSan)
         run: |
           clang++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
@@ -98,12 +229,21 @@ jobs:
   # The addon is built with ASan/UBSan and the full conformance + hardening +
   # WS suites run against it under a preloaded sanitizer runtime.
   asan-addon:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        transport: [uv, uring]
     env:
       # detect_leaks=0: Node itself reports benign leaks at exit that would
       # drown real findings; ASan's memory-error detection is unaffected.
       ASAN_OPTIONS: abort_on_error=1:halt_on_error=1:detect_leaks=0
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      CXX: g++ # the LD_PRELOAD flow below is gcc's libasan/libubsan
+      # Both transports under the sanitizers (ASan sees our lifetimes; the
+      # kernel's writes into provided buffers are covered by the ring tests).
+      MORO_ENGINE_TRANSPORT: ${{ matrix.transport }}
+      MORO_ENGINE_REQUIRE_TRANSPORT: ${{ matrix.transport }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
@@ -111,17 +251,10 @@ jobs:
           node-version: 24
       - name: Build addon with ASan/UBSan
         run: node tools/build.mjs --sanitize
-      - name: Conformance suites against the sanitized addon
+      - name: Every node --test suite against the sanitized addon
         run: |
           export LD_PRELOAD="$(g++ -print-file-name=libasan.so) $(g++ -print-file-name=libubsan.so)"
-          node --test test/conformance.test.mjs
-          node --test test/conformance-edge.test.mjs
-          node --test test/conformance-hardening.test.mjs
-          node --test test/ws-conformance.test.mjs
-          node --test test/limits-conformance.test.mjs
-          node --test test/tls-conformance.test.mjs
-          node --test test/tls-hardening.test.mjs
-          node --test test/ws-deflate-conformance.test.mjs
+          npm run test:suites
 
   # ── Fuzz-harness smoke (the sustained campaign is nightly in fuzz.yml) ───────
 
@@ -134,7 +267,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        fuzzer: [http, ws, tls, pmd]
+        fuzzer: [http, ws, tls, pmd, uring]
     steps:
       - uses: actions/checkout@v7
       - name: Install clang (+ OpenSSL/zlib headers for the tls/pmd harnesses)
@@ -176,6 +309,16 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      # clang-18 + lld from apt.llvm.org: the toolchain the release binaries
+      # are built (and PGO-trained) with; ubuntu-22.04's own clang 14 cannot
+      # compile Node 25/26's V8 headers. The glibc floor is unaffected.
+      - name: Install clang-18 + lld
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+          sudo apt-get install -y lld-18 llvm-18
+          echo "CXX=clang++-18" >> "$GITHUB_ENV"
+          echo "LLVM_PROFDATA=llvm-profdata-18" >> "$GITHUB_ENV"
+          sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -203,11 +346,53 @@ jobs:
       - name: Build in Alpine container (musl)
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo node:24-alpine \
-            sh -c "apk add --no-cache build-base && node tools/build.mjs --all"
+            sh -c "apk add --no-cache build-base clang lld llvm && node tools/build.mjs --all"
       - uses: actions/upload-artifact@v7
         with:
           name: binaries-linux-${{ matrix.arch }}-musl
           path: build/*.node
+
+  # The full PGO cycle (instrument -> train -> merge -> optimise), strict: a
+  # broken profile flow fails here instead of silently shipping plain builds
+  # from release.yml's lenient run. The suites then run against the PGO'd
+  # binary, so a profile-induced miscompile would surface as a test failure.
+  pgo-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install clang-18 + lld + llvm-profdata
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang-18 lld-18 llvm-18
+          echo "CXX=clang++-18" >> "$GITHUB_ENV"
+          echo "LLVM_PROFDATA=llvm-profdata-18" >> "$GITHUB_ENV"
+          sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: PGO cycle (strict)
+        run: node tools/pgo.mjs --strict
+      - name: Smoke + every suite against the PGO-optimised binary
+        run: npm run test:smoke && npm run test:suites
+
+  # HTTP/1.1 conformance against the unmodified h1spec driver (Deno), pinned
+  # to a commit - the 33/33 bar checked per commit here, not only weekly in the
+  # benchmark repo.
+  h1spec:
+    runs-on: ubuntu-latest
+    env:
+      CXX: g++
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Build engine for this Node ABI
+        run: node tools/build.mjs
+      - name: Run h1spec against the engine
+        run: sh test/h1spec/run.sh
 
   # Windows (MSVC): build.mjs downloads the per-version node.lib
   # (SHASUMS-verified) and compiles with cl.exe (/DELAYLOAD:node.exe + the
@@ -326,6 +511,8 @@ jobs:
   conformance-windows:
     needs: [windows]
     runs-on: windows-latest
+    env:
+      MORO_ENGINE_REQUIRE_TRANSPORT: uv
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
@@ -335,7 +522,7 @@ jobs:
         with:
           name: binaries-windows-x64
           path: build/
-      - run: npm run test:conformance && npm run test:conformance-edge && npm run test:hardening && npm run test:regression && npm run test:ws-conformance && npm run test:limits && npm run test:tls && npm run test:tls-hardening && npm run test:ws-deflate
+      - run: npm run test:suites
 
   # Full conformance on macOS for the running ABI. The darwin binaries ship to
   # real users, so at least one darwin leg must run the whole suite (the smoke
@@ -343,6 +530,8 @@ jobs:
   # build job; same runner flavor as the darwin smoke leg (macos-14 = arm64).
   conformance-macos:
     runs-on: macos-14
+    env:
+      MORO_ENGINE_REQUIRE_TRANSPORT: uv
     steps:
       - uses: actions/checkout@v7
       - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
@@ -354,8 +543,8 @@ jobs:
           node-version: 24
       - name: Build engine for this Node ABI
         run: node tools/build.mjs
-      - name: Smoke + HTTP + WebSocket + limits + TLS + pmd conformance
-        run: npm run test:smoke && npm run test:conformance && npm run test:conformance-edge && npm run test:hardening && npm run test:regression && npm run test:ws-conformance && npm run test:limits && npm run test:tls && npm run test:tls-hardening && npm run test:ws-deflate
+      - name: Smoke + every node --test suite (package.json test:suites)
+        run: npm run test:smoke && npm run test:suites
 
   # ── Single required gate ────────────────────────────────────────────────────
 
@@ -367,6 +556,12 @@ jobs:
     needs:
       - unit
       - integration
+      - integration-variants
+      - integration-uring
+      - fallback-seccomp
+      - conformance-musl-uring
+      - pgo-linux
+      - h1spec
       - asan-ubsan
       - asan-addon
       - fuzz-smoke
