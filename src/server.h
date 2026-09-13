@@ -238,6 +238,13 @@ struct Connection {
   bool finSent = false;        // our FIN already went with the last response bytes (tTryWriteLast)
   int pendingWrites = 0;       // outstanding uv_write_t
   bool closeAfterFlush = false;
+  // Lingering close (RFC 9112 §9.6, the "TCP reset problem"): the last
+  // response of a Connection: close exchange is out and our FIN with it; the
+  // socket now stays open with its input discarded until the peer's FIN
+  // arrives (or Server::kLingerMs passes, onSweep). See closeAfterResponse.
+  bool lingering = false;
+  uint32_t lingerTicks = 0;
+  uv_shutdown_t shutdownReq;   // uv arm: the FIN for a queued (non-coalesced) last write
 
   // Pipelined-response corking (see dispatchBatch): while `corked`, response bytes accumulate in corkBuf and are flushed with a single write once the buffered input drains - one syscall per pipelined batch instead of one per response. batchClose records a Connection: close response inside the batch (the flush-then-close is handled by the batch loop's tail).
   std::string corkBuf;
@@ -468,21 +475,35 @@ class Server {
     if (r != 0) return fail(r);
     r = uv_listen(reinterpret_cast<uv_stream_t*>(&tcp_), limits_.backlog, onConnection);
     if (r != 0) return fail(r);
+#if !defined(_WIN32)
+    {
+      // TCP_NODELAY on the listener is inherited by every accepted socket
+      // (Linux and XNU; test/sockopt-unit.cpp checks it), so the per-connection
+      // uv_tcp_nodelay() setsockopt - one syscall on every accept - is not
+      // needed on POSIX. Same trick as the io_uring listener (uringListen).
+      uv_os_fd_t lfd;
+      if (uv_fileno(reinterpret_cast<uv_handle_t*>(&tcp_), &lfd) == 0) {
+        int on = 1;
+        setsockopt(static_cast<int>(lfd), IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+      }
+    }
+#endif
 #if defined(__linux__)
     }
 #endif
 
-    // Start the idle-connection sweep. Granularity adapts to the configured timeout (capped at 4s, floored at 250ms) so short timeouts still fire promptly while the common 120s default sweeps cheaply. Unref'd so the timer alone never keeps the process alive - the listener (and any active connection) does that.
-    if ((limits_.idleTimeoutMs > 0 || limits_.requestTimeoutMs > 0 ||
-         limits_.responseTimeoutMs > 0) &&
-        !sweepActive_) {
-      // Granularity follows the shortest enabled timeout.
-      uint64_t shortest = limits_.idleTimeoutMs;
-      if (limits_.requestTimeoutMs > 0 &&
-          (shortest == 0 || limits_.requestTimeoutMs < shortest))
+    // Start the connection sweep. Granularity adapts to the shortest enabled
+    // timeout (capped at 4s, floored at 250ms) so short timeouts still fire
+    // promptly. The lingering-close deadline (kLingerMs) is always enabled,
+    // so the sweep always runs; unref'd, so the timer alone never keeps the
+    // process alive - the listener (and any active connection) does that.
+    if (!sweepActive_) {
+      uint64_t shortest = kLingerMs;
+      if (limits_.idleTimeoutMs > 0 && limits_.idleTimeoutMs < shortest)
+        shortest = limits_.idleTimeoutMs;
+      if (limits_.requestTimeoutMs > 0 && limits_.requestTimeoutMs < shortest)
         shortest = limits_.requestTimeoutMs;
-      if (limits_.responseTimeoutMs > 0 &&
-          (shortest == 0 || limits_.responseTimeoutMs < shortest))
+      if (limits_.responseTimeoutMs > 0 && limits_.responseTimeoutMs < shortest)
         shortest = limits_.responseTimeoutMs;
       uint64_t half = shortest / 2;
       sweepMs_ = half < 250 ? 250 : (half > 4000 ? 4000 : half);
@@ -1248,7 +1269,7 @@ class Server {
         queueNotify(c->reqId, kNotifyWritable);
       }
     }
-    if (c->closeAfterFlush && c->pendingWrites == 0) doClose(c);
+    if (c->closeAfterFlush && c->pendingWrites == 0) closeAfterResponse(c);
   }
 
   // Response for the active request is fully flushed: either close or move on to the next pipelined request.
@@ -1259,7 +1280,7 @@ class Server {
     c->active = false;
 
     if (!c->reqKeepAlive) {
-      if (c->pendingWrites == 0) doClose(c);
+      if (c->pendingWrites == 0) closeAfterResponse(c);
       else c->closeAfterFlush = true;
       return;
     }
@@ -1401,7 +1422,7 @@ class Server {
     c->corked = false;
     if (!c->closing) flushCork(c);
     if (c->batchClose && !c->closing) {
-      if (c->pendingWrites == 0) doClose(c);
+      if (c->pendingWrites == 0) closeAfterResponse(c);
       else c->closeAfterFlush = true;
     }
   }
@@ -1527,7 +1548,7 @@ class Server {
     c->corked = false;
     if (!c->closing) flushCork(c);
     if (c->batchClose && !c->closing) {
-      if (c->pendingWrites == 0) doClose(c);
+      if (c->pendingWrites == 0) closeAfterResponse(c);
       else c->closeAfterFlush = true;
     }
   }
@@ -1552,7 +1573,9 @@ class Server {
       uv_close(reinterpret_cast<uv_handle_t*>(&c->handle), onCloseFree);
       return;
     }
-    uv_tcp_nodelay(&c->handle, 1);
+#if defined(_WIN32)
+    uv_tcp_nodelay(&c->handle, 1);  // POSIX inherits it from the listener (listen())
+#endif
     s->attachConnection(c);
     uv_read_start(reinterpret_cast<uv_stream_t*>(&c->handle), onAlloc, onRead);
   }
@@ -1630,6 +1653,11 @@ class Server {
   // parser/pending/TLS/WS layers copy what they keep (see onAlloc).
   void onTransportData(Connection* c, char* base, size_t nread) {
     Server* s = this;
+    // Lingering close: the exchange is over and our FIN is out; whatever the
+    // peer still writes (typically a request it sent before seeing the FIN)
+    // is read and dropped so the kernel never answers it with a RST. The
+    // peer's own FIN (onTransportEof) or kLingerMs ends the connection.
+    if (c->lingering) return;
     c->idleTicks = 0;  // activity: reset the idle sweep counter
 
     if (c->tls) {
@@ -1843,6 +1871,62 @@ class Server {
     writeOutView(c, out, /*terminal=*/true);
   }
 
+  // Orderly end of the last HTTP exchange on a connection (Connection: close,
+  // HTTP/1.0, or an error response): half-close and linger, never an
+  // immediate close(). The FIN normally rode with the response bytes
+  // (tTryWriteLast); a last write that went the queued way gets it here once
+  // the queue has drained. The socket then stays open, its input discarded,
+  // until the peer's FIN (or kLingerMs, onSweep) - RFC 9112 §9.6: a server
+  // that closes outright answers a request the peer had already written
+  // with a RST, and that RST can discard the response still sitting unread
+  // in the peer's buffer. Measured with autocannon (which writes the next
+  // request the moment a response completes, before it has seen the FIN):
+  // the immediate close reconnected twice per cycle and ran at a quarter of
+  // the rate of servers that linger. TLS keeps its close_notify sequence and
+  // WebSockets their Close-frame sequence (doClose).
+  void closeAfterResponse(Connection* c) {
+    if (c->closing || c->lingering) return;
+    if (c->tls || c->isWebSocket) {
+      doClose(c);
+      return;
+    }
+    if (!c->finSent) {
+#if defined(__linux__)
+      if (kind_ == TransportKind::Uring) {
+        // Nothing of ours is queued for this fd (pendingWrites == 0): the FIN
+        // can go synchronously.
+        if (c->ring.fd < 0 || ::shutdown(c->ring.fd, SHUT_WR) != 0) {
+          doClose(c);
+          return;
+        }
+        c->finSent = true;
+      } else
+#endif
+      {
+        c->shutdownReq.data = c;
+        if (uv_shutdown(&c->shutdownReq, reinterpret_cast<uv_stream_t*>(&c->handle), onShutdownDone) != 0) {
+          doClose(c);
+          return;
+        }
+        // finSent is set by onShutdownDone; the connection lingers meanwhile.
+      }
+    }
+    c->lingering = true;
+    c->lingerTicks = 0;
+  }
+
+  static void onShutdownDone(uv_shutdown_t* req, int status) {
+    Connection* c = static_cast<Connection*>(req->data);
+    // A teardown that raced the shutdown cancels it (UV_ECANCELED) before the
+    // close callback frees the Connection, so `c` is still alive here.
+    if (c->closing) return;
+    if (status == 0) {
+      c->finSent = true;
+      return;
+    }
+    c->server->doClose(c);  // peer already gone: nothing left to linger for
+  }
+
   void abortConnection(Connection* c) {
     // Hard teardown (read error/EOF/write error): drop the socket now. Any in-flight writes reference WriteReq buffers, not the connection body, and their completion callbacks tolerate a closing handle.
     doClose(c);
@@ -1933,11 +2017,20 @@ class Server {
         (s->limits_.requestTimeoutMs + s->sweepMs_ - 1) / s->sweepMs_);
     const uint32_t respLimit = static_cast<uint32_t>(
         (s->limits_.responseTimeoutMs + s->sweepMs_ - 1) / s->sweepMs_);
+    uint32_t lingerLimit = static_cast<uint32_t>((kLingerMs + s->sweepMs_ - 1) / s->sweepMs_);
+    if (lingerLimit == 0) lingerLimit = 1;
     std::vector<Connection*> stale;
     std::vector<Connection*> overdue;
     std::vector<Connection*> stalled;
     for (Connection* c : s->conns_) {
       if (c->closing) continue;
+      // Lingering close (closeAfterResponse): the peer has our FIN and owes
+      // its own; one that never closes is cut at the deadline. Nothing of
+      // ours is queued on such a connection, so no other timeout applies.
+      if (c->lingering) {
+        if (++c->lingerTicks >= lingerLimit) stale.push_back(c);
+        continue;
+      }
       // Response-delivery deadline (slow-read DoS defense). The `active`
       // exemption below is right for a handler that hasn't answered yet, but
       // once bytes are QUEUED the engine owns them: a peer that stops reading
@@ -2047,19 +2140,27 @@ class Server {
     }
     if (fd < 0) return tTryWrite(c, p, n);
 #if defined(__APPLE__)
-    // TCP_NOPUSH holds the bytes; the EOF then forces tcp_output to emit
-    // data + FIN as one segment (without it, XNU pushes the data segment
-    // first and the FIN follows on its own, and a fast peer still closes
-    // first ~5% of the time). The socket is closing: no need to clear it.
+    // TCP_NOPUSH holds the bytes (a segment shorter than the MSS is not
+    // pushed while it is set); with the option cleared again, shutdown(SHUT_WR)
+    // queues the FIN and runs tcp_output, which emits the held data + FIN as
+    // ONE segment. Without the hold XNU pushes the data segment first and the
+    // FIN follows on its own, and a fast peer still closes first ~5% of the
+    // time. Two XNU facts shape the sequence: clearing TCP_NOPUSH does not
+    // by itself run tcp_output (the bytes would sit until close()), and a
+    // send(MSG_EOF) under TCP_NOPUSH stays held for the same reason - both
+    // were masked by the immediate close() this path used to end with; the
+    // socket now lingers open (closeAfterResponse).
     int on = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NOPUSH, &on, sizeof(on));
-    ssize_t r = ::send(fd, p, n, MSG_EOF | MSG_DONTWAIT);
+    ssize_t r = ::send(fd, p, n, MSG_DONTWAIT);
+    int off = 0;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NOPUSH, &off, sizeof(off));
     if (r == static_cast<ssize_t>(n)) {
+      ::shutdown(fd, SHUT_WR);
       c->finSent = true;
-    } else {
-      int off = 0;  // short send: the remainder goes the queued way; let it flow
-      ::setsockopt(fd, IPPROTO_TCP, TCP_NOPUSH, &off, sizeof(off));
     }
+    // short send: the remainder goes the queued way, uncorked; its completion
+    // sends the FIN (closeAfterResponse).
 #else
     ssize_t r = ::send(fd, p, n, MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL);
     if (r == static_cast<ssize_t>(n)) {
@@ -2745,6 +2846,11 @@ class Server {
   bool tlsEnabled_ = false;  // set via adoptTls() before listen()
   uv_timer_t sweepTimer_;
   uint64_t sweepMs_ = 4000;  // idle-sweep granularity (set in listen())
+  // Lingering-close deadline: how long a half-closed connection waits for the
+  // peer's FIN before it is closed anyway (Apache's lingering_close budget;
+  // nginx defaults to 5 s). Loopback peers close within a millisecond; the
+  // deadline only ever bounds a peer that never does.
+  static constexpr uint64_t kLingerMs = 2000;
   bool sweepActive_ = false;
   std::unordered_set<Connection*> conns_;  // all live connections (for close())
   TemplateStore templates_;

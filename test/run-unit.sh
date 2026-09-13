@@ -18,6 +18,14 @@ echo "response-template unit tests ..."
 $CXX -std=c++20 -O2 "$DIR/response-template-unit.cpp" -o /tmp/moro_tpltest
 /tmp/moro_tpltest
 
+case "$(uname -s)" in
+  Linux|Darwin)
+    echo "socket-option unit tests ..."
+    $CXX -std=c++20 -O2 "$DIR/sockopt-unit.cpp" -o /tmp/moro_sockopttest
+    /tmp/moro_sockopttest
+    ;;
+esac
+
 echo "io_uring fake-kernel unit tests ..."
 $CXX -std=c++20 -O2 "$DIR/uring-fake-unit.cpp" -o /tmp/moro_uringfaketest
 /tmp/moro_uringfaketest
