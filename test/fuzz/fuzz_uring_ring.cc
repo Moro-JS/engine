@@ -15,6 +15,7 @@
 //   test/fuzz/fuzz_uring_ring.cc -o /tmp/moro_fuzz_uring
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <vector>
@@ -50,7 +51,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   if (ring.open(sqEntries, kSetupFlags, cqEntries) != 0) return 0;
   BufRing<FakeSys> bufs;
   const bool haveBufs = bufs.init(ring, 3, 8, 64) == 0;
-  if (!haveBufs) __builtin_trap();
+  if (!haveBufs) std::abort();
 
   uint64_t nextId = 1;
   unsigned handedOut = 0;   // SQEs handed out since the last enter
@@ -60,7 +61,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
   auto reapAll = [&]() {
     ring.forEachCqe([&](const abi::io_uring_cqe& c) {
-      if (expectedOrder.empty() || expectedOrder.front() != c.user_data) __builtin_trap();
+      if (expectedOrder.empty() || expectedOrder.front() != c.user_data) std::abort();
       expectedOrder.pop_front();
       reaped++;
     });
@@ -73,14 +74,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
       case 1: {  // hand out an SQE
         abi::io_uring_sqe* s = ring.sqe();
         if (s) {
-          if (handedOut >= ring.sqEntries()) __builtin_trap();  // over-issue
+          if (handedOut >= ring.sqEntries()) std::abort();  // over-issue
           prepNop(s);
           s->user_data = nextId++;
           handedOut++;
         } else if (ring.pending() < ring.sqEntries()) {
           // sqe() may only refuse when the ring is genuinely full of
           // unsubmitted-or-unconsumed entries.
-          __builtin_trap();
+          std::abort();
         }
         break;
       }
@@ -88,9 +89,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         st.maxSubmitPerEnter = 1u + (op >> 3);
         const unsigned before = ring.pending();
         int r = ring.enter(0, (op & 8) ? abi::IORING_ENTER_GETEVENTS : 0);
-        if (r < 0) __builtin_trap();
-        if (static_cast<unsigned>(r) > before) __builtin_trap();
-        if (ring.pending() != before - static_cast<unsigned>(r)) __builtin_trap();
+        if (r < 0) std::abort();
+        if (static_cast<unsigned>(r) > before) std::abort();
+        if (ring.pending() != before - static_cast<unsigned>(r)) std::abort();
         handedOut = ring.pending();
         break;
       }
@@ -100,21 +101,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
       case 4: {  // recycle a buffer
         const uint16_t bid = static_cast<uint16_t>((op >> 3) & 7);
         const uint8_t* p = bufs.at(bid);
-        if (p < bufs.at(0) || p >= bufs.at(0) + 8 * 64) __builtin_trap();
+        if (p < bufs.at(0) || p >= bufs.at(0) + 8 * 64) std::abort();
         bufs.push(bid);
         pushedSinceMove++;
         break;
       }
       case 5:  // publish pushed buffers
         bufs.publish();
-        if (static_cast<uint16_t>(bufTail + pushedSinceMove) != bufs.tail()) __builtin_trap();
+        if (static_cast<uint16_t>(bufTail + pushedSinceMove) != bufs.tail()) std::abort();
         bufTail = bufs.tail();
         pushedSinceMove = 0;
         break;
       case 6: {  // drain everything: flush + GETEVENTS until quiescent
         st.maxSubmitPerEnter = 1u << 30;
         for (int i = 0; i < 8 && (ring.pending() || ring.cqOverflowed() || ring.cqReady()); i++) {
-          if (ring.enter(0, abi::IORING_ENTER_GETEVENTS) < 0) __builtin_trap();
+          if (ring.enter(0, abi::IORING_ENTER_GETEVENTS) < 0) std::abort();
           reapAll();
         }
         handedOut = ring.pending();
@@ -125,14 +126,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     }
   }
 
-  // Final drain: nothing may be lost or duplicated.
+  // Final drain: nothing may be lost or duplicated. A GETEVENTS round can
+  // surface at most cqEntries overflowed completions (the smallest CQ here
+  // is 2 slots), so the bound grows with what is still owed - a fixed 16
+  // rounds asserted "lost" on an input that had merely queued 35 overflow
+  // entries (corpus/uring/regress-cq-overflow-drain.raw).
   st.maxSubmitPerEnter = 1u << 30;
-  for (int i = 0; i < 16 && (ring.pending() || ring.cqOverflowed() || ring.cqReady()); i++) {
-    if (ring.enter(0, abi::IORING_ENTER_GETEVENTS) < 0) __builtin_trap();
+  const int drainRounds = 16 + static_cast<int>(expectedOrder.size() + ring.pending());
+  for (int i = 0; i < drainRounds && (ring.pending() || ring.cqOverflowed() || ring.cqReady()); i++) {
+    if (ring.enter(0, abi::IORING_ENTER_GETEVENTS) < 0) std::abort();
     reapAll();
   }
-  if (!expectedOrder.empty()) __builtin_trap();
-  if (reaped != static_cast<uint64_t>(st.enterCalls >= 0 ? reaped : 0)) __builtin_trap();
+  if (!expectedOrder.empty()) std::abort();
   bufs.destroy(ring);
   ring.close();
   FakeSys::reset();

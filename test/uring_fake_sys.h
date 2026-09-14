@@ -96,7 +96,14 @@ struct FakeSys {
     State& s = st();
     const uint32_t head = loadAcquire(s.cqHead);
     const uint32_t tail = *s.cqTail;
-    if (tail - head >= s.cqEntries) {
+    // The kernel keeps completion order across an overflow: while its
+    // overflow list is non-empty, every new CQE joins that list even if the
+    // ring has room again (io_cqe_cache_refill refuses the ring while the
+    // overflow bit is set), and the list is flushed in order on the next
+    // GETEVENTS. Posting straight into a freed slot here would let a newer
+    // completion overtake the overflowed ones - the ordering bug the ring
+    // fuzzer caught in this fake (corpus/uring/regress-cq-overflow-order.raw).
+    if (tail - head >= s.cqEntries || !s.overflowed.empty()) {
       s.overflowed.push_back(c);
       (*s.cqOverflow)++;
       *s.sqFlags |= abi::IORING_SQ_CQ_OVERFLOW;

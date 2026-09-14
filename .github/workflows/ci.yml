@@ -392,7 +392,7 @@ jobs:
       - name: Build engine for this Node ABI
         run: node tools/build.mjs
       - name: Run h1spec against the engine
-        run: sh test/h1spec/run.sh
+        run: bash test/h1spec/run.sh  # the script uses bash (set -o pipefail); sh is dash on Ubuntu
 
   # Windows (MSVC): build.mjs downloads the per-version node.lib
   # (SHASUMS-verified) and compiles with cl.exe (/DELAYLOAD:node.exe + the
