@@ -141,7 +141,12 @@ describe('worker_threads', { skip }, () => {
     }, 5000);
   });
 
-  it('two workers share one port with reusePort and both serve', T, async () => {
+  // reusePort is SO_REUSEPORT, which Windows does not have: the option is
+  // ignored there and a second listener on the port gets EADDRINUSE (the
+  // worker throws, so this test would wait for a 'listening' that never
+  // comes). MoroJS gates thread clustering to POSIX for the same reason.
+  const reusePortSkip = process.platform === 'win32' && 'reusePort is POSIX-only (no SO_REUSEPORT on Windows)';
+  it('two workers share one port with reusePort and both serve', { ...T, skip: reusePortSkip }, async () => {
     const port = await freePort();
     const src = workerSource(
       `
