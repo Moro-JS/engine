@@ -2162,6 +2162,12 @@ class Server {
     // short send: the remainder goes the queued way, uncorked; its completion
     // sends the FIN (closeAfterResponse).
 #else
+    // Measured alternative (2026-09-13, Linux container, oha + bombardier,
+    // three rotated rounds): sending the data segment first and the FIN as
+    // its own segment right behind it - so a fast peer usually closes first
+    // and holds the TIME_WAIT - was 15-25% SLOWER on connections per second
+    // than this coalesced form (a simultaneous close costs both sides). Keep
+    // MSG_MORE + shutdown.
     ssize_t r = ::send(fd, p, n, MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL);
     if (r == static_cast<ssize_t>(n)) {
       ::shutdown(fd, SHUT_WR);
