@@ -1,7 +1,7 @@
 // Deferred-notification suite for @morojs/engine.
 //
 // onAborted / onWritable are delivered on a later loop turn, never
-// re-entrantly from inside a binding call. Before 1.2 a write failure or a
+// re-entrantly from inside a binding call. Before 1.1.6 a write failure or a
 // responseBackpressureLimit trip inside respond()/write() reached onAborted
 // synchronously, in the middle of the very call that failed - which is also
 // what makes those entry points ineligible for V8 fast API calls (a fast

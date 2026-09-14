@@ -11,7 +11,7 @@
 // Hard rules for a fast target (V8's contract): no V8 API calls, no JS heap
 // allocation, no GC, no re-entry into JS, no exceptions. Every function below
 // is pure C++: a registry lookup, then Server::respond/write/end/... - which
-// after 1.2's deferred-notification change can no longer reach a JS callback
+// after 1.1.6's deferred-notification change can no longer reach a JS callback
 // synchronously (see Server::queueNotify). That is the precondition this file
 // exists on; it is enforced at install time (fast calls are refused when
 // MORO_ENGINE_NOTIFY=sync).

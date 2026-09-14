@@ -365,7 +365,7 @@ class Server {
   // libuv - silently, because the transport is never a requirement.
   // libuv unless MORO_ENGINE_TRANSPORT=uring asks for io_uring (then the
   // probe decides, and any refusal falls back to libuv with the reason).
-  // Opt-in, not auto-selected, in 1.2: measured on the same binary and box
+  // Opt-in, not auto-selected, in 1.1.6: measured on the same binary and box
   // (docs/DESIGN.md, "io_uring measurements"), io_uring halves the syscalls
   // per request but costs more CPU per completion at low batching - it wins
   // keep-alive at 64 and 512 connections, loses at 256, loses connection
@@ -400,7 +400,7 @@ class Server {
   // Notification delivery mode. Deferred (the default) hands onAborted /
   // onWritable to the binding from a uv_async callback, so no binding entry
   // point can re-enter JS - the precondition for V8 fast API calls. `sync`
-  // restores the pre-1.2 re-entrant delivery for bisecting
+  // restores the pre-1.1.6 re-entrant delivery for bisecting
   // (MORO_ENGINE_NOTIFY=sync); the binding then never installs fast calls.
   void setDeferredNotify(bool deferred) { notifyDeferred_ = deferred; }
   bool deferredNotify() const { return notifyDeferred_; }

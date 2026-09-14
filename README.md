@@ -4,11 +4,11 @@ MoroJS's native HTTP engine: a Moro-authored C++ core with raw-V8 bindings,
 built for maximum throughput with an API shaped exactly for how MoroJS serves
 requests. MIT licensed.
 
-**Status: GA (1.2.x).** HTTP/1.1 + WebSocket cores (with permessage-deflate),
+**Status: GA (1.1.x).** HTTP/1.1 + WebSocket cores (with permessage-deflate),
 in-process TLS/HTTPS/WSS, fully configurable limits, hardening, sanitizers,
 fuzzing, and the release pipeline are all shipped (M0–M6 complete). 1.1.0 added
 pipelined response corking and a zero-allocation hot path (~3.7× pipelined
-throughput vs 1.0.0). 1.2.0 takes on the JS boundary itself: prepared response
+throughput vs 1.0.0). 1.1.6 takes on the JS boundary itself: prepared response
 templates and static routes, V8 fast API calls on the hot entry points,
 deferred `onAborted`/`onWritable` delivery, zero-copy string bodies, a
 teardown hook that makes the engine safe inside `worker_threads` (MoroJS

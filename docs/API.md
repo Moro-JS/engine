@@ -22,7 +22,7 @@ serve(callbacks: {
   // returned; isAborted(reqId) is already true inside onAborted). The one
   // exception: close() delivers the onAborted of every in-flight request
   // synchronously, before close() returns. capabilities.asyncNotify; the
-  // MORO_ENGINE_NOTIFY=sync env var restores the pre-1.2 re-entrant delivery
+  // MORO_ENGINE_NOTIFY=sync env var restores the pre-1.1.6 re-entrant delivery
   // for bisecting (probe().notify reports which mode is active).
 }, options?: {
   maxBodySize?: number;        // default 10MB; larger bodies 413 natively
@@ -238,7 +238,7 @@ fails its write (or trips `responseBackpressureLimit`) returns first, and the
 abort arrives from a `uv_async` callback afterwards. `close()` is the one
 exception — it delivers every pending `onAborted` synchronously before
 returning, so a caller may drop its per-request routing state right after.
-`MORO_ENGINE_NOTIFY=sync` (diagnostics only) restores the pre-1.2 re-entrant
+`MORO_ENGINE_NOTIFY=sync` (diagnostics only) restores the pre-1.1.6 re-entrant
 delivery; `probe().notify` reports the mode.
 
 One case is re-entrant rather than driven by a fresh I/O event:
@@ -349,7 +349,7 @@ sequential dispatch is proven by `test/batch-dispatch.test.mjs`.
 ## I/O transports
 
 Everything above runs on one of two transports, chosen once per process.
-libuv is the default everywhere; io_uring is opt-in in 1.2
+libuv is the default everywhere; io_uring is opt-in in 1.1.6
 (`MORO_ENGINE_TRANSPORT=uring`), for the reasons measured in
 `docs/DESIGN.md` ("io_uring measurements"):
 

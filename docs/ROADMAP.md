@@ -105,7 +105,7 @@ UBSan lanes, an in-repo h1spec job, and a strict PGO cycle.
 
 ## io_uring: from opt-in to default
 
-1.2 ships the io_uring transport opt-in (`MORO_ENGINE_TRANSPORT=uring`);
+1.1.6 ships the io_uring transport opt-in (`MORO_ENGINE_TRANSPORT=uring`);
 see `docs/DESIGN.md` "io_uring measurements" for the numbers that keep libuv
 the default. Work that could flip the default, in order of expected payoff:
 

@@ -1579,7 +1579,7 @@ static void Initialize(Local<Object> exports, Local<Value> module,
   Isolate* iso = Isolate::GetCurrent();
 
   // Diagnostics-only: MORO_ENGINE_NOTIFY=sync restores re-entrant
-  // onAborted/onWritable delivery (pre-1.2 behaviour) for bisecting.
+  // onAborted/onWritable delivery (pre-1.1.6 behaviour) for bisecting.
   const char* notifyEnv = std::getenv("MORO_ENGINE_NOTIFY");
   const char* batchEnv = std::getenv("MORO_ENGINE_BATCH");
   g_batchEnabled = !(batchEnv && std::strcmp(batchEnv, "0") == 0);
