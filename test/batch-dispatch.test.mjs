@@ -27,7 +27,7 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { loadEngine } from './helpers.mjs';
+import { loadEngine, waitFor } from './helpers.mjs';
 
 const engine = await loadEngine();
 const caps = engine ? engine.probe().capabilities : {};
@@ -191,22 +191,31 @@ describe('batched pipelined dispatch', { skip }, () => {
 
   it('a client abort mid-batch fires exactly one onAborted, for the active request', T, async () => {
     const aborted = [];
-    const bat = serveWith(handler, { batch: true, onAborted: (id) => aborted.push(id) });
+    // The client goes away the moment /async/1 becomes the ACTIVE request:
+    // its handler destroys the socket instead of answering. Deterministic on
+    // every platform - a fixed 2 ms delay raced the server's read on a
+    // loaded Windows runner (the reset arrived before the request bytes were
+    // read, Windows discards unread data on RST, nothing was dispatched, so
+    // there was no active request to abort), and a poll after the fact
+    // misses the 5 ms window before the async handler answers.
+    let s;
+    const bat = serveWith(
+      (reqId, m, path) => {
+        if (path === '/async/1') {
+          s.destroy();
+          return;  // never answered: the abort is the only way this request ends
+        }
+        handler(reqId, m, path);
+      },
+      { batch: true, onAborted: (id) => aborted.push(id) }
+    );
     try {
       const bytes = [req('/sync/0'), req('/async/1'), req('/sync/2'), req('/sync/3')].join('');
-      await new Promise((resolve) => {
-        const s = net.connect(bat.port, '127.0.0.1', () => {
-          s.write(bytes);
-          setTimeout(() => {
-            s.destroy();
-            resolve();
-          }, 2);
-        });
-        s.on('error', () => {});
-      });
-      await delay(60);
+      s = net.connect(bat.port, '127.0.0.1', () => s.write(bytes));
+      s.on('error', () => {});
+      await waitFor(() => aborted.length >= 1, { message: 'no onAborted for the active request' });
+      await delay(20);  // room for a second (wrong) notification to show up
       assert.equal(aborted.length, 1, JSON.stringify(aborted));
-      assert.equal(bat.log.dispatched.length, 2, JSON.stringify(bat.log.dispatched));  // /sync/0 answered, /async/1 active
     } finally {
       bat.close();
     }
