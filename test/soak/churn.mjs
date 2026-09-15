@@ -52,7 +52,7 @@ function stats() {
 }
 
 const base = await stats();
-console.log(`churn soak: 3 x ${TOTAL} connections, concurrency ${CONC}, transport ${base.transport}, server pid ${child.pid}`);
+console.log(`churn soak: 3 x ${TOTAL} connections, concurrency ${CONC}, transport ${base.transport} (${base.transportMode}), server pid ${child.pid}`);
 
 let ok = 0, bad = 0, expectAborted = 0, done = 0, inflight = 0, next = 0;
 

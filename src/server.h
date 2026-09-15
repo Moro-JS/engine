@@ -2391,6 +2391,14 @@ class Server {
 
     static void onPrepare(uv_prepare_t* h) {
       UringLoop* u = static_cast<UringLoop*>(h->data);
+      // Never block with work the kernel is holding for us: deferred task
+      // work (DEFER_TASKRUN runs it only inside our own enter, and a wake is
+      // a hint, not a contract) or completions already posted. One flag read
+      // per loop turn; the reap it triggers is the same one a wake runs.
+      if (u->ring.taskWorkPending() || u->ring.cqReady()) {
+        u->reap();
+        return;
+      }
       // Anything queued outside a reap round (sweep-timer closes, async JS
       // responses that took the queued path) goes to the kernel before the
       // loop blocks.

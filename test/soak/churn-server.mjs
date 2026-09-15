@@ -18,7 +18,7 @@ const sid = engine.serve({
   onRequest(reqId, _m, path) {
     if (path === '/__stats') {
       if (globalThis.gc) globalThis.gc();
-      const stats = { rss: process.memoryUsage.rss(), fds: fdCount(), served, aborted, transport: engine.probe().transport ?? 'uv' };
+      const stats = { rss: process.memoryUsage.rss(), fds: fdCount(), served, aborted, transport: engine.probe().transport ?? 'uv', transportMode: engine.probe().transportMode ?? 'uv' };
       engine.respond(reqId, 200, ['content-type', 'application/json'], JSON.stringify(stats));
       return;
     }
