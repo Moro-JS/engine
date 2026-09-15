@@ -9,7 +9,7 @@
     "build": "node tools/build.mjs",
     "build:all": "node tools/build.mjs --all",
     "test": "npm run test:unit && npm run test:smoke && npm run test:suites",
-    "test:suites": "node --test test/conformance.test.mjs test/conformance-edge.test.mjs test/conformance-hardening.test.mjs test/conformance-regression.test.mjs test/ws-conformance.test.mjs test/limits-conformance.test.mjs test/tls-conformance.test.mjs test/tls-hardening.test.mjs test/ws-deflate-conformance.test.mjs test/static-routes.test.mjs test/linger-close.test.mjs test/notify-deferred.test.mjs test/worker-threads.test.mjs test/templates.test.mjs test/wire-parity.test.mjs test/fast-api.test.mjs test/probe-transport.test.mjs test/transport-parity.test.mjs test/batch-dispatch.test.mjs",
+    "test:suites": "node --test test/conformance.test.mjs test/conformance-edge.test.mjs test/conformance-hardening.test.mjs test/conformance-regression.test.mjs test/ws-conformance.test.mjs test/limits-conformance.test.mjs test/tls-conformance.test.mjs test/tls-hardening.test.mjs test/ws-deflate-conformance.test.mjs test/static-routes.test.mjs test/linger-close.test.mjs test/notify-deferred.test.mjs test/worker-threads.test.mjs test/templates.test.mjs test/wire-parity.test.mjs test/fast-api.test.mjs test/probe-transport.test.mjs test/transport-parity.test.mjs test/batch-dispatch.test.mjs test/callback-scope.test.mjs",
     "test:unit": "sh test/run-unit.sh",
     "test:smoke": "node test/smoke.mjs",
     "test:conformance": "node --test test/conformance.test.mjs",

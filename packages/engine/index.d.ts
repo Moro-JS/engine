@@ -30,6 +30,11 @@ export interface EngineCapabilities {
   /** prepareResponse() / releaseTemplates() / respondPrepared() /
    *  respondPreparedEmpty() / writeHeadPrepared() / endWith() are available. */
   responseTemplates: boolean;
+  /** Every callback into JS (onRequest, onRequestBatch, onAborted, onWritable,
+   *  the WebSocket callbacks) runs inside a Node callback scope, so
+   *  process.nextTick callbacks and microtasks queued during dispatch run
+   *  when the callback returns, as they do after Node's own I/O callbacks. */
+  callbackScope: boolean;
   /** onAborted / onWritable are delivered on a later loop turn - never
    *  re-entrantly from inside respond()/writeHead()/write()/end(). close()
    *  still delivers pending onAborted calls before it returns. False only
@@ -90,6 +95,11 @@ export interface EngineProbeResult {
   transport?: 'uv' | 'uring';
   /** Why the transport is not io_uring ('ok' when it is). */
   transportReason?: string;
+  /** 'uv', or the io_uring ring mode in use: 'defer-taskrun' (completions run
+   *  as one batch inside the engine's own io_uring_enter, woken through a
+   *  registered eventfd) or 'coop-taskrun' (the 1.1.6 mode). The probe tries
+   *  defer first; MORO_ENGINE_URING_TASKRUN=coop|defer pins one. */
+  transportMode?: 'uv' | 'defer-taskrun' | 'coop-taskrun';
   /** Per-thread fast/slow hit counters per hot entry point - present only when
    *  MORO_ENGINE_FASTCALL_STATS=1 was set when the addon loaded (test/CI proof
    *  that the fast path is taken). */

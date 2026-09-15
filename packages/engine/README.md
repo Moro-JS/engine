@@ -78,7 +78,11 @@ once per process by a feature check and a self-test, and anywhere it is
 unavailable (kernels before 6.1, gVisor, containers under Docker's default
 seccomp profile, which blocks `io_uring_setup`) the engine silently stays on
 libuv. Neither transport changes a byte on the wire. `probe().transport`
-reports which one is live and `probe().transportReason` why.
+reports which one is live, `probe().transportReason` why, and
+`probe().transportMode` which io_uring ring mode is running: `defer-taskrun`
+(completions run as one batch inside the engine's own `io_uring_enter`, woken
+through a registered eventfd) or `coop-taskrun` (the 1.1.6 mode, also
+selectable with `MORO_ENGINE_URING_TASKRUN=coop`).
 
 ## License
 

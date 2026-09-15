@@ -63,6 +63,9 @@ struct JsServer {
   Global<Function> onWsMessage;
   Global<Function> onWsClose;
   Server* server;
+  // The resource object of the Node callback scope every trampoline into JS
+  // opens (CallbackScopeFor): one per server, no per-request allocation.
+  Global<Object> asyncResource;
   uint32_t id = 0;
   // Set by the environment cleanup hook: the isolate is being torn down and
   // JS may no longer run, so every callback into JS becomes a no-op.
@@ -569,6 +572,24 @@ static void buildHeaders(Isolate* iso, Local<Context> ctx, Local<Value> v,
 
 static void reportCaught(Isolate* iso, TryCatch& tc, const char* where);
 
+// Every trampoline into JS runs inside a Node callback scope - the scope Node
+// itself opens around its own I/O callbacks. When the OUTERMOST scope closes,
+// Node runs the process.nextTick queue and drains V8's microtask queue.
+// Without it, a continuation the handler queued - an `await` on an already
+// settled promise, a `.then` chain, a framework's async not-found path - sat
+// in the queue until some later Node-managed callback ran, which on a quiet
+// server is whatever timer fires next: seconds. Nested scopes (a WS open
+// delivered from inside upgradeToWebSocket(), an onAborted delivered from
+// inside close()) drain nothing themselves; the outermost one does. Cost per
+// call: an async-context push/pop and, with an empty queue, one cheap check.
+struct CallbackScopeFor {
+  node::CallbackScope scope;
+  CallbackScopeFor(JsServer* js, Isolate* iso)
+      : scope(iso,
+              js->asyncResource.IsEmpty() ? Object::New(iso) : js->asyncResource.Get(iso),
+              node::async_context{0, 0}) {}
+};
+
 static void invokeJs(JsServer* js, Global<Function>& fn, uint32_t reqId,
                      bool withExtra, int32_t methodIdx, const std::string& path) {
   if (fn.IsEmpty() || js->tearingDown) return;
@@ -576,6 +597,7 @@ static void invokeJs(JsServer* js, Global<Function>& fn, uint32_t reqId,
   HandleScope scope(iso);
   Local<Context> ctx = js->context.Get(iso);
   Context::Scope ctxScope(ctx);
+  CallbackScopeFor cb(js, iso);
   TryCatch tryCatch(iso);
 
   Local<Function> f = fn.Get(iso);
@@ -600,10 +622,10 @@ static void invokeJs(JsServer* js, Global<Function>& fn, uint32_t reqId,
         Integer::New(iso, methodIdx),
         pathStr,
     };
-    (void)f->Call(ctx, ctx->Global(), 3, argv);
+    if (f->Call(ctx, ctx->Global(), 3, argv).IsEmpty()) { /* threw: reported below */ }
   } else {
     Local<Value> argv[1] = {Integer::NewFromUnsigned(iso, reqId)};
-    (void)f->Call(ctx, ctx->Global(), 1, argv);
+    if (f->Call(ctx, ctx->Global(), 1, argv).IsEmpty()) { /* threw: reported below */ }
   }
   // Swallow handler exceptions - one bad request must not tear down the loop.
   if (tryCatch.HasCaught()) {
@@ -670,6 +692,7 @@ static void cbOnRequestBatch(void* user, Connection* c, uint32_t count) {
   HandleScope scope(iso);
   Local<Context> ctx = js->context.Get(iso);
   Context::Scope ctxScope(ctx);
+  CallbackScopeFor cb(js, iso);
   ensureBatchBuffers(js, iso, ctx);
   if (count > Server::kMaxStaged) count = Server::kMaxStaged;
   uint32_t* d = js->desc;
@@ -684,7 +707,7 @@ static void cbOnRequestBatch(void* user, Connection* c, uint32_t count) {
   }
   TryCatch tryCatch(iso);
   Local<Value> argv[1] = {Integer::NewFromUnsigned(iso, count)};
-  (void)js->onRequestBatch.Get(iso)->Call(ctx, ctx->Global(), 1, argv);
+  if (js->onRequestBatch.Get(iso)->Call(ctx, ctx->Global(), 1, argv).IsEmpty()) { /* threw: reported below */ }
   reportCaught(iso, tryCatch, "onRequestBatch");
 }
 // Delivered from Server::drainNotifications (a uv_async callback, or
@@ -714,9 +737,10 @@ static void cbOnWsOpen(void* user, Connection* c, const std::string& path) {
   HandleScope scope(iso);
   Local<Context> ctx = js->context.Get(iso);
   Context::Scope cs(ctx);
+  CallbackScopeFor cb(js, iso);
   TryCatch tc(iso);
   Local<Value> argv[2] = {Integer::NewFromUnsigned(iso, c->wsId), str(iso, path)};
-  (void)js->onWsOpen.Get(iso)->Call(ctx, ctx->Global(), 2, argv);
+  if (js->onWsOpen.Get(iso)->Call(ctx, ctx->Global(), 2, argv).IsEmpty()) { /* threw: reported below */ }
   reportCaught(iso, tc, "onWsOpen");
 }
 
@@ -729,6 +753,7 @@ static void cbOnWsMessage(void* user, Connection* c, const char* data,
   HandleScope scope(iso);
   Local<Context> ctx = js->context.Get(iso);
   Context::Scope cs(ctx);
+  CallbackScopeFor cb(js, iso);
   TryCatch tc(iso);
   // Binary -> ArrayBuffer, text -> string (already UTF-8 validated natively)
   Local<Value> payload;
@@ -759,7 +784,7 @@ static void cbOnWsMessage(void* user, Connection* c, const char* data,
   }
   Local<Value> argv[3] = {Integer::NewFromUnsigned(iso, c->wsId), payload,
                           v8::Boolean::New(iso, isBinary)};
-  (void)js->onWsMessage.Get(iso)->Call(ctx, ctx->Global(), 3, argv);
+  if (js->onWsMessage.Get(iso)->Call(ctx, ctx->Global(), 3, argv).IsEmpty()) { /* threw: reported below */ }
   reportCaught(iso, tc, "onWsMessage");
 }
 
@@ -771,10 +796,11 @@ static void cbOnWsClose(void* user, Connection* c, int code) {
   HandleScope scope(iso);
   Local<Context> ctx = js->context.Get(iso);
   Context::Scope cs(ctx);
+  CallbackScopeFor cb(js, iso);
   TryCatch tc(iso);
   Local<Value> argv[2] = {Integer::NewFromUnsigned(iso, c->wsId),
                           Integer::New(iso, code)};
-  (void)js->onWsClose.Get(iso)->Call(ctx, ctx->Global(), 2, argv);
+  if (js->onWsClose.Get(iso)->Call(ctx, ctx->Global(), 2, argv).IsEmpty()) { /* threw: reported below */ }
   reportCaught(iso, tc, "onWsClose");
 }
 
@@ -794,6 +820,7 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
   JsServer* js = new JsServer();
   js->isolate = iso;
   js->context.Reset(iso, ctx);
+  js->asyncResource.Reset(iso, Object::New(iso));
 
   auto grab = [&](const char* name, Global<Function>& out) {
     Local<Value> v;
@@ -1467,6 +1494,10 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   // prepareResponse()/releaseTemplates()/respondPrepared()/
   // respondPreparedEmpty()/writeHeadPrepared()/endWith() are available.
   setCap("responseTemplates", true);
+  // Every callback into JS runs inside a Node callback scope, so nextTicks
+  // and microtasks queued during dispatch run when the callback returns
+  // (an adapter needs no setImmediate-based drain of its own).
+  setCap("callbackScope", true);
   // onAborted/onWritable are delivered on a later loop turn (never
   // re-entrantly from inside respond/write/end); false under
   // MORO_ENGINE_NOTIFY=sync.
@@ -1487,6 +1518,10 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   // 'uv' (libuv streams), with the reason when it is not uring.
   set("transport", str(iso, Server::transportName(Server::preferredTransport())));
   set("transportReason", str(iso, Server::transportReason()));
+  // "uv", or the io_uring ring mode: "defer-taskrun" (task work batched
+  // inside our own enter, woken through a registered eventfd) or
+  // "coop-taskrun" (the 1.1.6 mode). MORO_ENGINE_URING_TASKRUN pins one.
+  set("transportMode", str(iso, Server::transportModeName()));
   {
     Local<Object> fa = Object::New(iso);
     auto setFa = [&](const char* k, Local<Value> v) {

@@ -159,6 +159,7 @@ endWith(reqId, chunk: string | ArrayBuffer | Uint8Array | Buffer): void; // exac
 //     tlsPolicy: boolean,       // ssl.ciphers / ssl.ciphersuites / ssl.ecdhCurve parsed
 //     staticRoutes: boolean,    // setStaticRoute() / clearStaticRoutes()
 //     responseTemplates: boolean, // prepareResponse() & co.
+//     callbackScope: boolean,   // JS callbacks run in a Node callback scope: nextTicks + microtasks drain on return
 //     fastCalls: boolean }      // V8 fast API calls installed on the hot entry points (informational)
 // fastApi: { compiled, installed, reason, compiledV8, runtimeV8 } - why fast calls are on/off
 //   reason: 'ok' | 'not-compiled' | 'env-disabled' (MORO_ENGINE_FASTCALL=0) |
@@ -166,6 +167,9 @@ endWith(reqId, chunk: string | ArrayBuffer | Uint8Array | Buffer): void; // exac
 // fastCallStats: { <fn>: { fast, slow } } - only with MORO_ENGINE_FASTCALL_STATS=1 at load
 // transport: 'uring' | 'uv' - the I/O transport (io_uring on Linux 6.1+ when the sandbox
 //   permits it, libuv otherwise); transportReason says why it is not uring ('ok' when it is).
+// transportMode: 'uv' | 'defer-taskrun' | 'coop-taskrun' - the io_uring ring mode (defer: task
+//   work batched inside the engine's own enter, woken via a registered eventfd; coop: the 1.1.6
+//   mode). The probe tries defer first; MORO_ENGINE_URING_TASKRUN=coop|defer pins one.
 //   Behaviour and wire bytes are identical either way. MORO_ENGINE_TRANSPORT=uv forces libuv.
 //     asyncNotify: boolean,     // onAborted/onWritable delivered on a later turn (never re-entrant)
 //     workerThreads: boolean }  // servers left open at thread/env teardown are closed by a cleanup hook
@@ -173,12 +177,12 @@ endWith(reqId, chunk: string | ArrayBuffer | Uint8Array | Buffer): void; // exac
 probe(): { ok: boolean, version?: string, abi, platform, arch,
            capabilities?: { limits: boolean, tls: boolean, http2: boolean, wsDeflate: boolean,
                             responseLimits: boolean, tlsPolicy: boolean, staticRoutes: boolean,
-                            responseTemplates: boolean, asyncNotify: boolean, workerThreads: boolean,
+                            responseTemplates: boolean, callbackScope: boolean, asyncNotify: boolean, workerThreads: boolean,
                             fastCalls: boolean },
            notify?: 'deferred' | 'sync',
            fastApi?: { compiled: boolean, installed: boolean, reason: string, compiledV8: string, runtimeV8: string },
            fastCallStats?: { [fn: string]: { fast: number, slow: number } },
-           transport?: 'uv' | 'uring', transportReason?: string,
+           transport?: 'uv' | 'uring', transportReason?: string, transportMode?: string,
            error?: string };
 version: string;
 ```

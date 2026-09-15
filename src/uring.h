@@ -32,6 +32,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 
@@ -42,6 +43,7 @@
 #include <sys/mman.h>
 #if defined(__linux__)
 #include <sys/epoll.h>  // the probe's epoll wake self-test
+#include <sys/eventfd.h>  // the DEFER_TASKRUN wake
 #endif
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -281,6 +283,8 @@ enum : uint32_t {
 };
 // register opcodes
 enum : unsigned {
+  IORING_REGISTER_EVENTFD = 4,
+  IORING_UNREGISTER_EVENTFD = 5,
   IORING_REGISTER_PROBE = 8,
   IORING_REGISTER_PBUF_RING = 22,
   IORING_UNREGISTER_PBUF_RING = 23,
@@ -419,6 +423,12 @@ class Ring {
 
   bool isOpen() const { return fd_ >= 0; }
   int fd() const { return fd_; }
+
+  // Register an eventfd the kernel signals for completions - and, on a
+  // DEFER_TASKRUN ring, when local task work is queued (the only wake such a
+  // ring gives an epoll-driven loop). 0 or -errno.
+  int registerEventfd(int efd) { return Sys::registerOp(fd_, abi::IORING_REGISTER_EVENTFD, &efd, 1); }
+  int unregisterEventfd() { return Sys::registerOp(fd_, abi::IORING_UNREGISTER_EVENTFD, nullptr, 0); }
   uint32_t features() const { return features_; }
   uint32_t setupFlags() const { return setupFlags_; }
   unsigned sqEntries() const { return sqEntries_; }
@@ -691,24 +701,38 @@ struct UringConn {
 };
 
 // ---------------------------------------------------------------------------
-// The one ring mode the transport runs
+// Ring modes
 // ---------------------------------------------------------------------------
-// Mandatory: one issuer (SINGLE_ISSUER), task work run cooperatively at our
-// own kernel transitions instead of by interrupting the JS thread
-// (COOP_TASKRUN), a TASKRUN flag so the reap loop knows when an enter is
-// needed, submit-everything-or-fail semantics (SUBMIT_ALL), an explicit CQ
-// size. A kernel that rejects this set is a kernel without the multishot
-// recv fixes the design relies on: it falls back to libuv. No degraded modes.
+// Common to both: one issuer (SINGLE_ISSUER), a TASKRUN flag so the reap loop
+// knows when an enter is needed, submit-everything-or-fail semantics
+// (SUBMIT_ALL), an explicit CQ size. A kernel that rejects the set is a
+// kernel without the multishot recv fixes the design relies on: it falls
+// back to libuv. No degraded modes.
 //
-// NOT DEFER_TASKRUN, deliberately: with it the kernel queues a completion as
-// local task work WITHOUT waking the ring fd's wait queue, so an epoll-driven
-// loop (libuv's uv_poll) never learns about it - the CQE materialises only
-// inside an explicit io_uring_enter. Measured on 6.12: epoll never wakes
-// under DEFER_TASKRUN; under COOP_TASKRUN it wakes with the CQE already
-// posted. (An eventfd would work around it at one extra read per wake.)
-constexpr uint32_t kSetupFlags = abi::IORING_SETUP_SINGLE_ISSUER | abi::IORING_SETUP_COOP_TASKRUN |
-                                 abi::IORING_SETUP_TASKRUN_FLAG | abi::IORING_SETUP_SUBMIT_ALL |
-                                 abi::IORING_SETUP_CLAMP;
+// They differ in WHO runs task work. COOP_TASKRUN (the 1.1.6 mode): the
+// kernel runs it at our own kernel transitions and posts the CQE itself, so
+// the ring fd is epoll-readable when a completion lands - but every
+// completion is its own round trip (io_poll_wake -> task work -> CQE post ->
+// poll re-arm), which is where the CPU went in the 1.1.6 measurements.
+// DEFER_TASKRUN: completions stay queued as local task work until OUR
+// io_uring_enter(GETEVENTS) runs them all in one batch. Nothing posts to the
+// ring fd then (measured on 6.12: epoll on it never wakes), so the loop
+// waits on a registered eventfd instead, which the kernel signals when local
+// work is queued: one extra read per wake, many completions per wake. The
+// probe tries defer first and proves the wake behaviourally, exactly as it
+// proves the ring-fd wake for coop; MORO_ENGINE_URING_TASKRUN=coop|defer pins
+// one mode (A/B runs, diagnostics).
+struct RingMode {
+  uint32_t setupFlags;
+  bool eventfd;      // wait on a registered eventfd instead of the ring fd
+  const char* name;  // "defer-taskrun" | "coop-taskrun"
+};
+constexpr uint32_t kSetupFlagsCommon = abi::IORING_SETUP_SINGLE_ISSUER | abi::IORING_SETUP_TASKRUN_FLAG |
+                                       abi::IORING_SETUP_SUBMIT_ALL | abi::IORING_SETUP_CLAMP;
+constexpr RingMode kModeCoop{kSetupFlagsCommon | abi::IORING_SETUP_COOP_TASKRUN, false, "coop-taskrun"};
+constexpr RingMode kModeDefer{kSetupFlagsCommon | abi::IORING_SETUP_DEFER_TASKRUN, true, "defer-taskrun"};
+// The 1.1.6 flag set under its old name (unit coverage of the builders).
+constexpr uint32_t kSetupFlags = kModeCoop.setupFlags;
 constexpr unsigned kSqEntries = 1024;
 constexpr unsigned kCqEntries = 4096;
 constexpr uint32_t kRequiredFeatures = abi::IORING_FEAT_SINGLE_MMAP | abi::IORING_FEAT_NODROP |
@@ -720,6 +744,7 @@ constexpr uint16_t kBufGroup = 0;
 struct ProbeResult {
   bool ok;
   const char* reason;  // static string; "ok" when usable
+  RingMode mode;       // the mode that passed (meaningful when ok)
 };
 
 #if defined(__linux__)
@@ -731,9 +756,9 @@ struct ProbeResult {
 // poll() would re-evaluate readiness at call time and hide a missing wake).
 // EPERM (Docker's default seccomp, io_uring_disabled=2), ENOSYS (gVisor, old
 // kernels) and EINVAL (< 6.1) all mean "use libuv".
-inline ProbeResult probe() {
+inline ProbeResult probeMode(const RingMode& mode) {
   Ring<LinuxSys> ring;
-  int r = ring.open(8, kSetupFlags, 32);
+  int r = ring.open(8, mode.setupFlags, 32);
   if (r == -1) return {false, "io_uring_setup: EPERM (seccomp or io_uring_disabled)"};
   if (r == -38) return {false, "io_uring_setup: ENOSYS (no io_uring)"};
   if (r == -22) return {false, "io_uring_setup: EINVAL (kernel < 6.1: setup flags unsupported)"};
@@ -759,6 +784,7 @@ inline ProbeResult probe() {
     return {false, "socketpair failed"};
   }
   ProbeResult result{false, "self-test failed"};
+  int efd = -1;
   do {
     abi::io_uring_sqe* s = ring.sqe();
     if (!s) break;
@@ -768,8 +794,22 @@ inline ProbeResult probe() {
       result.reason = "io_uring_enter failed";
       break;
     }
-    // Register the ring fd with epoll BEFORE the data arrives, then require
-    // a wake-up: the exact contract uv_poll depends on.
+    // The fd the loop will wait on: the ring fd (coop) or a registered
+    // eventfd (defer). Register it with epoll BEFORE the data arrives, then
+    // require a wake-up: the exact contract uv_poll depends on.
+    int waitFd = ring.fd();
+    if (mode.eventfd) {
+      efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+      if (efd < 0) {
+        result.reason = "eventfd failed";
+        break;
+      }
+      if (ring.registerEventfd(efd) < 0) {
+        result.reason = "IORING_REGISTER_EVENTFD failed";
+        break;
+      }
+      waitFd = efd;
+    }
     int ep = ::epoll_create1(EPOLL_CLOEXEC);
     if (ep < 0) {
       result.reason = "epoll_create1 failed";
@@ -778,8 +818,8 @@ inline ProbeResult probe() {
     struct epoll_event ev;
     std::memset(&ev, 0, sizeof(ev));
     ev.events = EPOLLIN;
-    ev.data.fd = ring.fd();
-    if (::epoll_ctl(ep, EPOLL_CTL_ADD, ring.fd(), &ev) < 0) {
+    ev.data.fd = waitFd;
+    if (::epoll_ctl(ep, EPOLL_CTL_ADD, waitFd, &ev) < 0) {
       ::close(ep);
       result.reason = "epoll_ctl failed";
       break;
@@ -793,8 +833,13 @@ inline ProbeResult probe() {
     if (woke < 0 && errno == EINTR) woke = ::epoll_wait(ep, &out, 1, 500);
     ::close(ep);
     if (woke <= 0 || !(out.events & EPOLLIN)) {
-      result.reason = "ring fd did not wake epoll after a completion";
+      result.reason = mode.eventfd ? "eventfd did not wake epoll after a completion (DEFER_TASKRUN)"
+                                   : "ring fd did not wake epoll after a completion";
       break;
+    }
+    if (efd >= 0) {
+      uint64_t n;
+      if (::read(efd, &n, sizeof(n)) < 0) { /* the wake was the signal; the counter value is irrelevant */ }
     }
     // Run task work, reap.
     if (ring.enter(0, abi::IORING_ENTER_GETEVENTS) < 0) break;
@@ -835,15 +880,34 @@ inline ProbeResult probe() {
       break;
     }
     sv[0] = -1;  // closed by the ring
-    result = {true, "ok"};
+    result = {true, "ok", mode};
   } while (false);
   if (sv[0] >= 0) ::close(sv[0]);
   ::close(sv[1]);
+  if (efd >= 0) {
+    ring.unregisterEventfd();
+    ::close(efd);
+  }
   bufs.destroy(ring);
   return result;
 }
+
+// Defer first (fewer wakeups, task work batched inside our own enter), coop
+// when the kernel or its wake contract refuses it. MORO_ENGINE_URING_TASKRUN
+// pins one: "coop" (the 1.1.6 mode) or "defer" (no fallback; a refusal then
+// means libuv, with the reason).
+inline ProbeResult probe() {
+  const char* env = std::getenv("MORO_ENGINE_URING_TASKRUN");
+  const bool onlyCoop = env && std::strcmp(env, "coop") == 0;
+  const bool onlyDefer = env && std::strcmp(env, "defer") == 0;
+  if (!onlyCoop) {
+    ProbeResult r = probeMode(kModeDefer);
+    if (r.ok || onlyDefer) return r;
+  }
+  return probeMode(kModeCoop);
+}
 #else
-inline ProbeResult probe() { return {false, "platform"}; }
+inline ProbeResult probe() { return {false, "platform", {0, false, "none"}}; }
 #endif
 
 }  // namespace uring

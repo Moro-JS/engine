@@ -370,9 +370,23 @@ class Server {
   // per request but costs more CPU per completion at low batching - it wins
   // keep-alive at 64 and 512 connections, loses at 256, loses connection
   // churn by 10-20% and burns ~40% more CPU per request at a fixed moderate
-  // rate. The default therefore stays libuv until the per-completion cost is
-  // addressed (DEFER_TASKRUN behind an eventfd, ring-batched sends; see
-  // docs/ROADMAP.md).
+  // rate. The per-completion cost is what DEFER_TASKRUN behind an eventfd
+  // (uring.h, "Ring modes") addresses; the default stays libuv until that
+  // mode is measured to flip the go/no-go (docs/DESIGN.md).
+#if defined(__linux__)
+  // The io_uring ring mode the probe selected (uring.h, "Ring modes").
+  static uring::RingMode& uringModeSlot() {
+    static uring::RingMode m = uring::kModeCoop;
+    return m;
+  }
+  // "uv", or the io_uring mode in use: "defer-taskrun" | "coop-taskrun".
+  static const char* transportModeName() {
+    return preferredTransport() == TransportKind::Uring ? uringModeSlot().name : "uv";
+  }
+#else
+  static const char* transportModeName() { return "uv"; }
+#endif
+
   static TransportKind preferredTransport() {
 #if defined(__linux__)
     static const TransportKind kind = [] {
@@ -385,6 +399,7 @@ class Server {
       }
       uring::ProbeResult pr = uring::probe();
       transportReasonSlot() = pr.reason;
+      if (pr.ok) uringModeSlot() = pr.mode;
       return pr.ok ? TransportKind::Uring : TransportKind::Uv;
     }();
     return kind;
@@ -2270,6 +2285,8 @@ class Server {
     bool dead = false;    // io_uring_enter started failing: no new uring work
     bool inReap = false;
     int closedHandles = 0;
+    int efd = -1;         // DEFER_TASKRUN: the registered eventfd the poll handle waits on
+    bool woke = false;    // the eventfd fired since the last reap round
     std::vector<Connection*> rearm;  // multishot recvs to re-issue after a reap round
     std::unordered_set<Server*> servers;
     int emfileFd = -1;
@@ -2284,7 +2301,8 @@ class Server {
       if (s) return s->dead ? nullptr : s;
       auto* u = new UringLoop();
       u->loop = loop;
-      if (u->ring.open(uring::kSqEntries, uring::kSetupFlags, uring::kCqEntries) < 0) {
+      const uring::RingMode& mode = Server::uringModeSlot();
+      if (u->ring.open(uring::kSqEntries, mode.setupFlags, uring::kCqEntries) < 0) {
         delete u;
         return nullptr;
       }
@@ -2293,8 +2311,23 @@ class Server {
         delete u;
         return nullptr;
       }
+      // DEFER_TASKRUN posts nothing to the ring fd: the loop waits on a
+      // registered eventfd the kernel signals when local task work is queued.
+      int waitFd = u->ring.fd();
+      if (mode.eventfd) {
+        u->efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (u->efd < 0 || u->ring.registerEventfd(u->efd) < 0) {
+          if (u->efd >= 0) ::close(u->efd);
+          u->bufs.destroy(u->ring);
+          u->ring.close();
+          delete u;
+          return nullptr;
+        }
+        waitFd = u->efd;
+      }
       u->poll.data = u;
-      if (uv_poll_init(loop, &u->poll, u->ring.fd()) != 0) {
+      if (uv_poll_init(loop, &u->poll, waitFd) != 0) {
+        if (u->efd >= 0) ::close(u->efd);
         u->bufs.destroy(u->ring);
         u->ring.close();
         delete u;
@@ -2367,6 +2400,13 @@ class Server {
     static void onReadable(uv_poll_t* h, int status, int) {
       UringLoop* u = static_cast<UringLoop*>(h->data);
       if (status < 0) return;
+      if (u->efd >= 0) {
+        // Clear the counter; the wake itself says local task work
+        // (DEFER_TASKRUN) or a completion is waiting for our enter.
+        uint64_t n;
+        if (::read(u->efd, &n, sizeof(n)) < 0) { /* the wake was the signal; the counter value is irrelevant */ }
+        u->woke = true;
+      }
       u->reap();
     }
 
@@ -2378,7 +2418,8 @@ class Server {
       if (inReap || dead) return;
       inReap = true;
       for (int round = 0; round < 8 && !dead; round++) {
-        if (ring.pending() || ring.taskWorkPending() || ring.cqOverflowed()) {
+        if (woke || ring.pending() || ring.taskWorkPending() || ring.cqOverflowed()) {
+          woke = false;
           int r = ring.enter(0, uring::abi::IORING_ENTER_GETEVENTS);
           if (r < 0 && r != -EINTR && r != -EAGAIN && r != -EBUSY) {
             die();
@@ -2456,6 +2497,7 @@ class Server {
       uv_close(reinterpret_cast<uv_handle_t*>(&u->prepare), onHandleClosed);
       while (u->closedHandles < 2) uv_run(u->loop, UV_RUN_ONCE);
       if (u->emfileFd >= 0) ::close(u->emfileFd);
+      if (u->efd >= 0) ::close(u->efd);  // the ring's registration dies with the ring
       u->bufs.destroy(u->ring);
       u->ring.close();
       delete u;

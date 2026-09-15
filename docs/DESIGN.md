@@ -72,6 +72,18 @@ behind it. Follow-ups that could flip it:
 same VM (MoroJS-on-engine vs raw Bun.serve, both transports, worker-thread
 clustering) lives in the MoroJS Benchmark repo, `candidates/2026-09-11/`.
 
+Of those follow-ups, ring-batched sends were already in place (a SEND SQE is
+only prepared at issue time; the reap loop's next `enter` submits every SQE
+of the round, hence the 1.00 syscalls/req above), and `RECVSEND_BUNDLE` cannot
+help a one-request-in-flight keep-alive shape (each recv completes with one
+small request; there is nothing to bundle). `DEFER_TASKRUN` behind a
+registered eventfd is implemented as the ring's first-choice mode (`uring.h`,
+"Ring modes"; `probe().transportMode` reports which one is running):
+completions stay queued as local task work until the engine's own
+`io_uring_enter(GETEVENTS)` runs them as one batch, so the per-completion
+round trip that cost the CPU above is paid once per wake. The 1.1.6 mode
+remains selectable with `MORO_ENGINE_URING_TASKRUN=coop` for A/B runs.
+
 ## Milestones (benchmark/conformance-gated)
 
 - **M0 — bring-up** ✅: build driver + ABI matrix (115/127/131/137/141/147), probe() binding, packaging layout, CI skeleton, smoke matrix.
