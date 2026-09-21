@@ -55,7 +55,7 @@ jobs:
         node-version: [20, 22, 24, 26]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
       - name: Build engine for this Node ABI
@@ -87,7 +87,7 @@ jobs:
             envvar: MORO_ENGINE_BATCH=0
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Build engine for this Node ABI
@@ -111,7 +111,7 @@ jobs:
       MORO_ENGINE_REQUIRE_TRANSPORT: uring
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
       - name: Build engine for this Node ABI
@@ -246,7 +246,7 @@ jobs:
       MORO_ENGINE_REQUIRE_TRANSPORT: ${{ matrix.transport }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Build addon with ASan/UBSan
@@ -288,7 +288,7 @@ jobs:
         run: |
           brew list llvm >/dev/null 2>&1 || brew install llvm
           echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: node tools/build.mjs --all --arch arm64
@@ -319,7 +319,7 @@ jobs:
           echo "CXX=clang++-18" >> "$GITHUB_ENV"
           echo "LLVM_PROFDATA=llvm-profdata-18" >> "$GITHUB_ENV"
           sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: node tools/build.mjs --all
@@ -366,7 +366,7 @@ jobs:
           echo "CXX=clang++-18" >> "$GITHUB_ENV"
           echo "LLVM_PROFDATA=llvm-profdata-18" >> "$GITHUB_ENV"
           sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: PGO cycle (strict)
@@ -383,7 +383,7 @@ jobs:
       CXX: g++
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - uses: denoland/setup-deno@v2
@@ -404,7 +404,7 @@ jobs:
       # Third-party action pinned to a full commit SHA (supply-chain integrity);
       # Dependabot (.github/dependabot.yml) bumps the SHA + comment on new tags.
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: node tools/build.mjs --all
@@ -428,7 +428,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
       - uses: actions/download-artifact@v8
@@ -468,7 +468,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
       - uses: actions/download-artifact@v8
@@ -492,7 +492,7 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           architecture: x64 # x64 Node build; runs via Rosetta 2 on the arm64 host
@@ -515,7 +515,7 @@ jobs:
       MORO_ENGINE_REQUIRE_TRANSPORT: uv
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - uses: actions/download-artifact@v8
@@ -538,7 +538,7 @@ jobs:
         run: |
           brew list llvm >/dev/null 2>&1 || brew install llvm
           echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Build engine for this Node ABI
