@@ -120,6 +120,8 @@ class TlsContext {
 
   SSL_CTX* ctx() const { return ctx_; }
   bool valid() const { return ctx_ != nullptr; }
+  const std::string& ticketKeys() const { return ticketKeys_; }
+  bool alpnH2() const { return alpnH2_; }
 
   // Build the SSL_CTX from the config. Returns "" on success, else a
   // human-readable error - config errors must be LOUD (serve() throws), never

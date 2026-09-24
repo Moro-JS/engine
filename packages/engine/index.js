@@ -153,6 +153,7 @@ const NATIVE_API = new Set([
   'listen',
   'close',
   'stopListening',
+  'updateSsl',
   'getMethod',
   'getBatchBuffers',
   'getPath',

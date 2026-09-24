@@ -25,6 +25,9 @@ export interface EngineCapabilities {
   /** Explicit TLS cipher/group policy is parsed:
    *  ServeOptions.ssl.ciphers, ciphersuites, and ecdhCurve. */
   tlsPolicy: boolean;
+  /** updateSsl() is available: the certificate/key (and policy) of a TLS
+   *  server can be replaced for new handshakes without a restart. */
+  tlsReload: boolean;
   /** setStaticRoute() / clearStaticRoutes() are available. */
   staticRoutes: boolean;
   /** prepareResponse() / releaseTemplates() / respondPrepared() /
@@ -283,6 +286,14 @@ export function close(serverId: number): void;
 /** Stop accepting new connections while existing ones keep being served —
  *  the drain phase of a graceful shutdown. Idempotent. */
 export function stopListening(serverId: number): void;
+/** Replace the TLS certificate/key (and cipher policy) used for every
+ *  handshake from now on, without restarting the listener (feature-detect via
+ *  probe().capabilities.tlsReload). `ssl` is the full ServeOptions.ssl shape,
+ *  not a diff; ticketKeys carry over when omitted so session resumption
+ *  survives a rotation. Established connections keep the context they
+ *  handshaked with. Throws (leaving the current context in place) on invalid
+ *  material, and for a server that was not started with ssl. */
+export function updateSsl(serverId: number, ssl: NonNullable<ServeOptions['ssl']>): void;
 
 // ---- per-request accessors (valid until the response ends / aborts) ----
 export function getMethod(reqId: number): string | undefined;
@@ -395,6 +406,7 @@ declare const engine: {
   listen: typeof listen;
   close: typeof close;
   stopListening: typeof stopListening;
+  updateSsl: typeof updateSsl;
   getMethod: typeof getMethod;
   getBatchBuffers: typeof getBatchBuffers;
   getPath: typeof getPath;

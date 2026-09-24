@@ -96,6 +96,12 @@ serve(callbacks: {
 listen(serverId: number, host: string, port: number): number; // -> actual port; throws Error w/ .code (e.g. 'EADDRINUSE') on bind error
 stopListening(serverId: number): void; // stop accepting, keep serving existing connections
                                        // (graceful-shutdown drain phase; then close())
+updateSsl(serverId: number, ssl): void; // certificate rotation (capabilities.tlsReload): validate a
+                                       // NEW context from the full ssl shape above and use it for
+                                       // every handshake from now on; established connections keep
+                                       // theirs. Throws (current context untouched) on bad material
+                                       // or a server not started with ssl. ticketKeys carry over
+                                       // when omitted.
 close(serverId: number): void;   // full teardown: stop accepting AND close every live
                                  // connection; in-flight requests get onAborted
 
@@ -157,6 +163,7 @@ endWith(reqId, chunk: string | ArrayBuffer | Uint8Array | Buffer): void; // exac
 //   { limits: boolean, tls: boolean, http2: boolean, wsDeflate: boolean,
 //     responseLimits: boolean,  // responseTimeoutMs / responseBackpressureLimit / maxUriSize parsed
 //     tlsPolicy: boolean,       // ssl.ciphers / ssl.ciphersuites / ssl.ecdhCurve parsed
+//     tlsReload: boolean,       // updateSsl(serverId, ssl) available
 //     staticRoutes: boolean,    // setStaticRoute() / clearStaticRoutes()
 //     responseTemplates: boolean, // prepareResponse() & co.
 //     callbackScope: boolean,   // JS callbacks run in a Node callback scope: nextTicks + microtasks drain on return
@@ -176,7 +183,7 @@ endWith(reqId, chunk: string | ArrayBuffer | Uint8Array | Buffer): void; // exac
 // notify: 'deferred' | 'sync' - the onAborted/onWritable delivery mode in effect
 probe(): { ok: boolean, version?: string, abi, platform, arch,
            capabilities?: { limits: boolean, tls: boolean, http2: boolean, wsDeflate: boolean,
-                            responseLimits: boolean, tlsPolicy: boolean, staticRoutes: boolean,
+                            responseLimits: boolean, tlsPolicy: boolean, tlsReload: boolean, staticRoutes: boolean,
                             responseTemplates: boolean, callbackScope: boolean, asyncNotify: boolean, workerThreads: boolean,
                             fastCalls: boolean },
            notify?: 'deferred' | 'sync',

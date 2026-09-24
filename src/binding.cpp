@@ -807,6 +807,81 @@ static void cbOnWsClose(void* user, Connection* c, int code) {
 // ---- JS-exposed functions ----
 
 // serve(callbacks, options?) -> serverId
+// Parse a MoroJS-shaped ssl options object (file paths and/or inline PEM,
+// passphrase, ticketKeys, policy, minVersion, client-cert flags) into an
+// SslConfig. Shared by serve() and updateSsl(). Throws (and returns false)
+// on a malformed value; validity of the material itself is TlsContext's job.
+static bool parseSslOptions(Isolate* iso, Local<Context> ctx, Local<Object> so, SslConfig& ssl) {
+  auto getStr = [&](const char* name, std::string& out) {
+    Local<Value> v;
+    if (so->Get(ctx, str(iso, name)).ToLocal(&v) && v->IsString()) {
+      String::Utf8Value s(iso, v);
+      if (*s) out.assign(*s, s.length());
+    }
+  };
+  auto getBytes = [&](const char* name, std::string& out) {
+    Local<Value> v;
+    if (so->Get(ctx, str(iso, name)).ToLocal(&v) && !v->IsNullOrUndefined()) {
+      extractBytes(iso, ctx, v, out);
+    }
+  };
+  auto getBool = [&](const char* name, bool& out) {
+    Local<Value> v;
+    if (so->Get(ctx, str(iso, name)).ToLocal(&v) && v->IsBoolean()) {
+      out = v->BooleanValue(iso);
+    }
+  };
+  getStr("key_file_name", ssl.keyFile);
+  getStr("cert_file_name", ssl.certFile);
+  getStr("ca_file_name", ssl.caFile);
+  getBytes("key", ssl.keyPem);
+  getBytes("cert", ssl.certPem);
+  getBytes("ca", ssl.caPem);
+  getBytes("ticketKeys", ssl.ticketKeys);
+  if (!ssl.ticketKeys.empty() && ssl.ticketKeys.size() != 48) {
+    iso->ThrowException(v8::Exception::Error(str(
+        iso, "ssl.ticketKeys must be exactly 48 bytes (see Node's tls.Server ticketKeys)")));
+    return false;
+  }
+  getStr("passphrase", ssl.passphrase);
+  // Optional cipher/group policy (compliance profiles); validated in
+  // TlsContext::init, config errors throw from serve().
+  getStr("ciphers", ssl.ciphers);
+  getStr("ciphersuites", ssl.ciphersuites);
+  getStr("ecdhCurve", ssl.ecdhCurve);
+  std::string minVer;
+  getStr("minVersion", minVer);
+  if (minVer == "TLSv1.3") ssl.minVersion = TLS1_3_VERSION;
+  // (default TLS1_2_VERSION; anything else is rejected below)
+  if (!minVer.empty() && minVer != "TLSv1.2" && minVer != "TLSv1.3") {
+    iso->ThrowException(v8::Exception::Error(
+        str(iso, "ssl.minVersion must be 'TLSv1.2' or 'TLSv1.3'")));
+    return false;
+  }
+  getBool("requestCert", ssl.requestCert);
+  getBool("rejectUnauthorized", ssl.rejectUnauthorized);
+  return true;
+}
+
+// Build and validate a TlsContext from a parsed config. Throws (and returns
+// false) on incomplete or invalid material - a misconfigured TLS server must
+// never silently boot as plaintext, and a bad update must never replace a
+// working context.
+static bool buildTlsContext(Isolate* iso, const SslConfig& ssl, TlsContext& out) {
+  if (!ssl.complete()) {
+    iso->ThrowException(v8::Exception::Error(str(iso,
+        "ssl requires both a key (key or key_file_name) and a certificate "
+        "(cert or cert_file_name)")));
+    return false;
+  }
+  std::string err = out.init(ssl);
+  if (!err.empty()) {
+    iso->ThrowException(v8::Exception::Error(str(iso, ("ssl: " + err).c_str())));
+    return false;
+  }
+  return true;
+}
+
 static void Serve(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
   Local<Context> ctx = iso->GetCurrentContext();
@@ -924,76 +999,18 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
     Local<Value> sslVal;
     if (opts->Get(ctx, str(iso, "ssl")).ToLocal(&sslVal) && sslVal->IsObject()) {
       sslRequested = true;
-      Local<Object> so = sslVal.As<Object>();
-      auto getStr = [&](const char* name, std::string& out) {
-        Local<Value> v;
-        if (so->Get(ctx, str(iso, name)).ToLocal(&v) && v->IsString()) {
-          String::Utf8Value s(iso, v);
-          if (*s) out.assign(*s, s.length());
-        }
-      };
-      auto getBytes = [&](const char* name, std::string& out) {
-        Local<Value> v;
-        if (so->Get(ctx, str(iso, name)).ToLocal(&v) && !v->IsNullOrUndefined()) {
-          extractBytes(iso, ctx, v, out);
-        }
-      };
-      auto getBool = [&](const char* name, bool& out) {
-        Local<Value> v;
-        if (so->Get(ctx, str(iso, name)).ToLocal(&v) && v->IsBoolean()) {
-          out = v->BooleanValue(iso);
-        }
-      };
-      getStr("key_file_name", ssl.keyFile);
-      getStr("cert_file_name", ssl.certFile);
-      getStr("ca_file_name", ssl.caFile);
-      getBytes("key", ssl.keyPem);
-      getBytes("cert", ssl.certPem);
-      getBytes("ca", ssl.caPem);
-      getBytes("ticketKeys", ssl.ticketKeys);
-      if (!ssl.ticketKeys.empty() && ssl.ticketKeys.size() != 48) {
-        iso->ThrowException(v8::Exception::Error(str(
-            iso, "ssl.ticketKeys must be exactly 48 bytes (see Node's tls.Server ticketKeys)")));
+      if (!parseSslOptions(iso, ctx, sslVal.As<Object>(), ssl)) {
         delete js;
         return;
       }
-      getStr("passphrase", ssl.passphrase);
-      // Optional cipher/group policy (compliance profiles); validated in
-      // TlsContext::init, config errors throw from serve().
-      getStr("ciphers", ssl.ciphers);
-      getStr("ciphersuites", ssl.ciphersuites);
-      getStr("ecdhCurve", ssl.ecdhCurve);
-      std::string minVer;
-      getStr("minVersion", minVer);
-      if (minVer == "TLSv1.3") ssl.minVersion = TLS1_3_VERSION;
-      // (default TLS1_2_VERSION; anything else is rejected below)
-      if (!minVer.empty() && minVer != "TLSv1.2" && minVer != "TLSv1.3") {
-        iso->ThrowException(v8::Exception::Error(
-            str(iso, "ssl.minVersion must be 'TLSv1.2' or 'TLSv1.3'")));
-        delete js;
-        return;
-      }
-      getBool("requestCert", ssl.requestCert);
-      getBool("rejectUnauthorized", ssl.rejectUnauthorized);
     }
   }
 
   // Validate the TLS material BEFORE constructing the Server, so a config error throws cleanly with nothing to tear down.
   TlsContext tlsCtx;
-  if (sslRequested) {
-    if (!ssl.complete()) {
-      iso->ThrowException(v8::Exception::Error(str(iso,
-          "ssl requires both a key (key or key_file_name) and a certificate "
-          "(cert or cert_file_name)")));
-      delete js;
-      return;
-    }
-    std::string err = tlsCtx.init(ssl);
-    if (!err.empty()) {
-      iso->ThrowException(v8::Exception::Error(str(iso, ("ssl: " + err).c_str())));
-      delete js;
-      return;
-    }
+  if (sslRequested && !buildTlsContext(iso, ssl, tlsCtx)) {
+    delete js;
+    return;
   }
 
   uv_loop_t* loop = node::GetCurrentEventLoop(iso);
@@ -1077,6 +1094,44 @@ static void Close(const FunctionCallbackInfo<Value>& args) {
 static void StopListening(const FunctionCallbackInfo<Value>& args) {
   JsServer* js = serverFrom(args);
   if (js && js->server) js->server->stopListening();
+}
+
+// updateSsl(serverId, ssl) - certificate/key rotation without a restart.
+// Builds and validates a NEW TLS context from a full ssl options object (the
+// same shape serve() takes) and swaps it in for every handshake that starts
+// afterwards. Connections that already handshaked keep the context they were
+// created from (OpenSSL refcounts the SSL_CTX per SSL session), so in-flight
+// requests and kept-alive sockets are untouched. Validation happens before
+// the swap: a bad file, PEM or key/cert mismatch throws and the current
+// context keeps serving. Session-ticket keys carry over when the update does
+// not name new ones, so resumption survives a rotation. Throws for a server
+// that was not started with ssl - TLS cannot be turned on after the fact.
+static void UpdateSsl(const FunctionCallbackInfo<Value>& args) {
+  Isolate* iso = args.GetIsolate();
+  Local<Context> ctx = iso->GetCurrentContext();
+  JsServer* js = serverFrom(args);
+  if (!js || !js->server) {
+    iso->ThrowException(v8::Exception::Error(str(iso, "invalid serverId")));
+    return;
+  }
+  if (!js->server->tlsEnabled()) {
+    iso->ThrowException(v8::Exception::Error(
+        str(iso, "updateSsl: this server was not started with ssl")));
+    return;
+  }
+  if (args.Length() < 2 || !args[1]->IsObject()) {
+    iso->ThrowException(v8::Exception::Error(
+        str(iso, "updateSsl(serverId, ssl) requires an ssl options object")));
+    return;
+  }
+  SslConfig ssl;
+  if (!parseSslOptions(iso, ctx, args[1].As<Object>(), ssl)) return;
+  const TlsContext& current = js->server->tls();
+  if (ssl.ticketKeys.empty()) ssl.ticketKeys = current.ticketKeys();
+  ssl.alpnH2 = current.alpnH2();
+  TlsContext next;
+  if (!buildTlsContext(iso, ssl, next)) return;
+  js->server->adoptTls(std::move(next));
 }
 
 // ---- per-request data accessors (reqId is arg 0) ----
@@ -1489,6 +1544,8 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   setCap("responseLimits", true);
   // ssl.ciphers / ssl.ciphersuites / ssl.ecdhCurve are parsed.
   setCap("tlsPolicy", true);
+  // updateSsl(serverId, ssl) swaps the certificate/key for new handshakes.
+  setCap("tlsReload", true);
   // setStaticRoute()/clearStaticRoutes() are available.
   setCap("staticRoutes", true);
   // prepareResponse()/releaseTemplates()/respondPrepared()/
@@ -1580,6 +1637,7 @@ static const ExportDef kExports[] = {
     {"listen", Listen, nullptr, nullptr},
     {"close", Close, nullptr, nullptr},
     {"stopListening", StopListening, nullptr, nullptr},
+    {"updateSsl", UpdateSsl, nullptr, nullptr},
     {"getMethod", GetMethod, nullptr, nullptr},
     {"getBatchBuffers", GetBatchBuffers, nullptr, nullptr},
     {"getPath", GetPath, nullptr, nullptr},

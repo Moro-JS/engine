@@ -30,6 +30,7 @@ export let serve = (...a) => (serve = engine.serve)(...a);
 export let listen = (...a) => (listen = engine.listen)(...a);
 export let close = (...a) => (close = engine.close)(...a);
 export let stopListening = (...a) => (stopListening = engine.stopListening)(...a);
+export let updateSsl = (...a) => (updateSsl = engine.updateSsl)(...a);
 export let getMethod = (...a) => (getMethod = engine.getMethod)(...a);
 export let getBatchBuffers = (...a) => (getBatchBuffers = engine.getBatchBuffers)(...a);
 export let getPath = (...a) => (getPath = engine.getPath)(...a);

@@ -438,6 +438,8 @@ class Server {
     tlsEnabled_ = tlsCtx_.valid();
   }
   bool tlsEnabled() const { return tlsEnabled_; }
+  // The live context (updateSsl reads ticket keys / ALPN policy to carry over).
+  const TlsContext& tls() const { return tlsCtx_; }
 
   // Returns the bound port, or 0 on failure. On failure, *uvErr (when non-null) receives the libuv error code (e.g. UV_EADDRINUSE) so the caller can throw a precise, code-bearing Error.
   int listen(const char* host, int port, int* uvErr = nullptr) {
