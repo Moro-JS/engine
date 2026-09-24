@@ -1,7 +1,7 @@
 {
   "name": "@morojs/engine-monorepo",
   "private": true,
-  "version": "1.1.7",
+  "version": "1.1.8",
   "description": "Build tree for @morojs/engine - MoroJS's native HTTP engine",
   "license": "MIT",
   "type": "module",
