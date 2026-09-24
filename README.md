@@ -13,7 +13,10 @@ templates and static routes, V8 fast API calls on the hot entry points,
 deferred `onAborted`/`onWritable` delivery, zero-copy string bodies, a
 teardown hook that makes the engine safe inside `worker_threads` (MoroJS
 clusters with threads on it), and PGO-trained release binaries - with every
-response path proven byte-identical on the wire. Measured comparisons live in the
+response path proven byte-identical on the wire. 1.1.9 adds parameter routes:
+a route whose reply is one path segment (`/user/:id`) is answered inside the
+engine as well, so a static-plus-echo route table never enters JS. Measured
+comparisons live in the
 [MoroJS Benchmark repo](https://github.com/Moro-JS/benchmark). In progress:
 ALPN HTTP/2 (vendored nghttp2). See [docs/DESIGN.md](docs/DESIGN.md) and
 [docs/ROADMAP.md](docs/ROADMAP.md).
