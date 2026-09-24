@@ -30,6 +30,9 @@ export interface EngineCapabilities {
   tlsReload: boolean;
   /** setStaticRoute() / clearStaticRoutes() are available. */
   staticRoutes: boolean;
+  /** setParamRoute() / clearParamRoutes() are available: a route with one
+   *  variable path segment, echoed as the body, answered inside the engine. */
+  paramRoutes: boolean;
   /** prepareResponse() / releaseTemplates() / respondPrepared() /
    *  respondPreparedEmpty() / writeHeadPrepared() / endWith() are available. */
   responseTemplates: boolean;
@@ -355,6 +358,29 @@ export function setStaticRoute(
 /** Drop every static route registered on this server. */
 export function clearStaticRoutes(serverId: number): void;
 
+// ---- Parameter routes ----
+/** Register a route with ONE variable path segment whose body IS that
+ *  segment, answered entirely inside the engine like a static route:
+ *  `/user/:id` is prefix "/user/" and suffix ""; `/files/:name.json` is
+ *  prefix "/files/" and suffix ".json". The segment must be non-empty and
+ *  contain no '/', so `/user/` and `/user/1/2` still reach onRequest. It is
+ *  written as it is on the wire, undecoded (uWS's writeParameterValue does
+ *  the same); a route that needs decoding stays a JS route. The header block
+ *  is materialised once, so the reply is byte-identical to
+ *  respond(status, headersFlat, segment). Only an exact method match
+ *  short-circuits; re-registering (method, prefix, suffix) replaces it.
+ *  Feature-detect via probe().capabilities.paramRoutes. */
+export function setParamRoute(
+  serverId: number,
+  method: number,
+  prefix: string,
+  suffix: string,
+  status?: number,
+  headersFlat?: string[] | null
+): void;
+/** Drop every parameter route registered on this server. */
+export function clearParamRoutes(serverId: number): void;
+
 // ---- Prepared response templates ----
 /** Materialise status + headers ONCE (the same header builder respond() uses,
  *  so the wire bytes are identical) and get back a template id to replay per
@@ -422,6 +448,8 @@ declare const engine: {
   end: typeof end;
   setStaticRoute: typeof setStaticRoute;
   clearStaticRoutes: typeof clearStaticRoutes;
+  setParamRoute: typeof setParamRoute;
+  clearParamRoutes: typeof clearParamRoutes;
   prepareResponse: typeof prepareResponse;
   releaseTemplates: typeof releaseTemplates;
   respondPrepared: typeof respondPrepared;

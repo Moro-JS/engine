@@ -46,6 +46,8 @@ export let write = (...a) => (write = engine.write)(...a);
 export let end = (...a) => (end = engine.end)(...a);
 export let setStaticRoute = (...a) => (setStaticRoute = engine.setStaticRoute)(...a);
 export let clearStaticRoutes = (...a) => (clearStaticRoutes = engine.clearStaticRoutes)(...a);
+export let setParamRoute = (...a) => (setParamRoute = engine.setParamRoute)(...a);
+export let clearParamRoutes = (...a) => (clearParamRoutes = engine.clearParamRoutes)(...a);
 export let prepareResponse = (...a) => (prepareResponse = engine.prepareResponse)(...a);
 export let releaseTemplates = (...a) => (releaseTemplates = engine.releaseTemplates)(...a);
 export let respondPrepared = (...a) => (respondPrepared = engine.respondPrepared)(...a);

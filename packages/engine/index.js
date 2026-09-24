@@ -169,6 +169,8 @@ const NATIVE_API = new Set([
   'end',
   'setStaticRoute',
   'clearStaticRoutes',
+  'setParamRoute',
+  'clearParamRoutes',
   'prepareResponse',
   'releaseTemplates',
   'respondPrepared',

@@ -1341,6 +1341,46 @@ static void ClearStaticRoutes(const FunctionCallbackInfo<Value>& args) {
   if (js && js->server) js->server->clearStaticRoutes();
 }
 
+// setParamRoute(serverId, methodIdx, prefix, suffix, status, headersFlat|null)
+//
+// A route with one variable path segment whose body is that segment,
+// answered inside the engine like a static route: `/user/:id` is prefix
+// "/user/" and suffix "". The header block is materialised HERE, once, with
+// the same buildHeaders() respond() uses, so the reply is byte-identical to
+// respond(status, headersFlat, segment) without the JS round trip.
+// Re-registering the same (method, prefix, suffix) replaces it.
+static void SetParamRoute(const FunctionCallbackInfo<Value>& args) {
+  Isolate* iso = args.GetIsolate();
+  Local<Context> ctx = iso->GetCurrentContext();
+  JsServer* js = serverFrom(args);
+  if (!js || !js->server) return;
+  if (args.Length() < 4 || !args[2]->IsString() || !args[3]->IsString()) {
+    iso->ThrowException(
+        str(iso, "setParamRoute(serverId, method, prefix, suffix, status, headers)"));
+    return;
+  }
+
+  const int32_t method = args[1]->Int32Value(ctx).FromMaybe(0);
+  ResponseTemplate tpl;
+  tpl.status = args.Length() > 4 ? args[4]->Int32Value(ctx).FromMaybe(200) : 200;
+
+  String::Utf8Value prefixV(iso, args[2]);
+  String::Utf8Value suffixV(iso, args[3]);
+  if (!*prefixV || !*suffixV) return;
+  std::string prefix(*prefixV, static_cast<size_t>(prefixV.length()));
+  std::string suffix(*suffixV, static_cast<size_t>(suffixV.length()));
+
+  buildHeaders(iso, ctx, args.Length() > 5 ? args[5] : Local<Value>(), tpl.headers,
+               tpl.customCL);
+  js->server->setParamRoute(method, std::move(prefix), std::move(suffix), std::move(tpl));
+}
+
+// clearParamRoutes(serverId) - drops every parameter route on this server.
+static void ClearParamRoutes(const FunctionCallbackInfo<Value>& args) {
+  JsServer* js = serverFrom(args);
+  if (js && js->server) js->server->clearParamRoutes();
+}
+
 // ---- prepared response templates ----
 
 // prepareResponse(serverId, status, headersFlat|null) -> tplId (>= 1)
@@ -1548,6 +1588,9 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   setCap("tlsReload", true);
   // setStaticRoute()/clearStaticRoutes() are available.
   setCap("staticRoutes", true);
+  // setParamRoute()/clearParamRoutes() are available: one variable path
+  // segment echoed as the body, answered inside the engine.
+  setCap("paramRoutes", true);
   // prepareResponse()/releaseTemplates()/respondPrepared()/
   // respondPreparedEmpty()/writeHeadPrepared()/endWith() are available.
   setCap("responseTemplates", true);
@@ -1653,6 +1696,8 @@ static const ExportDef kExports[] = {
     {"end", End, MORO_FAST(End)},
     {"setStaticRoute", SetStaticRoute, nullptr, nullptr},
     {"clearStaticRoutes", ClearStaticRoutes, nullptr, nullptr},
+    {"setParamRoute", SetParamRoute, nullptr, nullptr},
+    {"clearParamRoutes", ClearParamRoutes, nullptr, nullptr},
     {"prepareResponse", PrepareResponse, nullptr, nullptr},
     {"releaseTemplates", ReleaseTemplates, nullptr, nullptr},
     {"respondPrepared", RespondPrepared, MORO_FAST(RespondPrepared)},

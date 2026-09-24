@@ -655,6 +655,34 @@ class Server {
   }
   void clearStaticRoutes() { staticRoutes_.clear(); }
 
+  // ---- parameter routes (capabilities.paramRoutes) ----
+  // A route with ONE variable path segment whose body IS that segment,
+  // answered inside the engine exactly like a static route: `/user/:id` is
+  // prefix "/user/" and suffix ""; `/files/:name.json` is prefix "/files/"
+  // and suffix ".json". The segment must be non-empty and contain no '/', so
+  // `/user/` and `/user/1/2` still reach JS. It goes out as it is on the wire,
+  // undecoded (what uWS's writeParameterValue does) - a route that needs
+  // decoding stays a JS route. Method policy is JS's, as for static routes.
+  struct ParamRoute {
+    int32_t method;
+    std::string prefix;
+    std::string suffix;
+    ResponseTemplate tpl;
+  };
+  void setParamRoute(int32_t method, std::string prefix, std::string suffix, ResponseTemplate&& tpl) {
+    for (ParamRoute& existing : paramRoutes_) {
+      if (existing.method == method && existing.prefix == prefix && existing.suffix == suffix) {
+        existing.tpl = std::move(tpl);
+        return;
+      }
+    }
+    paramRoutes_.push_back(ParamRoute{method, std::move(prefix), std::move(suffix), std::move(tpl)});
+  }
+  void clearParamRoutes() { paramRoutes_.clear(); }
+  // Any engine-answered route registered (static or parameter): the dispatch
+  // sites test this once per request before trying either table.
+  bool hasEngineRoutes() const { return !staticRoutes_.empty() || !paramRoutes_.empty(); }
+
   // ---- response API (called by the binding, by reqId->Connection) ----
 
   // Responses that MUST NOT carry a body or Content-Length (RFC 9110 §6.4.1, §15.3.5): 1xx informational, 204 No Content, 304 Not Modified.
@@ -1514,7 +1542,7 @@ class Server {
       std::string cont = "HTTP/1.1 100 Continue\r\n\r\n";
       writeOut(c, std::move(cont), /*terminal=*/false);
     }
-    if (!staticRoutes_.empty()) tryStaticRoute(c);
+    if (hasEngineRoutes()) tryStaticRoute(c);
   }
 
   uint32_t nextReqId() {
@@ -1856,17 +1884,39 @@ class Server {
     // Static route: answered right here with the SAME respond() the binding
     // calls, so framing, HEAD handling, corking and keep-alive are identical -
     // the only thing skipped is the trip through JS.
-    if (!staticRoutes_.empty() && tryStaticRoute(c)) return;
+    if (hasEngineRoutes() && tryStaticRoute(c)) return;
     if (cb_.onRequest) cb_.onRequest(cb_.user, c);
   }
 
   bool tryStaticRoute(Connection* c) {
-    auto it = staticRoutes_.find(c->path);
-    if (it == staticRoutes_.end()) return false;
     const int32_t m = static_cast<int32_t>(c->method);
-    for (const StaticRoute& r : it->second) {
+    auto it = staticRoutes_.find(c->path);
+    if (it != staticRoutes_.end()) {
+      for (const StaticRoute& r : it->second) {
+        if (r.method != m) continue;
+        respond(c, r.tpl.status, r.tpl.headers, r.tpl.customCL, r.body.data(), r.body.size());
+        return true;
+      }
+    }
+    return tryParamRoute(c, m);
+  }
+
+  // The parameter table is a handful of entries scanned linearly; the body
+  // points into the Connection's own path, which respond() copies out before
+  // returning, so nothing is allocated per request.
+  bool tryParamRoute(Connection* c, int32_t m) {
+    if (paramRoutes_.empty()) return false;
+    const std::string& p = c->path;
+    for (const ParamRoute& r : paramRoutes_) {
       if (r.method != m) continue;
-      respond(c, r.tpl.status, r.tpl.headers, r.tpl.customCL, r.body.data(), r.body.size());
+      const size_t fixed = r.prefix.size() + r.suffix.size();
+      if (p.size() <= fixed) continue;
+      if (p.compare(0, r.prefix.size(), r.prefix) != 0) continue;
+      if (!r.suffix.empty() && p.compare(p.size() - r.suffix.size(), r.suffix.size(), r.suffix) != 0) continue;
+      const char* seg = p.data() + r.prefix.size();
+      const size_t len = p.size() - fixed;
+      if (std::memchr(seg, '/', len) != nullptr) continue;
+      respond(c, r.tpl.status, r.tpl.headers, r.tpl.customCL, seg, len);
       return true;
     }
     return false;
@@ -2918,6 +2968,7 @@ class Server {
   // hot path allocates nothing. One or two methods per path in any real app,
   // so the per-path vector is scanned linearly.
   std::unordered_map<std::string, std::vector<StaticRoute>> staticRoutes_;
+  std::vector<ParamRoute> paramRoutes_;
   ServerCallbacks cb_;
   HttpLimits limits_;
   size_t maxPending_ = 0;  // per-connection not-yet-parsed backlog cap
