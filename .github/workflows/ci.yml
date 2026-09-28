@@ -96,7 +96,7 @@ jobs:
         run: env ${{ matrix.envvar }} sh -c 'npm run test:smoke && npm run test:suites'
 
   # The io_uring transport: every suite on kernels that have it (24.04 =
-  # 6.8), REQUIRE makes a silent fallback to libuv a failure. Runs on both
+  # 6.8), REQUIRE makes a silent fallback to epoll a failure. Runs on both
   # arches; the musl build gets its own container lane below.
   integration-uring:
     strategy:
@@ -127,9 +127,10 @@ jobs:
 
   # Silent degradation proof: Docker's default seccomp profile blocks
   # io_uring_setup (an explicit profile here so the lane is deterministic
-  # across Docker versions); the engine must select libuv, report why, and
-  # pass the suites. Then the same container with seccomp lifted must run
-  # io_uring - which is exactly what the-benchmarker needs to exercise it.
+  # across Docker versions); the engine must fall back to epoll (the Linux
+  # default since 1.1.10), report why, and pass the suites. Then the same
+  # container with seccomp lifted must run io_uring - which is exactly what
+  # the-benchmarker needs to exercise it.
   fallback-seccomp:
     runs-on: ubuntu-24.04
     steps:
@@ -138,11 +139,11 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo node:24-bookworm \
             sh -c "apt-get update -qq >/dev/null && apt-get install -y -qq g++ >/dev/null && CXX=g++ node tools/build.mjs"
-      - name: io_uring blocked by seccomp -> libuv, with the reason
+      - name: io_uring blocked by seccomp -> epoll, with the reason
         run: |
           docker run --rm --security-opt seccomp=test/ci/seccomp-block-io_uring.json \
-            -v "$PWD:/repo" -w /repo -e MORO_ENGINE_TRANSPORT=uring -e MORO_ENGINE_REQUIRE_TRANSPORT=uv node:24-bookworm \
-            sh -c "node -e \"const p=require('./packages/engine').probe(); console.log(p.transport, '-', p.transportReason); if (p.transport!=='uv' || !/EPERM|ENOSYS/.test(p.transportReason)) process.exit(1)\" && npm run test:smoke && node --test test/conformance.test.mjs test/probe-transport.test.mjs"
+            -v "$PWD:/repo" -w /repo -e MORO_ENGINE_TRANSPORT=uring -e MORO_ENGINE_REQUIRE_TRANSPORT=epoll node:24-bookworm \
+            sh -c "node -e \"const p=require('./packages/engine').probe(); console.log(p.transport, '-', p.transportReason); if (p.transport!=='epoll' || !/EPERM|ENOSYS/.test(p.transportReason)) process.exit(1)\" && npm run test:smoke && node --test test/conformance.test.mjs test/probe-transport.test.mjs"
       - name: seccomp lifted -> io_uring inside the container
         run: |
           docker run --rm --security-opt seccomp=unconfined \
