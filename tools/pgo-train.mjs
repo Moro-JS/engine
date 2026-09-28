@@ -7,10 +7,11 @@
 //   node tools/pgo-train.mjs [--seconds=N] [--no-suites]
 //
 // Workload (in-process servers, one raw-socket client each, pipelined at
-// depth 1 and depth 10):
+// depth 1 and depth 10, then a closed loop over 64 keep-alive connections):
 //   - respond()            JSON hello (the benchmark shape)
 //   - respondPrepared()    same via a template
 //   - static route         answered inside the engine
+//   - parameter route      answered inside the engine
 //   - writeHead/write/end  chunked streaming
 //   - HEAD, 404, an empty 204
 //   - WebSocket echo (text frames)
@@ -109,6 +110,9 @@ const port = engine.listen(sid, '127.0.0.1', 0);
 tpl = engine.prepareResponse(sid, 200, HEADERS);
 engine.setStaticRoute(sid, 0, '/static', 200, HEADERS, BODY);
 engine.setStaticRoute(sid, 5, '/static', 200, HEADERS, BODY);
+engine.setStaticRoute(sid, 0, '/plain', 200, null, '');
+engine.setStaticRoute(sid, 1, '/plain', 200, null, '');
+if (info.capabilities?.paramRoutes) engine.setParamRoute(sid, 0, '/user/', '', 200, null);
 const phase = (name) => console.log(`training: ${name}`);
 
 // Drive one connection with a pipelined request block for `ms` milliseconds.
@@ -131,6 +135,37 @@ function hammer(port, block, ms, { connect = (cb) => net.connect(port, '127.0.0.
   });
 }
 
+// Many keep-alive connections, one request in flight on each (the shape a
+// closed-loop load generator such as the web-frameworks harness drives):
+// every read carries exactly one request, so the batch loop stages one slot,
+// answers it and flushes one write per request. `block` is one request.
+function closedLoop(port, block, connections, ms) {
+  return new Promise((resolve) => {
+    let open = 0;
+    let done = false;
+    const finish = () => {
+      if (!done) {
+        done = true;
+        resolve();
+      }
+    };
+    const deadline = Date.now() + ms;
+    for (let i = 0; i < connections; i++) {
+      const sock = net.connect(port, '127.0.0.1', () => sock.write(block));
+      open++;
+      sock.on('data', () => {
+        if (Date.now() > deadline) sock.destroy();
+        else sock.write(block);
+      });
+      sock.on('error', () => {});
+      sock.on('close', () => {
+        if (--open === 0) finish();
+      });
+    }
+    setTimeout(finish, ms + 2000);
+  });
+}
+
 const req = (method, path) => `${method} ${path} HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`;
 const paths = ['/', '/tpl', '/static', '/empty', '/stream', '/nocontent', '/big', '/missing'];
 const perPhase = (seconds * 1000) / (paths.length * 3);
@@ -140,6 +175,16 @@ for (const path of paths) {
   await hammer(port, req('GET', path), perPhase);
   await hammer(port, req('GET', path).repeat(10), perPhase);
   await hammer(port, req('HEAD', path), perPhase / 2);
+}
+
+// Closed loop over 64 keep-alive connections: the engine-answered routes
+// (static, empty static, parameter) and a JS-answered one, GET and POST.
+phase('closed-loop keep-alive');
+{
+  const shapes = [req('GET', '/plain'), req('GET', '/static'), req('POST', '/plain'), req('GET', '/')];
+  if (info.capabilities?.paramRoutes) shapes.push(req('GET', '/user/42'));
+  const per = (seconds * 1000) / shapes.length;
+  for (const block of shapes) await closedLoop(port, block, 64, per);
 }
 // Connection-per-request shape (accept path).
 phase('connection per request');

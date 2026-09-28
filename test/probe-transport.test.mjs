@@ -25,21 +25,24 @@ const ENGINE_ENTRY = new URL('../packages/engine/index.mjs', import.meta.url).hr
 describe('transport selection', { skip }, () => {
   it('probe() reports the transport and a reason', T, () => {
     const p = engine.probe();
-    assert.ok(p.transport === 'uv' || p.transport === 'uring', `transport: ${p.transport}`);
+    assert.ok(['uv', 'uring', 'epoll'].includes(p.transport), `transport: ${p.transport}`);
     assert.equal(typeof p.transportReason, 'string');
     assert.ok(p.transportReason.length > 0);
     if (p.transport === 'uring') assert.equal(p.transportReason, 'ok');
     if (process.platform !== 'linux') {
       assert.equal(p.transport, 'uv');
       assert.equal(p.transportReason, 'platform');
-    } else if (process.env.MORO_ENGINE_TRANSPORT !== 'uring') {
+    } else if (process.env.MORO_ENGINE_TRANSPORT === 'uv') {
       assert.equal(p.transport, 'uv');
-      assert.match(p.transportReason, /opt-in|MORO_ENGINE_TRANSPORT=uv/);
+      assert.equal(p.transportReason, 'MORO_ENGINE_TRANSPORT=uv');
+    } else if (process.env.MORO_ENGINE_TRANSPORT !== 'uring') {
+      assert.equal(p.transport, 'epoll');
+      assert.match(p.transportReason, /default|MORO_ENGINE_TRANSPORT=epoll/);
     }
     console.log(`transport: ${p.transport} (${p.transportReason})`);
   });
 
-  it('without MORO_ENGINE_TRANSPORT a Linux host stays on libuv (opt-in)', T, () => {
+  it('without MORO_ENGINE_TRANSPORT a Linux host runs epoll; io_uring stays opt-in', T, () => {
     const script = `
       const { default: engine } = await import(${JSON.stringify(ENGINE_ENTRY)});
       const p = engine.probe();
@@ -50,8 +53,8 @@ describe('transport selection', { skip }, () => {
     const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { env, encoding: 'utf8' });
     assert.equal(r.status, 0, r.stderr);
     const out = JSON.parse(r.stdout.trim());
-    assert.equal(out.transport, 'uv');
-    if (process.platform === 'linux') assert.match(out.reason, /opt-in/);
+    assert.equal(out.transport, process.platform === 'linux' ? 'epoll' : 'uv');
+    if (process.platform === 'linux') assert.match(out.reason, /default.*opt-in/);
   });
 
   it('MORO_ENGINE_TRANSPORT=uv forces libuv', T, () => {

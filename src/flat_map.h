@@ -34,6 +34,7 @@ class FlatMap {
   bool contains(uint32_t k) const { return keys_[probe(k)] == k; }
 
   void insert(uint32_t k, V v) {
+    if (k == 0) return;  // the empty-slot marker cannot be a key
     if ((size_ + 1) * 2 > keys_.size()) grow();
     size_t i = probe(k);
     if (keys_[i] != k) {
@@ -44,6 +45,11 @@ class FlatMap {
   }
 
   void erase(uint32_t k) {
+    // 0 is the empty-slot marker, never a key (see insert): erasing it would
+    // "find" the first empty slot, shift live entries into it and decrement
+    // size_ below the live count - after enough of those the table reports
+    // itself empty while it is full and probe() never terminates.
+    if (k == 0) return;
     size_t i = probe(k);
     if (keys_[i] != k) return;
     // Backward-shift deletion: walk the chain after the hole and pull back

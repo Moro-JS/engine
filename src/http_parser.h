@@ -121,6 +121,24 @@ class HttpParser {
   // When ParseStatus::Error is returned, the status to send back before closing the connection (400, 413, 414, 431, 505).
   int errorStatus = 400;
 
+  // Route-first parsing. The server installs `routeHook`; after each request
+  // line the parser asks whether this request will be answered inside the
+  // engine (a static or parameter route with nothing queued ahead of it).
+  // When it will, the headers are validated and the framing ones interpreted
+  // exactly as always, but none are stored: no name lowering into a slot, no
+  // value copy, and `headers` is left as it was for the next request JS sees.
+  // light() reports the mode of the request being parsed.
+  using RouteHook = bool (*)(void* user, Method m, const std::string& path);
+  RouteHook routeHook = nullptr;
+  void* routeHookUser = nullptr;
+  bool light() const { return light_; }
+
+  // Framing-relevant headers of the current request, recorded while the
+  // header lines are scanned (in both modes), so no consumer walks the
+  // header list again for them.
+  bool expectContinue() const { return expectContinue_; }
+  bool hasUpgrade() const { return hasUpgrade_; }
+
   // Feed newly received bytes. Consumes from an internal accumulation buffer; callers append to inbound() or pass data here. Returns the parse status; on Complete, bytesConsumed() tells how many bytes of the input formed this request (the remainder is a pipelined follow-up request).
   ParseStatus parse(const char* data, size_t len);
 
@@ -133,6 +151,10 @@ class HttpParser {
 
   // True while a request is partially received (some bytes buffered or the head parsed but the body incomplete). Drives the request-timeout sweep: an idle keep-alive connection with no buffered bytes is NOT mid-request.
   bool midRequest() const { return headParsed() || buf_.size() > consumed_; }
+
+  // Nothing buffered and no request in progress: the next read starts a
+  // request at its first byte (what the server's fast lane needs).
+  bool idle() const { return buf_.empty() && state_ == State::RequestLine; }
 
   const char* findHeader(std::string_view lowercaseName) const;
 
@@ -158,6 +180,13 @@ class HttpParser {
   bool parseRequestLine(std::string_view line);
   bool parseHeaderLine(std::string_view line);
   bool finalizeHeaders();  // resolve body framing (Content-Length vs chunked)
+  // Interpret one header for framing / connection semantics; `lname` is the
+  // lowercased field name. Runs as each line is parsed, in both modes.
+  void classifyHeader(std::string_view lname, std::string_view value);
+  // Zero-copy head scan for a request that arrives whole in one read and is
+  // answered inside the engine (parse() tries it first; see the definitions).
+  bool parseDirect(const char* data, size_t len, ParseStatus& st);
+  int scanLightHeaders(const unsigned char* d, size_t len, size_t& pos);
 
   const Limits* limits_;
   std::string buf_;
@@ -166,6 +195,19 @@ class HttpParser {
   State state_ = State::RequestLine;
   // headers[0..headerCount_) belong to the CURRENT request; slots past it are retained from a previous request purely as assignment targets (their string capacities are reused - see parseHeaderLine). The vector is trimmed to headerCount_ when the head completes, before any consumer reads it.
   size_t headerCount_ = 0;
+  bool light_ = false;  // this request's headers are scanned, not stored
+
+  // Accumulated by classifyHeader(); finalizeHeaders() resolves them.
+  size_t hostCount_ = 0;
+  bool sawClose_ = false;
+  bool sawKeepAlive_ = false;
+  size_t teCount_ = 0;
+  bool teChunked_ = false;
+  bool hasCL_ = false;
+  size_t cl_ = 0;
+  int clError_ = 0;
+  bool expectContinue_ = false;
+  bool hasUpgrade_ = false;
 
   // Body framing resolved after headers
   bool chunked_ = false;
@@ -179,7 +221,15 @@ class HttpParser {
 
 // ---- small helpers (header-inline for the single-TU addon build) ----
 
-inline bool iequals(std::string_view a, std::string_view b) {
+// Hot on every header line (trimOWS) and framing token (iequals): force the
+// inline the optimizer otherwise declines for these call sites.
+#if defined(__GNUC__)
+#define MORO_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#define MORO_ALWAYS_INLINE inline
+#endif
+
+MORO_ALWAYS_INLINE bool iequals(std::string_view a, std::string_view b) {
   if (a.size() != b.size()) return false;
   for (size_t i = 0; i < a.size(); ++i) {
     char ca = a[i], cb = b[i];
@@ -190,7 +240,7 @@ inline bool iequals(std::string_view a, std::string_view b) {
   return true;
 }
 
-inline std::string_view trimOWS(std::string_view s) {
+MORO_ALWAYS_INLINE std::string_view trimOWS(std::string_view s) {
   // RFC 9110 §5.6.3 OWS = *( SP / HTAB )
   size_t b = 0, e = s.size();
   while (b < e && (s[b] == ' ' || s[b] == '\t')) ++b;
@@ -221,20 +271,26 @@ inline Method methodFrom(std::string_view m) {
   return Method::OTHER;
 }
 
-// A token char per RFC 9110 §5.6.2 (used to validate method + header names)
-inline bool isTokenChar(unsigned char c) {
-  if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-      (c >= '0' && c <= '9'))
-    return true;
-  switch (c) {
-    case '!': case '#': case '$': case '%': case '&': case '\'': case '*':
-    case '+': case '-': case '.': case '^': case '_': case '`': case '|':
-    case '~':
-      return true;
-    default:
-      return false;
-  }
-}
+// A token char per RFC 9110 §5.6.2 (used to validate method + header names):
+// one table lookup per byte.
+inline constexpr std::array<bool, 256> kTokenChar = [] {
+  std::array<bool, 256> t{};
+  for (unsigned c = 'a'; c <= 'z'; ++c) t[c] = true;
+  for (unsigned c = 'A'; c <= 'Z'; ++c) t[c] = true;
+  for (unsigned c = '0'; c <= '9'; ++c) t[c] = true;
+  for (unsigned char c : {'!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~'})
+    t[c] = true;
+  return t;
+}();
+inline bool isTokenChar(unsigned char c) { return kTokenChar[c]; }
+
+// A byte allowed in a field value (RFC 9110 §5.5: VCHAR / SP / HTAB /
+// obs-text): everything but C0 controls other than HTAB, and DEL.
+inline constexpr std::array<bool, 256> kValueChar = [] {
+  std::array<bool, 256> t{};
+  for (unsigned c = 0; c < 256; ++c) t[c] = !((c < 0x20 && c != '\t') || c == 0x7f);
+  return t;
+}();
 
 // Byte lowercase table (identity except A-Z -> a-z), for the per-request
 // header-name lowering: a table lookup instead of a per-char compare/branch.
@@ -279,6 +335,15 @@ inline void HttpParser::reset() {
   minorVersion = 1;
   // Do NOT clear headers: keep the vector and its strings as assignment targets for the next request (parseHeaderLine reuses their capacities).
   headerCount_ = 0;
+  light_ = false;
+  hostCount_ = 0;
+  sawClose_ = sawKeepAlive_ = false;
+  teCount_ = 0;
+  teChunked_ = false;
+  hasCL_ = false;
+  cl_ = 0;
+  clError_ = 0;
+  expectContinue_ = hasUpgrade_ = false;
   body.clear();
   // A huge body's capacity must not stay pinned to an idle keep-alive connection; small (typical) bodies keep theirs for reuse.
   if (body.capacity() > 16384) body.shrink_to_fit();
@@ -301,21 +366,17 @@ inline const char* HttpParser::findHeader(std::string_view name) const {
 }
 
 inline bool HttpParser::parseRequestLine(std::string_view line) {
-  // RFC 9112 §3: request-line = method SP request-target SP HTTP-version
-  size_t sp1 = line.find(' ');
-  if (sp1 == std::string_view::npos) return false;
-  size_t sp2 = line.find(' ', sp1 + 1);
-  if (sp2 == std::string_view::npos) return false;
-
-  std::string_view m = line.substr(0, sp1);
-  std::string_view t = line.substr(sp1 + 1, sp2 - sp1 - 1);
-  std::string_view v = line.substr(sp2 + 1);
-
-  if (m.empty() || t.empty()) return false;
-  for (char c : m) {
-    if (!isTokenChar(static_cast<unsigned char>(c))) return false;
-  }
-
+  // RFC 9112 §3: request-line = method SP request-target SP HTTP-version.
+  // One pass per field: the method is scanned while it is validated (token
+  // chars up to the SP), the target likewise (no C0 byte, no DEL, up to the
+  // SP) - a byte that is neither valid nor the delimiter ends the scan short
+  // of the delimiter and rejects the line, exactly as find-then-validate did.
+  const size_t n = line.size();
+  size_t i = 0;
+  while (i < n && kTokenChar[static_cast<unsigned char>(line[i])]) ++i;
+  if (i == 0 || i >= n || line[i] != ' ') return false;
+  std::string_view m = line.substr(0, i);
+  const size_t tStart = i + 1;
   // Request-target hygiene (RFC 9112 §3.2 / RFC 3986): reject raw control
   // bytes. Only the line-terminating CRLF is stripped by the caller, so a
   // bare CR, NUL, any other C0 byte, or DEL would otherwise reach the app
@@ -324,10 +385,15 @@ inline bool HttpParser::parseRequestLine(std::string_view line) {
   // Node), and absolute-form / authority-form targets pass through opaquely
   // (RFC 9112 §3.2.2 requires accepting absolute-form; routing on it is the
   // app's / fronting proxy's business, again matching Node).
-  for (char c : t) {
-    const unsigned char u = static_cast<unsigned char>(c);
+  size_t j = tStart;
+  while (j < n && line[j] != ' ') {
+    const unsigned char u = static_cast<unsigned char>(line[j]);
     if (u < 0x20 || u == 0x7f) return false;  // errorStatus stays 400
+    ++j;
   }
+  if (j >= n || j == tStart) return false;  // no second SP, or an empty target
+  std::string_view t = line.substr(tStart, j - tStart);
+  std::string_view v = line.substr(j + 1);
   if (limits_->maxUriSize && t.size() > limits_->maxUriSize) {
     errorStatus = 414;
     return false;
@@ -348,7 +414,7 @@ inline bool HttpParser::parseRequestLine(std::string_view line) {
   }
 
   // HTTP-version = "HTTP/" DIGIT "." DIGIT  (RFC 9112 §2.3)
-  if (v.size() != 8 || v.substr(0, 5) != "HTTP/" || v[6] != '.' ||
+  if (v.size() != 8 || memcmp(v.data(), "HTTP/", 5) != 0 || v[6] != '.' ||
       v[5] < '0' || v[5] > '9' || v[7] < '0' || v[7] > '9') {
     errorStatus = 400;
     return false;
@@ -365,15 +431,15 @@ inline bool HttpParser::parseRequestLine(std::string_view line) {
 
 inline bool HttpParser::parseHeaderLine(std::string_view line) {
   // field-line = field-name ":" OWS field-value OWS   (RFC 9112 §5)
-  size_t colon = line.find(':');
-  if (colon == std::string_view::npos || colon == 0) return false;
+  // The name is scanned while it is validated: token chars up to the colon.
+  // No whitespace (or any other non-token byte) may sit between the name and
+  // the colon (RFC 9112 §5.1 - request smuggling / header injection); such a
+  // byte ends the scan short of the colon and rejects the line.
+  size_t colon = 0;
+  while (colon < line.size() && kTokenChar[static_cast<unsigned char>(line[colon])]) ++colon;
+  if (colon == 0 || colon >= line.size() || line[colon] != ':') return false;
 
   std::string_view name = line.substr(0, colon);
-  // No whitespace allowed between field name and colon (RFC 9112 §5.1 - reject to prevent request smuggling / header injection)
-  for (char c : name) {
-    if (!isTokenChar(static_cast<unsigned char>(c))) return false;
-  }
-
   std::string_view value = trimOWS(line.substr(colon + 1));
   // Field-value byte discipline (RFC 9110 §5.5: VCHAR / SP / HTAB /
   // obs-text). A bare CR, NUL, or other C0 byte in a value would be handed
@@ -381,8 +447,21 @@ inline bool HttpParser::parseHeaderLine(std::string_view line) {
   // inbound twin of the response-side validHeaderValue filter. obs-text
   // (0x80+) stays allowed, matching Node.
   for (char c : value) {
-    const unsigned char u = static_cast<unsigned char>(c);
-    if ((u < 0x20 && u != '\t') || u == 0x7f) return false;
+    if (!kValueChar[static_cast<unsigned char>(c)]) return false;
+  }
+
+  if (light_) {
+    // Engine-answered request: nothing stores this header. Lower the name on
+    // the stack for classification (every framing header is <= 17 bytes; a
+    // longer name cannot be one of them).
+    if (name.size() <= 20) {
+      char lname[20];
+      for (size_t i = 0; i < name.size(); ++i)
+        lname[i] = static_cast<char>(kLowercase[static_cast<unsigned char>(name[i])]);
+      classifyHeader(std::string_view(lname, name.size()), value);
+    }
+    ++headerCount_;
+    return true;
   }
 
   // Reuse a slot (and its strings' heap capacities) from a previous request when one is available - header parsing is allocation-free on a warm keep-alive connection.
@@ -393,6 +472,7 @@ inline bool HttpParser::parseHeaderLine(std::string_view line) {
       h.name[i] =
           static_cast<char>(kLowercase[static_cast<unsigned char>(name[i])]);
     h.value.assign(value.data(), value.size());
+    classifyHeader(h.name, h.value);
   } else {
     Header h;
     h.name.resize(name.size());
@@ -400,119 +480,94 @@ inline bool HttpParser::parseHeaderLine(std::string_view line) {
       h.name[i] =
           static_cast<char>(kLowercase[static_cast<unsigned char>(name[i])]);
     h.value.assign(value);
+    classifyHeader(h.name, h.value);
     headers.push_back(std::move(h));
   }
   ++headerCount_;
   return true;
 }
 
-inline bool HttpParser::finalizeHeaders() {
-  // One pass over the headers (they were four), dispatching on the lowercased
-  // name's length then a memcmp. Error PRECEDENCE must match the old pass
-  // order - Host discipline first, then Content-Length parse errors - so a
-  // Content-Length failure is recorded in clError here and only reported
-  // after the Host check below.
-  size_t hostCount = 0;
-  bool sawClose = false, sawKeepAlive = false;
-  const char* te = nullptr;
-  size_t teCount = 0;
-  bool hasCL = false;
-  size_t clCount = 0;
-  size_t cl = 0;
-  int clError = 0;
-  for (const auto& h : headers) {
-    const std::string& n = h.name;
-    switch (n.size()) {
-      case 4:
-        if (memcmp(n.data(), "host", 4) == 0) ++hostCount;
-        break;
-      case 10:
-        // Connection handling (RFC 9110 §7.6.1). The field is a comma-separated list of connection options; tokenize every Connection header so "keep-alive, close" or "close, foo" are honored. A "close" token anywhere wins over "keep-alive"; otherwise a "keep-alive" token overrides the version default.
-        if (memcmp(n.data(), "connection", 10) == 0) {
-          std::string_view c = h.value;
-          size_t pos = 0;
-          while (pos <= c.size()) {
-            size_t comma = c.find(',', pos);
-            std::string_view tok =
-                trimOWS(c.substr(pos, comma == std::string_view::npos ? c.size() - pos : comma - pos));
-            if (iequals(tok, "close")) sawClose = true;
-            else if (iequals(tok, "keep-alive")) sawKeepAlive = true;
-            if (comma == std::string_view::npos) break;
-            pos = comma + 1;
-          }
+inline void HttpParser::classifyHeader(std::string_view n, std::string_view v) {
+  switch (n.size()) {
+    case 4:
+      if (memcmp(n.data(), "host", 4) == 0) ++hostCount_;
+      break;
+    case 6:
+      if (memcmp(n.data(), "expect", 6) == 0 && iequals(trimOWS(v), "100-continue")) expectContinue_ = true;
+      break;
+    case 7:
+      if (memcmp(n.data(), "upgrade", 7) == 0) hasUpgrade_ = true;
+      break;
+    case 10:
+      if (memcmp(n.data(), "connection", 10) == 0) {
+        // The single-token values first: no comma scan for the common case.
+        if (v.size() == 10 && iequals(v, "keep-alive")) { sawKeepAlive_ = true; break; }
+        if (v.size() == 5 && iequals(v, "close")) { sawClose_ = true; break; }
+        size_t pos = 0;
+        while (pos <= v.size()) {
+          size_t comma = v.find(',', pos);
+          std::string_view tok =
+              trimOWS(v.substr(pos, comma == std::string_view::npos ? v.size() - pos : comma - pos));
+          if (iequals(tok, "close")) sawClose_ = true;
+          else if (iequals(tok, "keep-alive")) sawKeepAlive_ = true;
+          if (comma == std::string_view::npos) break;
+          pos = comma + 1;
         }
-        break;
-      case 14:
-        // clError == 0 guard: the old dedicated pass stopped at its FIRST bad
-        // Content-Length; later CL headers must stay unparsed.
-        if (memcmp(n.data(), "content-length", 14) == 0 && clError == 0) {
-          clCount++;
-          // Reject conflicting duplicate Content-Length (RFC 9112 §6.3.5)
-          size_t parsed = 0;
-          if (h.value.empty()) { clError = 400; break; }
-          for (char c : h.value) {
-            if (c < '0' || c > '9') { clError = 400; break; }
-            parsed = parsed * 10 + static_cast<size_t>(c - '0');
-            // Reject once the value exceeds the body limit, DURING accumulation.
-            // A long digit string (allowed within maxHeadSize) would otherwise
-            // overflow size_t, wrap to a small value, slip past the post-loop 413
-            // check, and desync the body length -> request smuggling.
-            if (parsed > limits_->maxBodySize) { clError = 413; break; }
-          }
-          if (clError) break;
-          if (hasCL && parsed != cl) { clError = 400; break; }
-          cl = parsed;
-          hasCL = true;
+      }
+      break;
+    case 14:
+      if (memcmp(n.data(), "content-length", 14) == 0 && clError_ == 0) {
+        if (v.empty()) { clError_ = 400; break; }
+        size_t parsed = 0;
+        for (char c : v) {
+          if (c < '0' || c > '9') { clError_ = 400; break; }
+          parsed = parsed * 10 + static_cast<size_t>(c - '0');
+          if (parsed > limits_->maxBodySize) { clError_ = 413; break; }
         }
-        break;
-      case 17:
-        // Count Transfer-Encoding headers: RFC 9112 §6.1 requires the FINAL coding to be chunked. The engine only supports a lone "chunked", so more than one TE header (e.g. "chunked" then "cow") is a smuggling vector and is rejected (below).
-        if (memcmp(n.data(), "transfer-encoding", 17) == 0) {
-          teCount++;
-          te = h.value.c_str();
-        }
-        break;
-    }
+        if (clError_) break;
+        if (hasCL_ && parsed != cl_) { clError_ = 400; break; }
+        cl_ = parsed;
+        hasCL_ = true;
+      }
+      break;
+    case 17:
+      if (memcmp(n.data(), "transfer-encoding", 17) == 0) {
+        teCount_++;
+        teChunked_ = iequals(trimOWS(v), "chunked");  // the last one decides, as before
+      }
+      break;
+    default:
+      break;
   }
+}
 
-  // Host discipline (RFC 9112 §3.2): an HTTP/1.1 request MUST carry exactly
-  // one Host header - answer 400 to zero (1.1+ only; 1.0 predates Host) or
-  // more than one (any version). Absent/duplicate Host is a building block
-  // for host-confusion and cache-poisoning when the app or a fronting proxy
-  // routes on it; the parser is the one place that can reject it before any
-  // routing sees the request. Node's http server enforces the same
-  // (requireHostHeader, default on).
-  if (hostCount > 1 || (hostCount == 0 && minorVersion >= 1)) {
+inline bool HttpParser::finalizeHeaders() {
+  // Every header was classified as its line was parsed (classifyHeader);
+  // this resolves what they add up to.
+  if (hostCount_ > 1 || (hostCount_ == 0 && minorVersion >= 1)) {
     errorStatus = 400;
     return false;
   }
 
-  if (sawClose) keepAlive = false;
-  else if (sawKeepAlive) keepAlive = true;
+  if (sawClose_) keepAlive = false;
+  else if (sawKeepAlive_) keepAlive = true;
 
-  if (clError) { errorStatus = clError; return false; }
-  (void)clCount;
+  if (clError_) { errorStatus = clError_; return false; }
 
-  if (te != nullptr) {
-    // Request smuggling defense (RFC 9112 §6.1, §6.3.3): if both TE and CL are
-    // present, reject. A sender MUST NOT send both.
-    if (hasCL) { errorStatus = 400; return false; }
-    // Multiple Transfer-Encoding headers can't be resolved to a single final
-    // coding safely (a fronting proxy may honor a different one) — reject.
-    if (teCount > 1) { errorStatus = 400; return false; }
-    // Only "chunked" (as the sole/final encoding) is supported.
-    std::string_view tev = trimOWS(std::string_view(te));
-    if (iequals(tev, "chunked")) {
+  if (teCount_ > 0) {
+    if (hasCL_) { errorStatus = 400; return false; }
+    if (teCount_ > 1) { errorStatus = 400; return false; }
+    if (teChunked_) {
       chunked_ = true;
       hasBody_ = true;
     } else {
       errorStatus = 400;  // unsupported / non-final chunked
       return false;
     }
-  } else if (hasCL) {
-    contentLength_ = cl;
-    hasBody_ = cl > 0;
-    if (cl > limits_->maxBodySize) { errorStatus = 413; return false; }
+  } else if (hasCL_) {
+    contentLength_ = cl_;
+    hasBody_ = cl_ > 0;
+    if (cl_ > limits_->maxBodySize) { errorStatus = 413; return false; }
   } else {
     hasBody_ = false;  // no body framing -> no body (RFC 9112 §6.3 point 6)
   }
@@ -520,8 +575,166 @@ inline bool HttpParser::finalizeHeaders() {
   return true;
 }
 
+// The header lines of an engine-answered request, scanned in place. Each
+// line gets exactly the checks parseHeaderLine applies - a token field name
+// up to the colon, a field value of VCHAR / SP / HTAB / obs-text, the header
+// count and head-size limits - and, when its name has the length of a
+// framing header, the same classification; nothing is stored. Returns 1
+// with `pos` just past the blank line, 0 when the bytes end inside a line
+// (`pos` at that line's start, where the buffered path resumes), -1 for a
+// rejected line (errorStatus set, 400 unless a limit says 431).
+inline int HttpParser::scanLightHeaders(const unsigned char* d, size_t len, size_t& pos) {
+  for (;;) {
+    if (pos >= len) return 0;
+    const void* nlp = memchr(d + pos, '\n', len - pos);
+    if (!nlp) return 0;  // a line is judged only once it is whole
+    size_t lineEnd = static_cast<size_t>(static_cast<const unsigned char*>(nlp) - d);
+    const size_t next = lineEnd + 1;
+    if (lineEnd > pos && d[lineEnd - 1] == '\r') --lineEnd;
+    if (lineEnd == pos) {  // the blank line ends the head
+      pos = next;
+      break;
+    }
+    if (headerCount_ >= limits_->maxHeaders) {
+      errorStatus = 431;
+      return -1;
+    }
+    // field-line = field-name ":" OWS field-value OWS   (RFC 9112 §5)
+    size_t i = pos;
+    while (i < lineEnd && kTokenChar[d[i]]) ++i;
+    if (i == pos || i >= lineEnd || d[i] != ':') return -1;
+    const size_t nameLen = i - pos;
+    ++i;
+    while (i < lineEnd && (d[i] == ' ' || d[i] == '\t')) ++i;
+    const size_t vs = i;
+    size_t ve = lineEnd;
+    while (ve > vs && (d[ve - 1] == ' ' || d[ve - 1] == '\t')) --ve;
+    for (size_t k = vs; k < ve; ++k) {
+      if (!kValueChar[d[k]]) return -1;
+    }
+    // Only a name the length of a framing header can be one (host, expect,
+    // upgrade, connection, content-length, transfer-encoding): lower it on
+    // the stack and let classifyHeader decide; any other name is skipped.
+    switch (nameLen) {
+      case 4:
+      case 6:
+      case 7:
+      case 10:
+      case 14:
+      case 17: {
+        char lname[17];
+        for (size_t k = 0; k < nameLen; ++k)
+          lname[k] = static_cast<char>(kLowercase[d[pos + k]]);
+        classifyHeader(std::string_view(lname, nameLen),
+                       std::string_view(reinterpret_cast<const char*>(d + vs), ve - vs));
+        break;
+      }
+      default:
+        break;
+    }
+    ++headerCount_;
+    pos = next;
+    if (pos > limits_->maxHeadSize) {
+      errorStatus = 431;
+      return -1;
+    }
+  }
+  if (pos > limits_->maxHeadSize) {
+    errorStatus = 431;
+    return -1;
+  }
+  return 1;
+}
+
+// A request arriving on an idle connection, straight from the read buffer.
+// The request line is parsed as always and the route hook asked; a request
+// JS will see (the hook says no) is handed to the buffered path with its
+// request line already parsed, so nothing is scanned twice. An
+// engine-answered one has its headers scanned in place (scanLightHeaders)
+// and, with no body to collect, completes without the bytes ever being
+// copied: only a pipelined remainder is kept in buf_. Anything unfinished -
+// a partial head, a body still to receive - goes to buf_ with the state
+// machine positioned where the scan stopped, and the buffered path continues
+// from there. Returns true when `st` is the result; false when the buffered
+// path must run (buf_ then holds the bytes).
+inline bool HttpParser::parseDirect(const char* data, size_t len, ParseStatus& st) {
+  const void* nlp = memchr(data, '\n', len);
+  if (!nlp) {  // no complete request line yet
+    buf_.append(data, len);
+    return false;
+  }
+  size_t lineEnd = static_cast<size_t>(static_cast<const char*>(nlp) - data);
+  const size_t nextScan = lineEnd + 1;
+  if (lineEnd > 0 && data[lineEnd - 1] == '\r') --lineEnd;
+  if (lineEnd == 0) {  // leading CRLF: the buffered path tolerates it
+    buf_.append(data, len);
+    return false;
+  }
+  if (!parseRequestLine(std::string_view(data, lineEnd))) {
+    if (errorStatus == 400 && len > limits_->maxHeadSize) errorStatus = 431;
+    buf_.append(data, len);
+    st = ParseStatus::Error;
+    return true;
+  }
+  if (nextScan > limits_->maxHeadSize) {
+    errorStatus = 431;
+    buf_.append(data, len);
+    st = ParseStatus::Error;
+    return true;
+  }
+  light_ = routeHook(routeHookUser, method, path);
+  state_ = State::Headers;
+  if (!light_) {  // JS will see this request: its headers are stored as always
+    buf_.append(data, len);
+    scanPos_ = nextScan;
+    return false;
+  }
+  size_t pos = nextScan;
+  const int r = scanLightHeaders(reinterpret_cast<const unsigned char*>(data), len, pos);
+  if (r < 0) {
+    buf_.append(data, len);
+    st = ParseStatus::Error;
+    return true;
+  }
+  if (r == 0) {  // head unfinished: resume from the incomplete line
+    buf_.append(data, len);
+    scanPos_ = pos;
+    return false;
+  }
+  if (!finalizeHeaders()) {
+    buf_.append(data, len);
+    st = ParseStatus::Error;
+    return true;
+  }
+  state_ = chunked_ ? State::ChunkSize : State::Body;
+  if (hasBody_) {  // the body is collected from buf_ as always
+    buf_.append(data, len);
+    headEnd_ = pos;
+    scanPos_ = pos;
+    return false;
+  }
+  // Complete, nothing copied; buf_ holds only what follows this request.
+  if (pos < len) buf_.assign(data + pos, len - pos);
+  consumed_ = 0;
+  scanPos_ = 0;
+  headEnd_ = 0;
+  state_ = State::Done;
+  st = ParseStatus::Complete;
+  return true;
+}
+
 inline ParseStatus HttpParser::parse(const char* data, size_t len) {
-  if (len) buf_.append(data, len);
+  if (len) {
+    // A fresh request with nothing buffered ahead of it: the zero-copy scan
+    // first. When it hands the request over instead, it has appended the
+    // bytes to buf_ and positioned the state machine itself.
+    if (buf_.empty() && state_ == State::RequestLine && routeHook) {
+      ParseStatus st;
+      if (parseDirect(data, len, st)) return st;
+    } else {
+      buf_.append(data, len);
+    }
+  }
 
   // --- head (request line + headers) ---
   while (state_ == State::RequestLine || state_ == State::Headers) {
@@ -552,6 +765,7 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
           errorStatus = 431;
         return ParseStatus::Error;
       }
+      light_ = routeHook != nullptr && routeHook(routeHookUser, method, path);
       state_ = State::Headers;
       scanPos_ = nextScan;
     } else {  // Headers
@@ -568,8 +782,9 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
           return ParseStatus::Error;
         }
         // Trim stale reuse-slots from a prior, larger request BEFORE any
-        // consumer can iterate the vector.
-        headers.resize(headerCount_);
+        // consumer can iterate the vector. (A light request stored nothing
+        // and has no consumer of `headers`; the slots stay for the next one.)
+        if (!light_) headers.resize(headerCount_);
         if (headerCount_ > limits_->maxHeaders) {
           errorStatus = 431;
           return ParseStatus::Error;

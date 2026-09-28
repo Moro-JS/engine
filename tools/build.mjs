@@ -325,6 +325,10 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null, fastApi = fa
     // stay exactly as-is.
     ...(!sanitize && arch === 'x64' ? ['-march=x86-64-v2'] : []),
     ...(!sanitize && arch === 'arm64' ? ['-march=armv8.2-a'] : []),
+    // Linux: call libc/libstdc++ through the GOT directly instead of PLT
+    // stubs. The addon is linked -z now (no lazy binding), so the stubs buy
+    // nothing, and memchr/memcpy/memcmp run on every request.
+    ...(!sanitize && platform === 'linux' ? ['-fno-plt'] : []),
     '-fvisibility=hidden',
     `-I${includeDir}`,
     '-DBUILDING_NODE_EXTENSION',

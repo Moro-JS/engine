@@ -94,18 +94,20 @@ export interface EngineProbeResult {
   notify?: 'deferred' | 'sync';
   /** Fast-call build/install diagnostics. */
   fastApi?: FastApiInfo;
-  /** I/O transport in use: 'uring' (Linux 6.1+ with io_uring permitted by the
-   *  sandbox) or 'uv' (libuv streams - macOS, Windows, older kernels,
-   *  seccomp-blocked containers, MORO_ENGINE_TRANSPORT=uv). Behaviour and wire
-   *  bytes are identical; only the syscall layer differs. */
-  transport?: 'uv' | 'uring';
-  /** Why the transport is not io_uring ('ok' when it is). */
+  /** I/O transport in use: 'epoll' (Linux default since 1.1.10: the engine's
+   *  own readiness loop on one uv_poll, no libuv stream per connection),
+   *  'uring' (Linux 6.1+, MORO_ENGINE_TRANSPORT=uring, when the sandbox
+   *  permits io_uring) or 'uv' (libuv streams - macOS, Windows,
+   *  MORO_ENGINE_TRANSPORT=uv). Behaviour and wire bytes are identical; only
+   *  the syscall layer differs. */
+  transport?: 'uv' | 'uring' | 'epoll';
+  /** Why this transport: 'ok' for io_uring, the default/override note otherwise. */
   transportReason?: string;
   /** 'uv', or the io_uring ring mode in use: 'defer-taskrun' (completions run
    *  as one batch inside the engine's own io_uring_enter, woken through a
    *  registered eventfd) or 'coop-taskrun' (the 1.1.6 mode). The probe tries
    *  defer first; MORO_ENGINE_URING_TASKRUN=coop|defer pins one. */
-  transportMode?: 'uv' | 'defer-taskrun' | 'coop-taskrun';
+  transportMode?: 'uv' | 'epoll' | 'defer-taskrun' | 'coop-taskrun';
   /** Per-thread fast/slow hit counters per hot entry point - present only when
    *  MORO_ENGINE_FASTCALL_STATS=1 was set when the addon loaded (test/CI proof
    *  that the fast path is taken). */

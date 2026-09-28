@@ -31,6 +31,9 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#if defined(__linux__)
+#include <sys/epoll.h>
+#endif
 #include "uring.h"
 #endif
 
@@ -45,10 +48,11 @@ namespace engine {
 
 // Cached RFC 9110 §5.6.7 Date header, refreshed at most once per second.
 // Holds the COMPLETE "Date: ...\r\n" line so the hot path appends it once.
-// time(nullptr), not uv_now: uv_now is loop time, not wall-clock.
-inline const std::string& httpDateLine() {
-  static thread_local std::string cached;
-  static thread_local time_t cachedAt = 0;
+// time(nullptr), not uv_now: uv_now is loop time, not wall-clock. The cache
+// lives on the caller (one per Server, which is one per loop thread): a
+// thread_local in a dlopen'd addon is a __tls_get_addr call per access, and
+// this ran on every response.
+inline void refreshHttpDateLine(std::string& cached, time_t& cachedAt) {
   time_t now = time(nullptr);
   if (now != cachedAt || cached.empty()) {
     char buf[48];
@@ -63,7 +67,6 @@ inline const std::string& httpDateLine() {
     cached.assign(buf);
     cachedAt = now;
   }
-  return cached;
 }
 
 // Append v in decimal - digits written backwards into a stack buffer, one
@@ -159,7 +162,23 @@ inline std::unordered_map<uint32_t, Connection*>& globalWebSockets() {
 // Server::preferredTransport): libuv streams everywhere, io_uring on Linux
 // when the kernel and the sandbox allow it. Behaviour and wire bytes are
 // identical; only the syscall layer differs.
-enum class TransportKind : uint8_t { Uv, Uring };
+enum class TransportKind : uint8_t { Uv, Uring, Epoll };
+
+#if defined(__linux__)
+// Per-connection state of the epoll transport (Server::EpollLoop): a plain
+// non-blocking socket driven straight from epoll_wait, no libuv stream.
+struct EpollConn {
+  int fd;               // the accepted socket (owned)
+  uint8_t state;        // 0 idle, 1 open, 2 closed (fd gone, free pending/done)
+  bool wantOut;         // EPOLLOUT armed: a queued write hit EAGAIN
+  bool eofSeen;         // EOF/error already routed once
+  bool inFlush;         // epollFlush is on the stack (re-entrant queueWrite just enqueues)
+  bool completionPending;  // fully-sent WriteReqs wait for epollCompleteWrites (clean stack)
+  size_t pendingBytes;  // queued write bytes the kernel has not accepted
+  void* wqHead;         // WriteReq* queue (intrusive, FIFO; WriteReq::next / sent)
+  void* wqTail;
+};
+#endif
 
 // One pre-parsed pipelined request waiting behind the active one (batched
 // dispatch, Server::dispatchBatch): the same snapshot fields the Connection
@@ -196,9 +215,29 @@ struct Connection {
     uv_tcp_t handle;
 #if defined(__linux__)
     uring::UringConn ring;
+    EpollConn ep;
 #endif
   };
   HttpParser parser;
+  // The engine route the parser's route hook matched for the request being
+  // parsed (light mode): answerFromParser() replies from it without a second
+  // lookup. Exactly one of the two is set; fastSeg points into parser.path.
+  StaticRoute* fastStatic = nullptr;
+  ParamRoute* fastParam = nullptr;
+  const char* fastSeg = nullptr;
+  size_t fastSegLen = 0;
+  // Repeat-request memo (Server::fastLane): the bytes of the last
+  // engine-answered request this connection sent whole in one read, and
+  // what answered it. A keep-alive client repeating that request byte for
+  // byte - a poller, a health check, a load generator - is answered without
+  // a parse. memoGen ties it to the route table it was taken against.
+  std::string memo;
+  uint32_t memoGen = 0;
+  StaticRoute* memoStatic = nullptr;
+  ParamRoute* memoParam = nullptr;
+  uint32_t memoSegOff = 0;  // the parameter segment, within memo
+  uint32_t memoSegLen = 0;
+  Method memoMethod = Method::OTHER;
 #if defined(_WIN32)
   // Per-connection receive buffer (uninitialized on purpose - uv only reads
   // back what the socket filled). Windows/IOCP posts this into an overlapped
@@ -356,7 +395,9 @@ class Server {
 
   uv_loop_t* loop() const { return loop_; }
   TransportKind transportKind() const { return kind_; }
-  static const char* transportName(TransportKind k) { return k == TransportKind::Uring ? "uring" : "uv"; }
+  static const char* transportName(TransportKind k) {
+    return k == TransportKind::Uring ? "uring" : k == TransportKind::Epoll ? "epoll" : "uv";
+  }
 
   // Decided ONCE per process: MORO_ENGINE_TRANSPORT=uv forces libuv
   // (diagnostics; `uring` is an accepted no-op hint); otherwise io_uring's
@@ -381,7 +422,8 @@ class Server {
   }
   // "uv", or the io_uring mode in use: "defer-taskrun" | "coop-taskrun".
   static const char* transportModeName() {
-    return preferredTransport() == TransportKind::Uring ? uringModeSlot().name : "uv";
+    return preferredTransport() == TransportKind::Uring ? uringModeSlot().name
+                                                        : transportName(preferredTransport());
   }
 #else
   static const char* transportModeName() { return "uv"; }
@@ -389,18 +431,25 @@ class Server {
 
   static TransportKind preferredTransport() {
 #if defined(__linux__)
+    // Linux: epoll by default (the engine's own readiness loop on a uv_poll,
+    // no libuv stream layer per connection), io_uring on request when the
+    // kernel and sandbox allow it, libuv on request. Decided once per process.
     static const TransportKind kind = [] {
       const char* env = std::getenv("MORO_ENGINE_TRANSPORT");
-      if (!env || std::strcmp(env, "uring") != 0) {
-        transportReasonSlot() = (env && std::strcmp(env, "uv") == 0)
-                                    ? "MORO_ENGINE_TRANSPORT=uv"
-                                    : "opt-in (set MORO_ENGINE_TRANSPORT=uring)";
+      if (env && std::strcmp(env, "uv") == 0) {
+        transportReasonSlot() = "MORO_ENGINE_TRANSPORT=uv";
         return TransportKind::Uv;
       }
-      uring::ProbeResult pr = uring::probe();
-      transportReasonSlot() = pr.reason;
-      if (pr.ok) uringModeSlot() = pr.mode;
-      return pr.ok ? TransportKind::Uring : TransportKind::Uv;
+      if (env && std::strcmp(env, "uring") == 0) {
+        uring::ProbeResult pr = uring::probe();
+        transportReasonSlot() = pr.reason;
+        if (pr.ok) uringModeSlot() = pr.mode;
+        return pr.ok ? TransportKind::Uring : TransportKind::Epoll;
+      }
+      transportReasonSlot() = (env && std::strcmp(env, "epoll") == 0)
+                                  ? "MORO_ENGINE_TRANSPORT=epoll"
+                                  : "default (epoll); io_uring is opt-in (MORO_ENGINE_TRANSPORT=uring)";
+      return TransportKind::Epoll;
     }();
     return kind;
 #else
@@ -469,9 +518,20 @@ class Server {
       // simply runs the uv arm - a downgrade, never a failure.
       uring_ = UringLoop::get(loop_);
       if (!uring_) {
-        kind_ = TransportKind::Uv;
+        kind_ = TransportKind::Epoll;
       } else {
         int r = uringListen(addr);
+        if (r != 0) return fail(r);
+      }
+    }
+    if (kind_ == TransportKind::Epoll) {
+      // Per-thread epoll loop, created lazily by the first epoll listener on
+      // this uv loop; if it cannot be created this server runs the uv arm.
+      epoll_ = EpollLoop::get(loop_);
+      if (!epoll_) {
+        kind_ = TransportKind::Uv;
+      } else {
+        int r = epollListen(addr);
         if (r != 0) return fail(r);
       }
     }
@@ -643,17 +703,23 @@ class Server {
   // a registered GET still reaches JS, which owns method policy).
   void setStaticRoute(int32_t method, std::string path, ResponseTemplate&& tpl,
                       std::string body) {
+    routesGen_++;  // every memo taken against the old table now misses
     auto& vec = staticRoutes_[std::move(path)];
     for (StaticRoute& existing : vec) {
       if (existing.method == method) {
         existing.tpl = std::move(tpl);
         existing.body = std::move(body);
+        existing.frame.clear();  // the cached frame was the old reply
+        existing.frameAt = 0;
         return;
       }
     }
     vec.push_back(StaticRoute{method, std::move(tpl), std::move(body)});
   }
-  void clearStaticRoutes() { staticRoutes_.clear(); }
+  void clearStaticRoutes() {
+    routesGen_++;
+    staticRoutes_.clear();
+  }
 
   // ---- parameter routes (capabilities.paramRoutes) ----
   // A route with ONE variable path segment whose body IS that segment,
@@ -663,22 +729,22 @@ class Server {
   // `/user/` and `/user/1/2` still reach JS. It goes out as it is on the wire,
   // undecoded (what uWS's writeParameterValue does) - a route that needs
   // decoding stays a JS route. Method policy is JS's, as for static routes.
-  struct ParamRoute {
-    int32_t method;
-    std::string prefix;
-    std::string suffix;
-    ResponseTemplate tpl;
-  };
   void setParamRoute(int32_t method, std::string prefix, std::string suffix, ResponseTemplate&& tpl) {
+    routesGen_++;
     for (ParamRoute& existing : paramRoutes_) {
       if (existing.method == method && existing.prefix == prefix && existing.suffix == suffix) {
         existing.tpl = std::move(tpl);
+        existing.head.clear();  // the cached head carried the old template
+        existing.headAt = 0;
         return;
       }
     }
     paramRoutes_.push_back(ParamRoute{method, std::move(prefix), std::move(suffix), std::move(tpl)});
   }
-  void clearParamRoutes() { paramRoutes_.clear(); }
+  void clearParamRoutes() {
+    routesGen_++;
+    paramRoutes_.clear();
+  }
   // Any engine-answered route registered (static or parameter): the dispatch
   // sites test this once per request before trying either table.
   bool hasEngineRoutes() const { return !staticRoutes_.empty() || !paramRoutes_.empty(); }
@@ -735,7 +801,7 @@ class Server {
                       const std::string& headersBlock, long long customCL,
                       const char* body, size_t bodyLen, bool bodyless) {
     appendStatusLine(out, status);
-    out += httpDateLine();
+    out += dateLine();
     out += headersBlock;
     if (!bodyless) {
       const unsigned long long cl =
@@ -782,7 +848,7 @@ class Server {
     std::string& out = c->scratch;
     out.clear();
     appendStatusLine(out, status);
-    out += httpDateLine();
+    out += dateLine();
     out += headersBlock;
     if (c->bodylessStatus) {
       if (customCL >= 0) {
@@ -844,7 +910,7 @@ class Server {
     if (!c->responseStarted) {
       // end() without writeHead(): a 200 with the given body as the full payload
       appendStatusLine(out, 200);
-      out += httpDateLine();
+      out += dateLine();
       out += "Content-Length: ";
       appendDecimal(out, c->isHead ? 0 : len);
       out += "\r\n";
@@ -1240,8 +1306,9 @@ class Server {
     wr->req.data = wr;
     c->pendingWrites++;
 #if defined(__linux__)
-    if (kind_ == TransportKind::Uring) {
-      uringQueueWrite(c, wr);
+    if (kind_ == TransportKind::Uring || kind_ == TransportKind::Epoll) {
+      if (kind_ == TransportKind::Uring) uringQueueWrite(c, wr);
+      else epollQueueWrite(c, wr);
       if (limits_.responseBackpressureLimit && !c->isWebSocket &&
           tPendingBytes(c) > limits_.responseBackpressureLimit) {
         doClose(c);
@@ -1426,8 +1493,23 @@ class Server {
       parsed = true;
     }
     for (;;) {
-      // 1. Stage what is already complete.
+      // 1. Stage what is already complete. An engine route with no slot
+      //    staged ahead of it is answered from the parser right here, in
+      //    request order, and never occupies a slot.
       while (parsed && st == ParseStatus::Complete && c->stagedCount < kMaxStaged) {
+        if (c->stagedCount == 0 && !c->tls && hasEngineRoutes() && answerFromParser(c)) {
+          if (c->batchClose || c->closing) {  // Connection: close - nothing after it is parsed
+            parsed = false;
+            break;
+          }
+          st = parseNext(c);
+          continue;
+        }
+        if (c->parser.light()) {  // see handleParse: unreachable, but never stage a headerless request
+          sendErrorAndClose(c, 500);
+          parsed = false;
+          break;
+        }
         if (stageRequest(c)) {  // close/upgrade: the batch ends here
           parsed = false;
           break;
@@ -1482,6 +1564,9 @@ class Server {
       p.swap(c->pending);
       return c->parser.parse(p.data(), p.size());
     }
+    // Nothing buffered and no partial request: the next one comes with the
+    // next read, which is what an empty parse() call would report.
+    if (!c->parser.midRequest()) return ParseStatus::NeedMore;
     return c->parser.parse(nullptr, 0);
   }
 
@@ -1493,12 +1578,8 @@ class Server {
     if (c->staged.empty()) c->staged.resize(kMaxStaged);
     StagedRequest& sr = c->staged[(c->stagedHead + c->stagedCount) % kMaxStaged];
     c->stagedCount++;
-    const bool upgrade = c->parser.findHeader("upgrade") != nullptr;
-    sr.expectContinue = false;
-    if (!c->sentContinue) {
-      const char* exp = c->parser.findHeader("expect");
-      if (exp && iequals(trimOWS(std::string_view(exp)), "100-continue")) sr.expectContinue = true;
-    }
+    const bool upgrade = c->parser.hasUpgrade();
+    sr.expectContinue = !c->sentContinue && c->parser.expectContinue();
     sr.reqId = nextReqId();
     sr.method = c->parser.method;
     // Swap, not copy (see surfaceRequest): the slot's previous buffers become
@@ -1586,8 +1667,10 @@ class Server {
         std::string p;
         p.swap(c->pending);
         st = c->parser.parse(p.data(), p.size());
-      } else {
+      } else if (c->parser.midRequest()) {
         st = c->parser.parse(nullptr, 0);
+      } else {
+        break;  // nothing buffered: the next request comes with the next read
       }
     }
     c->corked = false;
@@ -1629,6 +1712,8 @@ class Server {
   // session, registry. The caller then starts reads its own way.
   void attachConnection(Connection* c) {
     c->parser = HttpParser(limits_);
+    c->parser.routeHook = &Server::routeHook;
+    c->parser.routeHookUser = c;
     if (tlsEnabled_) c->tls = new TlsSession(tlsCtx_.ctx());
     conns_.insert(c);
   }
@@ -1653,15 +1738,13 @@ class Server {
     // inside the same read callback (see dispatchPlaintext). Uninitialized on
     // purpose: only pages the kernel actually fills become resident, and the
     // O(connections) x 64 KiB zero-filled footprint collapses to O(1).
-    (void)handle;
-    static thread_local std::unique_ptr<char[]> sharedBuf;
-    static thread_local size_t sharedSize = 0;
-    if (sharedSize < suggested) {
-      sharedBuf.reset(new char[suggested]);
-      sharedSize = suggested;
+    Server* s = static_cast<Connection*>(handle->data)->server;
+    if (s->readBufSize_ < suggested) {
+      s->readBuf_.reset(new char[suggested]);
+      s->readBufSize_ = suggested;
     }
-    buf->base = sharedBuf.get();
-    buf->len = static_cast<unsigned>(sharedSize);
+    buf->base = s->readBuf_.get();
+    buf->len = static_cast<unsigned>(s->readBufSize_);
 #endif
   }
 
@@ -1754,6 +1837,15 @@ class Server {
       c->pending.append(data, len);
       return;
     }
+    // Nothing queued on the connection in either direction and the parser
+    // idle: the fast lane (an engine route answered from its cache, or a
+    // byte-for-byte repeat answered without a parse) or, failing that, the
+    // same dispatch as below with the parse it already did.
+    if (!c->tls && !c->closing && c->stagedCount == 0 && !c->aheadComplete &&
+        c->pendingWrites == 0 && c->corkBuf.empty() && c->parser.idle() && hasEngineRoutes()) {
+      fastLane(c, data, len);
+      return;
+    }
     ParseStatus st = c->parser.parse(data, len);
     dispatchBatch(c, st);
   }
@@ -1842,10 +1934,24 @@ class Server {
   void handleParse(Connection* c, ParseStatus st) {
     if (c->closing) return;
 
+    // An engine-answered route on a complete request: framed straight from
+    // the parser, ahead of the Expect scan (a 100 may be omitted once the
+    // body has been received, RFC 9110 §10.1.1).
+    if (st == ParseStatus::Complete && !c->active && !c->tls && hasEngineRoutes() &&
+        answerFromParser(c))
+      return;
+    if (st == ParseStatus::Complete && c->parser.light()) {
+      // The route hook said "engine route" while this request was parsed, so
+      // its headers were never stored; the table cannot have changed since
+      // (no JS ran in between), so this is unreachable - fail loudly, never
+      // hand JS a request without its headers.
+      sendErrorAndClose(c, 500);
+      return;
+    }
+
     // Answer Expect: 100-continue before the (already fully-buffered) body - the parser reads the whole body before Complete, so on NeedMore with the head parsed we know a body is pending.
     if (!c->sentContinue && c->parser.headParsed()) {
-      const char* exp = c->parser.findHeader("expect");
-      if (exp && iequals(trimOWS(std::string_view(exp)), "100-continue")) {
+      if (c->parser.expectContinue()) {
         c->sentContinue = true;
         std::string cont = "HTTP/1.1 100 Continue\r\n\r\n";
         writeOut(c, std::move(cont), /*terminal=*/false);
@@ -1902,24 +2008,225 @@ class Server {
   }
 
   // The parameter table is a handful of entries scanned linearly; the body
-  // points into the Connection's own path, which respond() copies out before
-  // returning, so nothing is allocated per request.
-  bool tryParamRoute(Connection* c, int32_t m) {
-    if (paramRoutes_.empty()) return false;
-    const std::string& p = c->path;
+  // points into the request's own path (the Connection's or the parser's),
+  // which the response builder copies out before returning, so nothing is
+  // allocated per request.
+  const ParamRoute* findParamRoute(const std::string& p, int32_t m, const char*& seg,
+                                   size_t& len) const {
     for (const ParamRoute& r : paramRoutes_) {
       if (r.method != m) continue;
       const size_t fixed = r.prefix.size() + r.suffix.size();
       if (p.size() <= fixed) continue;
       if (p.compare(0, r.prefix.size(), r.prefix) != 0) continue;
       if (!r.suffix.empty() && p.compare(p.size() - r.suffix.size(), r.suffix.size(), r.suffix) != 0) continue;
-      const char* seg = p.data() + r.prefix.size();
-      const size_t len = p.size() - fixed;
+      seg = p.data() + r.prefix.size();
+      len = p.size() - fixed;
       if (std::memchr(seg, '/', len) != nullptr) continue;
-      respond(c, r.tpl.status, r.tpl.headers, r.tpl.customCL, seg, len);
-      return true;
+      return &r;
     }
-    return false;
+    return nullptr;
+  }
+
+  bool tryParamRoute(Connection* c, int32_t m) {
+    if (paramRoutes_.empty()) return false;
+    const char* seg = nullptr;
+    size_t len = 0;
+    const ParamRoute* r = findParamRoute(c->path, m, seg, len);
+    if (!r) return false;
+    respond(c, r->tpl.status, r->tpl.headers, r->tpl.customCL, seg, len);
+    return true;
+  }
+
+  // Engine-answered route straight from the parser. A static or parameter
+  // route needs only the method and the path, so when nothing is queued
+  // ahead of this request (no staged slot, no active request - the response
+  // order is the request order) the reply is framed right here into the cork
+  // buffer: no request id, no registry insert/erase, no snapshot swap, no
+  // header scan. Both dispatch loops run corked, and the plaintext frame
+  // goes to corkBuf as respond()'s corked path would; TLS keeps the regular
+  // path (its frame must be encrypted first). Returns false for anything
+  // that is not an engine route, and the caller stages/surfaces it as before.
+  // Match an engine route for (method, path); on a hit the reply's template
+  // and body land in the Connection's fast* fields.
+  bool matchEngineRoute(Connection* c, Method method, const std::string& path) {
+    const int32_t m = static_cast<int32_t>(method);
+    c->fastStatic = nullptr;
+    c->fastParam = nullptr;
+    auto it = staticRoutes_.find(path);
+    if (it != staticRoutes_.end()) {
+      for (StaticRoute& r : it->second) {
+        if (r.method != m) continue;
+        c->fastStatic = &r;
+        return true;
+      }
+    }
+    if (paramRoutes_.empty()) return false;
+    const char* seg = nullptr;
+    size_t len = 0;
+    const ParamRoute* r = findParamRoute(path, m, seg, len);
+    if (!r) return false;
+    c->fastParam = const_cast<ParamRoute*>(r);
+    c->fastSeg = seg;
+    c->fastSegLen = len;
+    return true;
+  }
+
+  // The parser's route hook (HttpParser::routeHook), asked once per request
+  // right after its request line: will this request be answered inside the
+  // engine? Only when nothing is queued ahead of it on the connection (the
+  // reply must go out in request order), the connection is plaintext (the
+  // corked frame is written as-is), and the route matches. A yes puts the
+  // parser in light mode: headers are scanned, not stored.
+  static bool routeHook(void* user, Method method, const std::string& path) {
+    Connection* c = static_cast<Connection*>(user);
+    Server* s = c->server;
+    if (c->active || c->stagedCount > 0 || c->tls || !s->hasEngineRoutes()) return false;
+    return s->matchEngineRoute(c, method, path);
+  }
+
+  bool answerFromParser(Connection* c) {
+    HttpParser& p = c->parser;
+    if (!p.light() && !matchEngineRoute(c, p.method, p.path)) return false;
+    // The framing inputs appendResponse reads from the Connection.
+    c->method = p.method;
+    c->isHead = (p.method == Method::HEAD);
+    c->reqKeepAlive = p.keepAlive;
+    c->reqHttp11 = p.minorVersion >= 1;
+    c->requestTicks = 0;
+    // The common shape - HTTP/1.1 keep-alive, not HEAD - carries no
+    // Connection header and its body, so its frame depends on nothing but
+    // the route and the Date line: served from the route's cache, rebuilt
+    // only when the Date cache ticks. Every other shape is framed as before.
+    const bool plain = c->reqKeepAlive && c->reqHttp11 && !c->isHead;
+    std::string& out = c->corkBuf;
+    if (plain && plainFrameable(c)) {
+      appendPlainFrame(c);
+    } else if (StaticRoute* r = c->fastStatic) {
+      const bool bodyless = isBodyless(r->tpl.status);
+      out.reserve(out.size() + r->body.size() + r->tpl.headers.size() + 128);
+      appendResponse(out, c, r->tpl.status, r->tpl.headers, r->tpl.customCL, r->body.data(),
+                     bodyless ? 0 : r->body.size(), bodyless);
+    } else {
+      ParamRoute* pr = c->fastParam;
+      const bool bodyless = isBodyless(pr->tpl.status);
+      out.reserve(out.size() + c->fastSegLen + pr->tpl.headers.size() + 128);
+      appendResponse(out, c, pr->tpl.status, pr->tpl.headers, pr->tpl.customCL, c->fastSeg,
+                     bodyless ? 0 : c->fastSegLen, bodyless);
+    }
+    // Same per-request bookkeeping completeCorkedResponse does for a
+    // surfaced request, minus the registry: nothing was registered.
+    resetResponseState(c);
+    if (!p.keepAlive) c->batchClose = true;
+    p.reset();
+    if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
+    return true;
+  }
+
+  // The common request shape - HTTP/1.1 keep-alive, not HEAD - carries no
+  // Connection header and its body, so its frame depends on nothing but the
+  // route and the Date line: a static route serves its whole cached frame, a
+  // parameter route its cached head up to Content-Length (a bodyless status
+  // there is framed the general way).
+  bool plainFrameable(Connection* c) const {
+    return c->fastStatic != nullptr || !isBodyless(c->fastParam->tpl.status);
+  }
+
+  void appendPlainFrame(Connection* c) {
+    std::string& out = c->corkBuf;
+    if (StaticRoute* r = c->fastStatic) {
+      dateLine();  // refresh dateCachedAt_
+      if (r->frameAt != dateCachedAt_ || r->frame.empty()) {
+        r->frame.clear();
+        const bool bodyless = isBodyless(r->tpl.status);
+        appendResponse(r->frame, c, r->tpl.status, r->tpl.headers, r->tpl.customCL,
+                       r->body.data(), bodyless ? 0 : r->body.size(), bodyless);
+        r->frameAt = dateCachedAt_;
+      }
+      out += r->frame;
+      return;
+    }
+    ParamRoute* pr = c->fastParam;
+    const std::string& date = dateLine();
+    if (pr->headAt != dateCachedAt_ || pr->head.empty()) {
+      pr->head.clear();
+      appendStatusLine(pr->head, pr->tpl.status);
+      pr->head += date;
+      pr->head += pr->tpl.headers;
+      pr->head += "Content-Length: ";
+      pr->headAt = dateCachedAt_;
+    }
+    out += pr->head;
+    appendDecimal(out, c->fastSegLen);
+    out += "\r\n\r\n";
+    out.append(c->fastSeg, c->fastSegLen);
+  }
+
+  // ---- fast lane ----
+  // dispatchPlaintext hands a read here when nothing is queued on the
+  // connection in either direction (no active or staged request, no bytes
+  // waiting to be written, the parser idle). Two ways out that skip the
+  // dispatch machinery:
+  //  1. the read is byte for byte the connection's previous engine-answered
+  //     request (memo): answered from the route cache, no parse at all;
+  //  2. the read parses (zero-copy, HttpParser::parseDirect) to one complete
+  //     engine-answered request of the common shape - HTTP/1.1 keep-alive,
+  //     not HEAD, nothing pipelined behind it: answered from the route cache
+  //     and remembered for a repeat.
+  // Anything else continues exactly as before, with the parse it did.
+  static constexpr size_t kMemoMax = 512;
+
+  void fastLane(Connection* c, const char* data, size_t len) {
+    if (len == c->memo.size() && c->memoGen == routesGen_ &&
+        std::memcmp(c->memo.data(), data, len) == 0) {
+      c->fastStatic = c->memoStatic;
+      c->fastParam = c->memoParam;
+      c->fastSeg = c->memo.data() + c->memoSegOff;
+      c->fastSegLen = c->memoSegLen;
+      c->method = c->memoMethod;
+      answerPlain(c);
+      return;
+    }
+    HttpParser& p = c->parser;
+    ParseStatus st = p.parse(data, len);
+    if (st == ParseStatus::Complete && p.light() && p.keepAlive && p.minorVersion >= 1 &&
+        p.method != Method::HEAD && p.leftover().empty() && plainFrameable(c)) {
+      c->method = p.method;
+      if (len <= kMemoMax) remember(c, data, len);
+      answerPlain(c);  // fastSeg points into p.path until the reset below
+      p.reset();
+      return;
+    }
+    dispatchBatch(c, st);
+  }
+
+  void remember(Connection* c, const char* data, size_t len) {
+    c->memo.assign(data, len);
+    c->memoGen = routesGen_;
+    c->memoStatic = c->fastStatic;
+    c->memoParam = c->fastParam;
+    c->memoMethod = c->parser.method;
+    if (c->fastParam) {
+      // The segment sits in the request target, which follows the first SP.
+      const void* sp = std::memchr(data, ' ', len);
+      const size_t pathOff = static_cast<size_t>(static_cast<const char*>(sp) - data) + 1;
+      c->memoSegOff = static_cast<uint32_t>(pathOff + c->fastParam->prefix.size());
+      c->memoSegLen = static_cast<uint32_t>(c->fastSegLen);
+    }
+  }
+
+  // The plain-shape reply for the route in c->fastStatic / c->fastParam:
+  // framed from the route cache into corkBuf and written at once. (Holding
+  // a readiness round's replies and sending them in one burst was measured
+  // too: it wakes the client less often but leaves the server idle until
+  // the clients answer the burst, and lost 3-13% throughput at every load.)
+  void answerPlain(Connection* c) {
+    c->isHead = false;
+    c->reqKeepAlive = true;
+    c->reqHttp11 = true;
+    c->requestTicks = 0;
+    appendPlainFrame(c);
+    resetResponseState(c);
+    flushCork(c);
   }
 
   static const std::string& emptyHeaders() {
@@ -1932,7 +2239,7 @@ class Server {
     std::string& out = c->scratch;
     out.clear();
     appendStatusLine(out, status);
-    out += httpDateLine();
+    out += dateLine();
     out += "Content-Length: 0\r\nConnection: close\r\n\r\n";
     c->responseEnded = true;
     writeOutView(c, out, /*terminal=*/true);
@@ -1959,10 +2266,11 @@ class Server {
     }
     if (!c->finSent) {
 #if defined(__linux__)
-      if (kind_ == TransportKind::Uring) {
+      if (kind_ != TransportKind::Uv) {
         // Nothing of ours is queued for this fd (pendingWrites == 0): the FIN
         // can go synchronously.
-        if (c->ring.fd < 0 || ::shutdown(c->ring.fd, SHUT_WR) != 0) {
+        const int fd = kind_ == TransportKind::Uring ? c->ring.fd : c->ep.fd;
+        if (fd < 0 || ::shutdown(fd, SHUT_WR) != 0) {
           doClose(c);
           return;
         }
@@ -2045,6 +2353,15 @@ class Server {
       }
       c->ring.wqHead = c->ring.wqTail = nullptr;
       if (uring_) uring_->release();
+    } else if (kind_ == TransportKind::Epoll) {
+      WriteReq* wr = static_cast<WriteReq*>(c->ep.wqHead);
+      while (wr) {
+        WriteReq* next = wr->next;
+        delete wr;
+        wr = next;
+      }
+      c->ep.wqHead = c->ep.wqTail = nullptr;
+      if (epoll_) epoll_->release();
     }
 #endif
     delete c;
@@ -2170,8 +2487,9 @@ class Server {
   // UV_EAGAIN when the socket would block, or a negative errno.
   int tTryWrite(Connection* c, const char* p, size_t n) {
 #if defined(__linux__)
-    if (kind_ == TransportKind::Uring) {
-      ssize_t r = ::send(c->ring.fd, p, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (kind_ != TransportKind::Uv) {
+      const int fd = kind_ == TransportKind::Uring ? c->ring.fd : c->ep.fd;
+      ssize_t r = ::send(fd, p, n, MSG_DONTWAIT | MSG_NOSIGNAL);
       if (r >= 0) return static_cast<int>(r);
       if (errno == EAGAIN || errno == EWOULDBLOCK) return UV_EAGAIN;
       return -errno;
@@ -2199,6 +2517,7 @@ class Server {
     int fd = -1;
 #if defined(__linux__)
     if (kind_ == TransportKind::Uring) fd = c->ring.fd;
+    else if (kind_ == TransportKind::Epoll) fd = c->ep.fd;
     else
 #endif
     {
@@ -2259,6 +2578,7 @@ class Server {
   size_t tPendingBytes(Connection* c) {
 #if defined(__linux__)
     if (kind_ == TransportKind::Uring) return c->ring.pendingBytes;
+    if (kind_ == TransportKind::Epoll) return c->ep.pendingBytes;
 #endif
     return uv_stream_get_write_queue_size(reinterpret_cast<uv_stream_t*>(&c->handle));
   }
@@ -2266,6 +2586,7 @@ class Server {
   bool tIsClosing(Connection* c) {
 #if defined(__linux__)
     if (kind_ == TransportKind::Uring) return c->ring.state >= 2;
+    if (kind_ == TransportKind::Epoll) return c->ep.state >= 2;
 #endif
     return uv_is_closing(reinterpret_cast<uv_handle_t*>(&c->handle)) != 0;
   }
@@ -2278,6 +2599,10 @@ class Server {
       uringCloseConn(c);
       return;
     }
+    if (kind_ == TransportKind::Epoll) {
+      epollCloseConn(c);
+      return;
+    }
 #endif
     uv_read_stop(reinterpret_cast<uv_stream_t*>(&c->handle));
     uv_close(reinterpret_cast<uv_handle_t*>(&c->handle), onCloseFree);
@@ -2285,9 +2610,10 @@ class Server {
 
   bool tPeerName(Connection* c, struct sockaddr_storage* addr, int* len) {
 #if defined(__linux__)
-    if (kind_ == TransportKind::Uring) {
+    if (kind_ != TransportKind::Uv) {
+      const int fd = kind_ == TransportKind::Uring ? c->ring.fd : c->ep.fd;
       socklen_t sl = static_cast<socklen_t>(*len);
-      if (::getpeername(c->ring.fd, reinterpret_cast<sockaddr*>(addr), &sl) != 0) return false;
+      if (::getpeername(fd, reinterpret_cast<sockaddr*>(addr), &sl) != 0) return false;
       *len = static_cast<int>(sl);
       return true;
     }
@@ -2297,7 +2623,7 @@ class Server {
 
   bool tBoundName(struct sockaddr_storage* addr, int* len) {
 #if defined(__linux__)
-    if (kind_ == TransportKind::Uring && listenFd_ >= 0) {
+    if (kind_ != TransportKind::Uv && listenFd_ >= 0) {
       socklen_t sl = static_cast<socklen_t>(*len);
       if (::getsockname(listenFd_, reinterpret_cast<sockaddr*>(addr), &sl) != 0) return false;
       *len = static_cast<int>(sl);
@@ -2311,6 +2637,7 @@ class Server {
   void tCloseListener() {
 #if defined(__linux__)
     if (kind_ == TransportKind::Uring) uringCloseListener();
+    if (kind_ == TransportKind::Epoll) epollCloseListener();
 #endif
   }
 
@@ -2877,6 +3204,399 @@ class Server {
   bool listenerClosing_ = false;
   bool listenerReaped_ = false;
   UringLoop* uring_ = nullptr;
+
+  // ---------------------------------------------------------------------
+  // epoll transport: the engine's own readiness loop, surfaced to libuv as a
+  // single uv_poll on the epoll fd (the same integration uWS uses). Per
+  // connection there is a non-blocking socket and nothing else: recv into
+  // the server's receive buffer, send straight from the frame, EPOLLOUT only
+  // while a write is backpressured. It removes libuv's per-stream machinery
+  // (alloc/read callbacks, write requests, handle close) from the hot path;
+  // the protocol layers above (onTransportData, transportWrite, the cork,
+  // TLS, WebSocket, the sweep) are the same ones the uv and io_uring
+  // transports drive.
+  //
+  // Two things only ever happen on a clean stack (the end of a readiness
+  // round, or a uv_check on the next loop turn), never inside the call that
+  // caused them:
+  //   - completing a queued write (completeWrite -> finishResponse -> the
+  //     next pipelined request -> JS). libuv defers uv_write callbacks the
+  //     same way; running them inside respond() would re-enter JS from a V8
+  //     fast call. Bytes are still pushed to the socket immediately.
+  //   - freeing a closed Connection: later events of the same epoll_wait
+  //     batch may still name it, and freeConnection may `delete this` (a
+  //     fully closed Server), which must not happen on a Server method's
+  //     stack.
+ public:
+  struct EpollLoop {
+    int epfd = -1;
+    uv_loop_t* loop = nullptr;
+    uv_poll_t poll;
+    uv_check_t check;
+    bool checkActive = false;
+    int refs = 0;  // listening servers + live connections (ref/unref the poll handle)
+    bool pollRef = false;
+    bool inDrain = false;
+    int closedHandles = 0;
+    int emfileFd = -1;
+    std::vector<Connection*> dead;         // closed, to free (freeConnection)
+    std::vector<Connection*> completions;  // fully-sent queued writes to complete
+    std::unordered_set<Server*> servers;
+
+    static EpollLoop*& slot() {
+      static thread_local EpollLoop* p = nullptr;
+      return p;
+    }
+
+    static EpollLoop* get(uv_loop_t* loop) {
+      EpollLoop*& s = slot();
+      if (s) return s;
+      auto* u = new EpollLoop();
+      u->loop = loop;
+      u->epfd = ::epoll_create1(EPOLL_CLOEXEC);
+      if (u->epfd < 0) {
+        delete u;
+        return nullptr;
+      }
+      u->poll.data = u;
+      if (uv_poll_init(loop, &u->poll, u->epfd) != 0) {
+        ::close(u->epfd);
+        delete u;
+        return nullptr;
+      }
+      u->check.data = u;
+      uv_check_init(loop, &u->check);
+      uv_unref(reinterpret_cast<uv_handle_t*>(&u->check));
+      uv_poll_start(&u->poll, UV_READABLE, onReadable);
+      uv_unref(reinterpret_cast<uv_handle_t*>(&u->poll));
+      u->emfileFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+      s = u;
+      return u;
+    }
+
+    void addRef() {
+      if (++refs == 1 && !pollRef) {
+        uv_ref(reinterpret_cast<uv_handle_t*>(&poll));
+        pollRef = true;
+      }
+    }
+    void release() {
+      if (--refs == 0 && pollRef) {
+        uv_unref(reinterpret_cast<uv_handle_t*>(&poll));
+        pollRef = false;
+      }
+    }
+
+    static void onReadable(uv_poll_t* h, int status, int) {
+      if (status < 0) return;
+      static_cast<EpollLoop*>(h->data)->drain();
+    }
+
+    // One readiness round: everything epoll has right now, without blocking
+    // (libuv already waited). Listener events accept; connection events read
+    // and, when EPOLLOUT was armed, resume the write queue. A batch that
+    // filled the array is followed by another pass, bounded.
+    void drain() {
+      if (inDrain) return;
+      inDrain = true;
+      epoll_event evs[256];
+      for (int round = 0; round < 8; round++) {
+        int n = ::epoll_wait(epfd, evs, 256, 0);
+        if (n <= 0) break;
+        for (int i = 0; i < n; i++) {
+          const uintptr_t raw = reinterpret_cast<uintptr_t>(evs[i].data.ptr);
+          if (raw & 1u) {
+            reinterpret_cast<Server*>(raw & ~static_cast<uintptr_t>(1u))->epollOnListener();
+          } else {
+            Connection* c = reinterpret_cast<Connection*>(raw);
+            if (c->ep.state < 2) c->server->epollOnConn(c, evs[i].events);
+          }
+        }
+        if (n < 256) break;
+      }
+      inDrain = false;
+      settle();
+    }
+
+    void armCheck() {
+      if (!inDrain && !checkActive) {
+        checkActive = true;
+        uv_check_start(&check, onCheck);
+      }
+    }
+    void deferFree(Connection* c) {
+      dead.push_back(c);
+      armCheck();
+    }
+    void deferCompletion(Connection* c) {
+      completions.push_back(c);
+      armCheck();
+    }
+    static void onCheck(uv_check_t* h) { static_cast<EpollLoop*>(h->data)->settle(); }
+
+    // Clean-stack work: complete fully-sent writes (which may surface further
+    // requests and queue more writes - those complete in the next pass), then
+    // free closed connections. A connection closed by a completion is skipped
+    // by the state check before its free.
+    void settle() {
+      if (checkActive) {
+        checkActive = false;
+        uv_check_stop(&check);
+      }
+      for (int pass = 0; pass < 64 && (!completions.empty() || !dead.empty()); pass++) {
+        std::vector<Connection*> list;
+        list.swap(completions);
+        for (Connection* c : list) {
+          if (c->ep.state < 2) c->server->epollCompleteWrites(c);
+        }
+        while (!dead.empty()) {
+          Connection* c = dead.back();
+          dead.pop_back();
+          c->server->freeConnection(c);  // may delete the Server (checkFullyClosed)
+        }
+      }
+      if (!completions.empty() || !dead.empty()) armCheck();
+    }
+    void flushDead() { settle(); }
+
+    static void shutdownForThread() {
+      EpollLoop*& s = slot();
+      if (!s) return;
+      EpollLoop* u = s;
+      s = nullptr;
+      u->flushDead();
+      uv_close(reinterpret_cast<uv_handle_t*>(&u->poll), onHandleClosed);
+      uv_close(reinterpret_cast<uv_handle_t*>(&u->check), onHandleClosed);
+      while (u->closedHandles < 2) uv_run(u->loop, UV_RUN_ONCE);
+      if (u->emfileFd >= 0) ::close(u->emfileFd);
+      if (u->epfd >= 0) ::close(u->epfd);
+      delete u;
+    }
+    static void onHandleClosed(uv_handle_t* h) {
+      static_cast<EpollLoop*>(h->data)->closedHandles++;
+    }
+  };
+
+ private:
+  int epollListen(const sockaddr_storage& addr) {
+    const socklen_t len = addr.ss_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in);
+    int fd = ::socket(addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -errno;
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    if (addr.ss_family == AF_INET6) {
+      int off = 0;
+      setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+    }
+    if (limits_.reusePort) setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));  // inherited by every accepted socket
+    if (::bind(fd, reinterpret_cast<const sockaddr*>(&addr), len) < 0) {
+      int e = -errno;
+      ::close(fd);
+      return e;
+    }
+    if (::listen(fd, limits_.backlog) < 0) {
+      int e = -errno;
+      ::close(fd);
+      return e;
+    }
+    epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.ptr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(this) | 1u);
+    if (::epoll_ctl(epoll_->epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
+      int e = -errno;
+      ::close(fd);
+      return e;
+    }
+    listenFd_ = fd;
+    liveHandles_++;  // balanced in epollCloseListener
+    epoll_->addRef();
+    epoll_->servers.insert(this);
+    return 0;
+  }
+
+  void epollOnListener() {
+    if (listenFd_ < 0) return;
+    for (int i = 0; i < 64; i++) {
+      int fd = ::accept4(listenFd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+      if (fd < 0) {
+        if (errno == EINTR || errno == ECONNABORTED) continue;
+        if (errno == EMFILE || errno == ENFILE) {
+          // Out of descriptors: accept and drop one connection so the
+          // listener does not stay readable forever (the uv/uring transports
+          // do the same through their EMFILE fallbacks).
+          if (epoll_->emfileFd >= 0) {
+            ::close(epoll_->emfileFd);
+            int d = ::accept4(listenFd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+            if (d >= 0) ::close(d);
+            epoll_->emfileFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+          }
+        }
+        break;  // EAGAIN or an error: nothing more to accept right now
+      }
+      if (closeRequested_ || listenerClosed_ ||
+          (limits_.maxConnections && conns_.size() >= limits_.maxConnections)) {
+        ::close(fd);
+        continue;
+      }
+      epollAcceptFd(fd);
+    }
+  }
+
+  void epollAcceptFd(int fd) {
+    Connection* c = new Connection();
+    c->server = this;
+    c->ep.fd = fd;
+    c->ep.state = 1;
+    liveHandles_++;  // balanced by freeConnection
+    epoll_->addRef();
+    attachConnection(c);
+    if (!readBuf_) {
+      readBuf_.reset(new char[65536]);
+      readBufSize_ = 65536;
+    }
+    epoll_event ev{};
+    ev.events = EPOLLIN | EPOLLRDHUP;
+    ev.data.ptr = c;
+    if (::epoll_ctl(epoll_->epfd, EPOLL_CTL_ADD, fd, &ev) != 0) abortConnection(c);
+  }
+
+  void epollOnConn(Connection* c, uint32_t events) {
+    if (events & EPOLLOUT) {
+      epollFlush(c);
+      if (c->ep.state >= 2) return;
+    }
+    if (!(events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR))) return;
+    ssize_t n = ::recv(c->ep.fd, readBuf_.get(), readBufSize_, 0);
+    if (n > 0) {
+      // Level-triggered: anything left in the socket raises the next event.
+      onTransportData(c, readBuf_.get(), static_cast<size_t>(n));
+      return;
+    }
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
+        !(events & (EPOLLHUP | EPOLLERR)))
+      return;  // RDHUP with the receive queue drained: the FIN arrives as recv() == 0 next
+    if (!c->ep.eofSeen) {
+      c->ep.eofSeen = true;
+      onTransportEof(c);
+    }
+  }
+
+  void epollQueueWrite(Connection* c, WriteReq* wr) {
+    wr->next = nullptr;
+    if (c->ep.wqTail) static_cast<WriteReq*>(c->ep.wqTail)->next = wr;
+    else c->ep.wqHead = wr;
+    c->ep.wqTail = wr;
+    c->ep.pendingBytes += wr->data.size();
+    epollFlush(c);
+  }
+
+  void epollWantOut(Connection* c, bool on) {
+    if (c->ep.wantOut == on || c->ep.state >= 2 || c->ep.fd < 0) return;
+    epoll_event ev{};
+    ev.events = EPOLLIN | EPOLLRDHUP | (on ? EPOLLOUT : 0u);
+    ev.data.ptr = c;
+    ::epoll_ctl(epoll_->epfd, EPOLL_CTL_MOD, c->ep.fd, &ev);
+    c->ep.wantOut = on;
+  }
+
+  // Push the write queue as far as the socket takes it, in order. Nothing is
+  // completed here: a fully-sent WriteReq stays at the head (pendingWrites
+  // keeps later writes on the ordered queue) until epollCompleteWrites runs
+  // on a clean stack. A hard socket error drops the queue and aborts the
+  // connection (no JS re-entry on that path).
+  void epollFlush(Connection* c) {
+    if (c->ep.state >= 2 || c->ep.inFlush) return;
+    c->ep.inFlush = true;
+    bool anyDone = false;
+    for (WriteReq* wr = static_cast<WriteReq*>(c->ep.wqHead); wr; wr = wr->next) {
+      const size_t remaining = wr->data.size() - wr->sent;
+      if (remaining == 0) {
+        anyDone = true;
+        continue;
+      }
+      const size_t len = remaining > kMaxWriteChunk ? kMaxWriteChunk : remaining;
+      ssize_t r = ::send(c->ep.fd, wr->data.data() + wr->sent, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+      if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+          epollWantOut(c, true);
+          break;
+        }
+        const int e = -errno;
+        c->ep.inFlush = false;
+        epollDropQueue(c);
+        completeWrite(c, false, e);  // -> abortConnection
+        return;
+      }
+      wr->sent += static_cast<size_t>(r);
+      c->ep.pendingBytes -= static_cast<size_t>(r) < c->ep.pendingBytes ? static_cast<size_t>(r) : c->ep.pendingBytes;
+      if (wr->sent < wr->data.size()) {
+        epollWantOut(c, true);
+        break;
+      }
+      anyDone = true;
+    }
+    c->ep.inFlush = false;
+    if (c->ep.wantOut && c->ep.pendingBytes == 0) epollWantOut(c, false);
+    if (anyDone && !c->ep.completionPending) {
+      c->ep.completionPending = true;
+      epoll_->deferCompletion(c);
+    }
+  }
+
+  // Clean stack only (EpollLoop::settle): pop every fully-sent WriteReq from
+  // the head, in order, and run its completion - a terminal one finishes the
+  // response and may surface the next pipelined request.
+  void epollCompleteWrites(Connection* c) {
+    c->ep.completionPending = false;
+    while (WriteReq* wr = static_cast<WriteReq*>(c->ep.wqHead)) {
+      if (wr->sent < wr->data.size()) break;
+      const bool terminal = wr->terminal;
+      c->ep.wqHead = wr->next;
+      if (!c->ep.wqHead) c->ep.wqTail = nullptr;
+      delete wr;
+      c->pendingWrites--;
+      completeWrite(c, terminal, 0);
+      if (c->ep.state >= 2) return;
+    }
+  }
+
+  void epollDropQueue(Connection* c) {
+    WriteReq* wr = static_cast<WriteReq*>(c->ep.wqHead);
+    while (wr) {
+      WriteReq* next = wr->next;
+      delete wr;
+      c->pendingWrites--;
+      wr = next;
+    }
+    c->ep.wqHead = c->ep.wqTail = nullptr;
+    c->ep.pendingBytes = 0;
+  }
+
+  void epollCloseConn(Connection* c) {
+    if (c->ep.state >= 2) return;
+    c->ep.state = 2;
+    if (c->ep.fd >= 0) {
+      ::epoll_ctl(epoll_->epfd, EPOLL_CTL_DEL, c->ep.fd, nullptr);
+      ::close(c->ep.fd);
+      c->ep.fd = -1;
+    }
+    epoll_->deferFree(c);
+  }
+
+  void epollCloseListener() {
+    if (listenFd_ < 0 || listenerClosing_) return;
+    listenerClosing_ = true;
+    ::epoll_ctl(epoll_->epfd, EPOLL_CTL_DEL, listenFd_, nullptr);
+    ::close(listenFd_);
+    listenFd_ = -1;
+    epoll_->servers.erase(this);
+    epoll_->release();
+    liveHandles_--;
+    checkFullyClosed();  // tcp_'s pending uv_close keeps liveHandles_ > 0 here
+  }
+
+  EpollLoop* epoll_ = nullptr;
 #endif
 
   // ---- deferred notifications ----
@@ -2963,12 +3683,28 @@ class Server {
   std::unordered_set<Connection*> conns_;  // all live connections (for close())
   TemplateStore templates_;
   bool batchOn_ = false;
+  uint32_t routesGen_ = 1;  // bumped by every route-table change (memo validity)
   uint32_t* batchControl_ = nullptr;
   // Keyed by path and looked up with the Connection's own std::string, so the
   // hot path allocates nothing. One or two methods per path in any real app,
   // so the per-path vector is scanned linearly.
   std::unordered_map<std::string, std::vector<StaticRoute>> staticRoutes_;
   std::vector<ParamRoute> paramRoutes_;
+
+  // Per-loop scratch that used to be thread_local (see refreshHttpDateLine
+  // and onAlloc): a Server is one per loop thread, so members are the same
+  // ownership without the TLS indirection on every read and response.
+  std::string dateCache_;
+  time_t dateCachedAt_ = 0;
+  const std::string& dateLine() {
+    refreshHttpDateLine(dateCache_, dateCachedAt_);
+    return dateCache_;
+  }
+#if !defined(_WIN32)
+  // One receive buffer per loop, shared by every connection (see onAlloc).
+  std::unique_ptr<char[]> readBuf_;
+  size_t readBufSize_ = 0;
+#endif
   ServerCallbacks cb_;
   HttpLimits limits_;
   size_t maxPending_ = 0;  // per-connection not-yet-parsed backlog cap

@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 #include <string>
 #include <utility>
 #include <vector>
@@ -70,6 +71,26 @@ struct StaticRoute {
   int32_t method;
   ResponseTemplate tpl;
   std::string body;
+  // The complete wire frame for the common request shape (HTTP/1.1
+  // keep-alive, not HEAD): status line, Date, headers, Content-Length, blank
+  // line, body. Only the Date line ever changes, so the frame is rebuilt when
+  // the server's Date cache ticks (once per second) and otherwise copied out
+  // in one append. See Server::answerFromParser.
+  std::string frame;
+  time_t frameAt = 0;
+};
+
+// A parameter route: one variable path segment between prefix and suffix,
+// echoed as the body. `head` caches the status line, Date and headers the
+// same way StaticRoute::frame does; the length and segment are appended per
+// request.
+struct ParamRoute {
+  int32_t method;
+  std::string prefix;
+  std::string suffix;
+  ResponseTemplate tpl;
+  std::string head;
+  time_t headAt = 0;
 };
 
 }  // namespace engine

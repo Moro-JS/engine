@@ -15,8 +15,13 @@ teardown hook that makes the engine safe inside `worker_threads` (MoroJS
 clusters with threads on it), and PGO-trained release binaries - with every
 response path proven byte-identical on the wire. 1.1.9 adds parameter routes:
 a route whose reply is one path segment (`/user/:id`) is answered inside the
-engine as well, so a static-plus-echo route table never enters JS. Measured
-comparisons live in the
+engine as well, so a static-plus-echo route table never enters JS. 1.1.10
+answers those routes straight from the parser - scanned in place in the
+receive buffer, no request id, no header materialisation, one cached frame
+append - remembers each connection's last such request so a byte-for-byte
+repeat is answered without a parse, and puts the engine's own epoll loop
+under Linux by default, taking libuv's stream layer off the request path.
+Measured comparisons live in the
 [MoroJS Benchmark repo](https://github.com/Moro-JS/benchmark). In progress:
 ALPN HTTP/2 (vendored nghttp2). See [docs/DESIGN.md](docs/DESIGN.md) and
 [docs/ROADMAP.md](docs/ROADMAP.md).
@@ -31,11 +36,13 @@ ALPN HTTP/2 (vendored nghttp2). See [docs/DESIGN.md](docs/DESIGN.md) and
 - The Moro-shaped boundary (batched request snapshot, single corked response
   write) needs 2–4 JS crossings per request vs ~10–20 for a general-purpose
   binding.
-- Two transports behind one seam: libuv streams (the default everywhere) and
-  an opt-in io_uring transport on Linux 6.1+ (`MORO_ENGINE_TRANSPORT=uring`:
-  multishot accept/recv, half the syscalls per request) — identical bytes on
-  the wire, the whole test matrix on both, `probe().transport` reporting which
-  is live. Measured numbers and why libuv stays the default: docs/DESIGN.md.
+- Three transports behind one seam: the engine's own epoll loop (the Linux
+  default since 1.1.10, no libuv stream per connection), libuv streams (macOS,
+  Windows, or `MORO_ENGINE_TRANSPORT=uv`) and an opt-in io_uring transport on
+  Linux 6.1+ (`MORO_ENGINE_TRANSPORT=uring`: multishot accept/recv, half the
+  syscalls per request) — identical bytes on the wire, the whole test matrix
+  on each, `probe().transport` reporting which is live. Measured numbers:
+  docs/DESIGN.md.
 
 ## Usage (with MoroJS)
 

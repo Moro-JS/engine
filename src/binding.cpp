@@ -137,6 +137,8 @@ static void cleanupJsServer(void* arg);
 // ring first; then the ring's poll/prepare handles and mappings go.
 static void cleanupUringLoop(void*) { Server::UringLoop::shutdownForThread(); }
 static thread_local bool g_uringHookRegistered = false;
+static void cleanupEpollLoop(void*) { Server::EpollLoop::shutdownForThread(); }
+static thread_local bool g_epollHookRegistered = false;
 #endif
 
 // Invoked by Server once it is fully closed and self-deleted. Releases the
@@ -1032,6 +1034,10 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
   if (js->server->transportKind() == TransportKind::Uring && !g_uringHookRegistered) {
     g_uringHookRegistered = true;
     node::AddEnvironmentCleanupHook(iso, cleanupUringLoop, nullptr);
+  }
+  if (js->server->transportKind() == TransportKind::Epoll && !g_epollHookRegistered) {
+    g_epollHookRegistered = true;
+    node::AddEnvironmentCleanupHook(iso, cleanupEpollLoop, nullptr);
   }
 #endif
   if (tlsCtx.valid()) js->server->adoptTls(std::move(tlsCtx));

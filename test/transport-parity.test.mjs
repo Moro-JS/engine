@@ -151,8 +151,11 @@ describe('transport parity', { skip }, () => {
   before(async () => {
     const host = engine.probe();
     const wanted = ['uv'];
-    if (process.platform === 'linux' && host.transport === 'uring') wanted.push('uring');
-    else wanted.push('uv'); // a second uv process: still proves determinism
+    // Linux: uv vs the engine's own loop - io_uring when the lane pinned it,
+    // epoll (the default) otherwise. Elsewhere a second uv process still
+    // proves determinism.
+    if (process.platform === 'linux') wanted.push(host.transport === 'uring' ? 'uring' : 'epoll');
+    else wanted.push('uv');
     for (const t of wanted) {
       const s = await startSubject(t);
       subjects.push(s);
@@ -166,7 +169,8 @@ describe('transport parity', { skip }, () => {
 
   it('subjects ran on the transports the lane pinned', T, () => {
     assert.equal(subjects[0].transport, 'uv');
-    if (process.platform === 'linux' && engine.probe().transport === 'uring') assert.equal(subjects[1].transport, 'uring');
+    if (process.platform === 'linux')
+      assert.equal(subjects[1].transport, engine.probe().transport === 'uring' ? 'uring' : 'epoll');
   });
 
   it('every scenario produced a response on both subjects', T, () => {
