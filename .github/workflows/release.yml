@@ -40,7 +40,7 @@ jobs:
         run: |
           brew list llvm >/dev/null 2>&1 || brew install llvm
           echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       # PGO cycle (lenient: a profile problem keeps the plain build). The x64
@@ -79,7 +79,7 @@ jobs:
           echo "CXX=clang++-18" >> "$GITHUB_ENV"
           echo "LLVM_PROFDATA=llvm-profdata-18" >> "$GITHUB_ENV"
           sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: node tools/pgo.mjs --all
@@ -129,7 +129,7 @@ jobs:
       # Third-party action pinned to a full commit SHA (supply-chain integrity);
       # Dependabot (.github/dependabot.yml) bumps the SHA + comment on new tags.
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       # MSVC PGO stays opt-in (MORO_PGO_WINDOWS) until the pgort runtime is
@@ -164,7 +164,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
       - uses: actions/download-artifact@v8
@@ -202,7 +202,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
       - uses: actions/download-artifact@v8
@@ -222,7 +222,7 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           architecture: x64
@@ -239,7 +239,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       # The exact binaries being published (PGO'd), not a fresh local build.
@@ -254,7 +254,7 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       # The exact binaries being published (PGO'd), not a fresh local build.
@@ -269,7 +269,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - uses: actions/download-artifact@v8
@@ -298,7 +298,7 @@ jobs:
       id-token: write # npm provenance + trusted publishing (OIDC)
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
