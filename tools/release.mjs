@@ -12,13 +12,15 @@
 //   --skip-checks   skip the build + smoke gate (not recommended)
 //
 // What it does, in order:
-//   1. Safety gates: clean working tree, on main, --skip-checks-able build+smoke.
+//   1. Safety gates: clean working tree, on main, the release note
+//      changelog/vX.Y.Z.md present and indexed in CHANGELOG.md,
+//      --skip-checks-able build+smoke.
 //   2. Bumps the version EVERYWHERE it lives: the meta package + its exact
 //      optionalDependencies pins, all 7 platform packages, the monorepo root,
 //      and the kEngineVersion fallback in src/binding.cpp.
 //   3. Commits "chore: release vX.Y.Z", tags vX.Y.Z, pushes main + the tag.
-//   4. YOU then draft the GitHub Release for that tag (paste the vX.Y.Z.md
-//      notes) and click Publish - THAT fires .github/workflows/release.yml,
+//   4. YOU then draft the GitHub Release for that tag (its body is
+//      changelog/vX.Y.Z.md) and click Publish - THAT fires .github/workflows/release.yml,
 //      which rebuilds every platform and publishes to npm with provenance.
 //      Nothing publishes from this machine, and nothing publishes until the
 //      Release is published on GitHub.
@@ -77,6 +79,12 @@ const branch = sh('git branch --show-current');
 if (branch !== 'main') die(`on branch '${branch}' - releases cut from main`);
 
 if (sh(`git tag -l v${next}`)) die(`tag v${next} already exists`);
+// The release note is written before the release, not after: it is the
+// GitHub Release body, and CHANGELOG.md is the index users land on.
+const notesPath = join(root, 'changelog', `v${next}.md`);
+if (!existsSync(notesPath)) die(`changelog/v${next}.md is missing - write the release note first`);
+if (!readFileSync(join(root, 'CHANGELOG.md'), 'utf8').includes(`changelog/v${next}.md`))
+  die(`CHANGELOG.md has no entry for v${next} - add its line at the top of the list`);
 
 if (!skipChecks) {
   console.log('build + smoke gate (skip with --skip-checks):');
@@ -130,7 +138,7 @@ if (noPush) {
   run(`git push origin main v${next}`);
   console.log(`\ntag v${next} pushed. npm publish fires when you publish the GitHub Release:`);
   console.log(`  1. open  https://github.com/Moro-JS/engine/releases/new?tag=v${next}`);
-  console.log(`  2. paste the v${next}.md release notes as the body`);
+  console.log(`  2. paste changelog/v${next}.md as the body (or: gh release create v${next} --title v${next} --notes-file changelog/v${next}.md)`);
   console.log(`  3. click "Publish release" - that click starts the build + npm publish`);
   console.log(`watch it: https://github.com/Moro-JS/engine/actions`);
 }
