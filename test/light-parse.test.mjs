@@ -205,13 +205,11 @@ function session(port) {
   });
 }
 
-// The repeat-request memo: a keep-alive connection repeating its previous
-// engine-answered request byte for byte is answered without a parse. What
-// it must keep: the reply, its live Date, the route table (a replaced or
-// cleared route takes effect on the very next repeat), and that anything
-// not a byte-for-byte repeat - a different request, two copies in one
-// write - goes the ordinary way.
-test('a repeated request on a keep-alive connection follows the route table and the clock', async () => {
+// Repeated requests on one keep-alive connection, through the fast lane:
+// the reply, its live Date, the route table (a replaced or cleared route
+// takes effect on the very next request), a different request in between,
+// and two copies in one write (answered in order).
+test('repeated requests on a keep-alive connection follow the route table and the clock', async () => {
   const seen = [];
   const sid = engine.serve({
     onRequest(reqId, _m, path) {

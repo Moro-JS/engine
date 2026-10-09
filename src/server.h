@@ -32,7 +32,6 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #if defined(__linux__)
-#include <sys/epoll.h>
 #endif
 #include "uring.h"
 #endif
@@ -166,11 +165,12 @@ enum class TransportKind : uint8_t { Uv, Uring, Epoll };
 
 #if defined(__linux__)
 // Per-connection state of the epoll transport (Server::EpollLoop): a plain
-// non-blocking socket driven straight from epoll_wait, no libuv stream.
+// non-blocking socket watched by a libuv poll handle, no libuv stream.
 struct EpollConn {
+  uv_poll_t poll;       // libuv's watcher on fd; closed before fd is
   int fd;               // the accepted socket (owned)
-  uint8_t state;        // 0 idle, 1 open, 2 closed (fd gone, free pending/done)
-  bool wantOut;         // EPOLLOUT armed: a queued write hit EAGAIN
+  uint8_t state;        // 0 idle, 1 open, 2 closing/closed (events ignored, free pending/done)
+  bool wantOut;         // writable interest armed: a queued write hit EAGAIN
   bool eofSeen;         // EOF/error already routed once
   bool inFlush;         // epollFlush is on the stack (re-entrant queueWrite just enqueues)
   bool completionPending;  // fully-sent WriteReqs wait for epollCompleteWrites (clean stack)
@@ -226,18 +226,6 @@ struct Connection {
   ParamRoute* fastParam = nullptr;
   const char* fastSeg = nullptr;
   size_t fastSegLen = 0;
-  // Repeat-request memo (Server::fastLane): the bytes of the last
-  // engine-answered request this connection sent whole in one read, and
-  // what answered it. A keep-alive client repeating that request byte for
-  // byte - a poller, a health check, a load generator - is answered without
-  // a parse. memoGen ties it to the route table it was taken against.
-  std::string memo;
-  uint32_t memoGen = 0;
-  StaticRoute* memoStatic = nullptr;
-  ParamRoute* memoParam = nullptr;
-  uint32_t memoSegOff = 0;  // the parameter segment, within memo
-  uint32_t memoSegLen = 0;
-  Method memoMethod = Method::OTHER;
 #if defined(_WIN32)
   // Per-connection receive buffer (uninitialized on purpose - uv only reads
   // back what the socket filled). Windows/IOCP posts this into an overlapped
@@ -703,7 +691,6 @@ class Server {
   // a registered GET still reaches JS, which owns method policy).
   void setStaticRoute(int32_t method, std::string path, ResponseTemplate&& tpl,
                       std::string body) {
-    routesGen_++;  // every memo taken against the old table now misses
     auto& vec = staticRoutes_[std::move(path)];
     for (StaticRoute& existing : vec) {
       if (existing.method == method) {
@@ -716,10 +703,7 @@ class Server {
     }
     vec.push_back(StaticRoute{method, std::move(tpl), std::move(body)});
   }
-  void clearStaticRoutes() {
-    routesGen_++;
-    staticRoutes_.clear();
-  }
+  void clearStaticRoutes() { staticRoutes_.clear(); }
 
   // ---- parameter routes (capabilities.paramRoutes) ----
   // A route with ONE variable path segment whose body IS that segment,
@@ -730,7 +714,6 @@ class Server {
   // undecoded (what uWS's writeParameterValue does) - a route that needs
   // decoding stays a JS route. Method policy is JS's, as for static routes.
   void setParamRoute(int32_t method, std::string prefix, std::string suffix, ResponseTemplate&& tpl) {
-    routesGen_++;
     for (ParamRoute& existing : paramRoutes_) {
       if (existing.method == method && existing.prefix == prefix && existing.suffix == suffix) {
         existing.tpl = std::move(tpl);
@@ -741,10 +724,7 @@ class Server {
     }
     paramRoutes_.push_back(ParamRoute{method, std::move(prefix), std::move(suffix), std::move(tpl)});
   }
-  void clearParamRoutes() {
-    routesGen_++;
-    paramRoutes_.clear();
-  }
+  void clearParamRoutes() { paramRoutes_.clear(); }
   // Any engine-answered route registered (static or parameter): the dispatch
   // sites test this once per request before trying either table.
   bool hasEngineRoutes() const { return !staticRoutes_.empty() || !paramRoutes_.empty(); }
@@ -1838,9 +1818,9 @@ class Server {
       return;
     }
     // Nothing queued on the connection in either direction and the parser
-    // idle: the fast lane (an engine route answered from its cache, or a
-    // byte-for-byte repeat answered without a parse) or, failing that, the
-    // same dispatch as below with the parse it already did.
+    // idle: the fast lane (parsed in place, an engine route answered from
+    // its cache) or, failing that, the same dispatch as below with the
+    // parse it already did.
     if (!c->tls && !c->closing && c->stagedCount == 0 && !c->aheadComplete &&
         c->pendingWrites == 0 && c->corkBuf.empty() && c->parser.idle() && hasEngineRoutes()) {
       fastLane(c, data, len);
@@ -2164,54 +2144,25 @@ class Server {
   // ---- fast lane ----
   // dispatchPlaintext hands a read here when nothing is queued on the
   // connection in either direction (no active or staged request, no bytes
-  // waiting to be written, the parser idle). Two ways out that skip the
-  // dispatch machinery:
-  //  1. the read is byte for byte the connection's previous engine-answered
-  //     request (memo): answered from the route cache, no parse at all;
-  //  2. the read parses (zero-copy, HttpParser::parseDirect) to one complete
-  //     engine-answered request of the common shape - HTTP/1.1 keep-alive,
-  //     not HEAD, nothing pipelined behind it: answered from the route cache
-  //     and remembered for a repeat.
-  // Anything else continues exactly as before, with the parse it did.
-  static constexpr size_t kMemoMax = 512;
-
+  // waiting to be written, the parser idle). The read is parsed in full -
+  // zero-copy, HttpParser::parseDirect, every header validated and the
+  // framing ones interpreted - and when it is one complete engine-answered
+  // request of the common shape (HTTP/1.1 keep-alive, not HEAD, nothing
+  // pipelined behind it) the reply is framed from the route's cache and
+  // written, skipping the dispatch machinery. Anything else continues
+  // exactly as before, with the parse it did. Every request is parsed and
+  // routed; nothing is answered from a previous request's bytes.
   void fastLane(Connection* c, const char* data, size_t len) {
-    if (len == c->memo.size() && c->memoGen == routesGen_ &&
-        std::memcmp(c->memo.data(), data, len) == 0) {
-      c->fastStatic = c->memoStatic;
-      c->fastParam = c->memoParam;
-      c->fastSeg = c->memo.data() + c->memoSegOff;
-      c->fastSegLen = c->memoSegLen;
-      c->method = c->memoMethod;
-      answerPlain(c);
-      return;
-    }
     HttpParser& p = c->parser;
     ParseStatus st = p.parse(data, len);
     if (st == ParseStatus::Complete && p.light() && p.keepAlive && p.minorVersion >= 1 &&
         p.method != Method::HEAD && p.leftover().empty() && plainFrameable(c)) {
       c->method = p.method;
-      if (len <= kMemoMax) remember(c, data, len);
       answerPlain(c);  // fastSeg points into p.path until the reset below
       p.reset();
       return;
     }
     dispatchBatch(c, st);
-  }
-
-  void remember(Connection* c, const char* data, size_t len) {
-    c->memo.assign(data, len);
-    c->memoGen = routesGen_;
-    c->memoStatic = c->fastStatic;
-    c->memoParam = c->fastParam;
-    c->memoMethod = c->parser.method;
-    if (c->fastParam) {
-      // The segment sits in the request target, which follows the first SP.
-      const void* sp = std::memchr(data, ' ', len);
-      const size_t pathOff = static_cast<size_t>(static_cast<const char*>(sp) - data) + 1;
-      c->memoSegOff = static_cast<uint32_t>(pathOff + c->fastParam->prefix.size());
-      c->memoSegLen = static_cast<uint32_t>(c->fastSegLen);
-    }
   }
 
   // The plain-shape reply for the route in c->fastStatic / c->fastParam:
@@ -2361,7 +2312,6 @@ class Server {
         wr = next;
       }
       c->ep.wqHead = c->ep.wqTail = nullptr;
-      if (epoll_) epoll_->release();
     }
 #endif
     delete c;
@@ -3206,40 +3156,45 @@ class Server {
   UringLoop* uring_ = nullptr;
 
   // ---------------------------------------------------------------------
-  // epoll transport: the engine's own readiness loop, surfaced to libuv as a
-  // single uv_poll on the epoll fd (the same integration uWS uses). Per
-  // connection there is a non-blocking socket and nothing else: recv into
-  // the server's receive buffer, send straight from the frame, EPOLLOUT only
-  // while a write is backpressured. It removes libuv's per-stream machinery
+  // epoll transport: plain non-blocking sockets, each watched by a libuv
+  // poll handle on the loop's own epoll (the integration uWebSockets.js
+  // uses), so one epoll_wait per loop iteration delivers every event. Per
+  // connection there is the socket and its watcher and nothing else: recv
+  // into the server's receive buffer, send straight from the frame, writable
+  // interest only while a write is backpressured. It removes libuv's per-stream machinery
   // (alloc/read callbacks, write requests, handle close) from the hot path;
   // the protocol layers above (onTransportData, transportWrite, the cork,
   // TLS, WebSocket, the sweep) are the same ones the uv and io_uring
   // transports drive.
   //
-  // Two things only ever happen on a clean stack (the end of a readiness
-  // round, or a uv_check on the next loop turn), never inside the call that
+  // Two things only ever happen on a clean stack, never inside the call that
   // caused them:
   //   - completing a queued write (completeWrite -> finishResponse -> the
-  //     next pipelined request -> JS). libuv defers uv_write callbacks the
-  //     same way; running them inside respond() would re-enter JS from a V8
-  //     fast call. Bytes are still pushed to the socket immediately.
-  //   - freeing a closed Connection: later events of the same epoll_wait
-  //     batch may still name it, and freeConnection may `delete this` (a
-  //     fully closed Server), which must not happen on a Server method's
-  //     stack.
+  //     next pipelined request -> JS) runs from a uv_check on the next loop
+  //     turn. libuv defers uv_write callbacks the same way; running them
+  //     inside respond() would re-enter JS from a V8 fast call. Bytes are
+  //     still pushed to the socket immediately.
+  //   - freeing a closed Connection runs from its poll handle's close
+  //     callback: freeConnection may `delete this` (a fully closed Server),
+  //     which must not happen on a Server method's stack.
  public:
+  // Per-thread state of the epoll transport. Every listening and accepted
+  // socket is a libuv poll handle on this loop, so libuv's own epoll_wait -
+  // one per loop iteration - delivers every readiness event, and the engine
+  // makes the accept, receive and send calls itself on plain non-blocking
+  // sockets. (1.1.10 kept a private epoll fd behind one poll handle and
+  // drained it with a second epoll_wait per iteration; with few events per
+  // iteration that second call was measurable.) What is shared across the
+  // servers on a thread lives here: the check handle that runs write
+  // completions on a clean stack (a write issued from a V8 fast call must
+  // not re-enter JS synchronously), the EMFILE spare descriptor, the set of
+  // listening servers.
   struct EpollLoop {
-    int epfd = -1;
     uv_loop_t* loop = nullptr;
-    uv_poll_t poll;
     uv_check_t check;
     bool checkActive = false;
-    int refs = 0;  // listening servers + live connections (ref/unref the poll handle)
-    bool pollRef = false;
-    bool inDrain = false;
-    int closedHandles = 0;
+    bool checkClosed = false;
     int emfileFd = -1;
-    std::vector<Connection*> dead;         // closed, to free (freeConnection)
     std::vector<Connection*> completions;  // fully-sent queued writes to complete
     std::unordered_set<Server*> servers;
 
@@ -3253,80 +3208,19 @@ class Server {
       if (s) return s;
       auto* u = new EpollLoop();
       u->loop = loop;
-      u->epfd = ::epoll_create1(EPOLL_CLOEXEC);
-      if (u->epfd < 0) {
-        delete u;
-        return nullptr;
-      }
-      u->poll.data = u;
-      if (uv_poll_init(loop, &u->poll, u->epfd) != 0) {
-        ::close(u->epfd);
-        delete u;
-        return nullptr;
-      }
       u->check.data = u;
       uv_check_init(loop, &u->check);
       uv_unref(reinterpret_cast<uv_handle_t*>(&u->check));
-      uv_poll_start(&u->poll, UV_READABLE, onReadable);
-      uv_unref(reinterpret_cast<uv_handle_t*>(&u->poll));
       u->emfileFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
       s = u;
       return u;
     }
 
-    void addRef() {
-      if (++refs == 1 && !pollRef) {
-        uv_ref(reinterpret_cast<uv_handle_t*>(&poll));
-        pollRef = true;
-      }
-    }
-    void release() {
-      if (--refs == 0 && pollRef) {
-        uv_unref(reinterpret_cast<uv_handle_t*>(&poll));
-        pollRef = false;
-      }
-    }
-
-    static void onReadable(uv_poll_t* h, int status, int) {
-      if (status < 0) return;
-      static_cast<EpollLoop*>(h->data)->drain();
-    }
-
-    // One readiness round: everything epoll has right now, without blocking
-    // (libuv already waited). Listener events accept; connection events read
-    // and, when EPOLLOUT was armed, resume the write queue. A batch that
-    // filled the array is followed by another pass, bounded.
-    void drain() {
-      if (inDrain) return;
-      inDrain = true;
-      epoll_event evs[256];
-      for (int round = 0; round < 8; round++) {
-        int n = ::epoll_wait(epfd, evs, 256, 0);
-        if (n <= 0) break;
-        for (int i = 0; i < n; i++) {
-          const uintptr_t raw = reinterpret_cast<uintptr_t>(evs[i].data.ptr);
-          if (raw & 1u) {
-            reinterpret_cast<Server*>(raw & ~static_cast<uintptr_t>(1u))->epollOnListener();
-          } else {
-            Connection* c = reinterpret_cast<Connection*>(raw);
-            if (c->ep.state < 2) c->server->epollOnConn(c, evs[i].events);
-          }
-        }
-        if (n < 256) break;
-      }
-      inDrain = false;
-      settle();
-    }
-
     void armCheck() {
-      if (!inDrain && !checkActive) {
+      if (!checkActive) {
         checkActive = true;
         uv_check_start(&check, onCheck);
       }
-    }
-    void deferFree(Connection* c) {
-      dead.push_back(c);
-      armCheck();
     }
     void deferCompletion(Connection* c) {
       completions.push_back(c);
@@ -3334,46 +3228,37 @@ class Server {
     }
     static void onCheck(uv_check_t* h) { static_cast<EpollLoop*>(h->data)->settle(); }
 
-    // Clean-stack work: complete fully-sent writes (which may surface further
-    // requests and queue more writes - those complete in the next pass), then
-    // free closed connections. A connection closed by a completion is skipped
-    // by the state check before its free.
+    // Clean-stack work: complete fully-sent writes, which may surface further
+    // requests and queue more writes - those complete in the next pass. A
+    // connection closed by a completion is skipped by its state.
     void settle() {
       if (checkActive) {
         checkActive = false;
         uv_check_stop(&check);
       }
-      for (int pass = 0; pass < 64 && (!completions.empty() || !dead.empty()); pass++) {
+      for (int pass = 0; pass < 64 && !completions.empty(); pass++) {
         std::vector<Connection*> list;
         list.swap(completions);
         for (Connection* c : list) {
           if (c->ep.state < 2) c->server->epollCompleteWrites(c);
         }
-        while (!dead.empty()) {
-          Connection* c = dead.back();
-          dead.pop_back();
-          c->server->freeConnection(c);  // may delete the Server (checkFullyClosed)
-        }
       }
-      if (!completions.empty() || !dead.empty()) armCheck();
+      if (!completions.empty()) armCheck();
     }
-    void flushDead() { settle(); }
 
     static void shutdownForThread() {
       EpollLoop*& s = slot();
       if (!s) return;
       EpollLoop* u = s;
       s = nullptr;
-      u->flushDead();
-      uv_close(reinterpret_cast<uv_handle_t*>(&u->poll), onHandleClosed);
-      uv_close(reinterpret_cast<uv_handle_t*>(&u->check), onHandleClosed);
-      while (u->closedHandles < 2) uv_run(u->loop, UV_RUN_ONCE);
+      u->settle();
+      uv_close(reinterpret_cast<uv_handle_t*>(&u->check), onCheckClosed);
+      while (!u->checkClosed) uv_run(u->loop, UV_RUN_ONCE);
       if (u->emfileFd >= 0) ::close(u->emfileFd);
-      if (u->epfd >= 0) ::close(u->epfd);
       delete u;
     }
-    static void onHandleClosed(uv_handle_t* h) {
-      static_cast<EpollLoop*>(h->data)->closedHandles++;
+    static void onCheckClosed(uv_handle_t* h) {
+      static_cast<EpollLoop*>(h->data)->checkClosed = true;
     }
   };
 
@@ -3400,19 +3285,22 @@ class Server {
       ::close(fd);
       return e;
     }
-    epoll_event ev{};
-    ev.events = EPOLLIN;
-    ev.data.ptr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(this) | 1u);
-    if (::epoll_ctl(epoll_->epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
-      int e = -errno;
+    listenPoll_.data = this;
+    int r = uv_poll_init(loop_, &listenPoll_, fd);
+    if (r != 0) {
       ::close(fd);
-      return e;
+      return r;
     }
     listenFd_ = fd;
-    liveHandles_++;  // balanced in epollCloseListener
-    epoll_->addRef();
+    liveHandles_++;  // balanced in onListenPollClosed
     epoll_->servers.insert(this);
+    uv_poll_start(&listenPoll_, UV_READABLE, onListenPoll);
     return 0;
+  }
+
+  static void onListenPoll(uv_poll_t* h, int status, int) {
+    if (status < 0) return;
+    static_cast<Server*>(h->data)->epollOnListener();
   }
 
   void epollOnListener() {
@@ -3448,34 +3336,51 @@ class Server {
     c->server = this;
     c->ep.fd = fd;
     c->ep.state = 1;
-    liveHandles_++;  // balanced by freeConnection
-    epoll_->addRef();
+    c->ep.poll.data = c;
+    if (uv_poll_init(loop_, &c->ep.poll, fd) != 0) {
+      ::close(fd);
+      delete c;
+      return;
+    }
+    liveHandles_++;  // balanced by freeConnection (from onConnPollClosed)
     attachConnection(c);
     if (!readBuf_) {
       readBuf_.reset(new char[65536]);
       readBufSize_ = 65536;
     }
-    epoll_event ev{};
-    ev.events = EPOLLIN | EPOLLRDHUP;
-    ev.data.ptr = c;
-    if (::epoll_ctl(epoll_->epfd, EPOLL_CTL_ADD, fd, &ev) != 0) abortConnection(c);
+    uv_poll_start(&c->ep.poll, UV_READABLE | UV_DISCONNECT, onConnPoll);
   }
 
-  void epollOnConn(Connection* c, uint32_t events) {
-    if (events & EPOLLOUT) {
+  // libuv reports a socket error (POLLERR) as a negative status and stops
+  // the watcher; a hang-up or half-close arrives as readable / disconnect and
+  // recv() then says 0 or the error, which is the EOF path either way.
+  static void onConnPoll(uv_poll_t* h, int status, int events) {
+    Connection* c = static_cast<Connection*>(h->data);
+    if (c->ep.state >= 2) return;
+    if (status < 0) {
+      if (!c->ep.eofSeen) {
+        c->ep.eofSeen = true;
+        c->server->onTransportEof(c);
+      }
+      return;
+    }
+    c->server->epollOnConn(c, events);
+  }
+
+  void epollOnConn(Connection* c, int events) {
+    if (events & UV_WRITABLE) {
       epollFlush(c);
       if (c->ep.state >= 2) return;
     }
-    if (!(events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR))) return;
+    if (!(events & (UV_READABLE | UV_DISCONNECT))) return;
     ssize_t n = ::recv(c->ep.fd, readBuf_.get(), readBufSize_, 0);
     if (n > 0) {
       // Level-triggered: anything left in the socket raises the next event.
       onTransportData(c, readBuf_.get(), static_cast<size_t>(n));
       return;
     }
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) &&
-        !(events & (EPOLLHUP | EPOLLERR)))
-      return;  // RDHUP with the receive queue drained: the FIN arrives as recv() == 0 next
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+      return;  // a half-close with the receive queue drained: the FIN arrives as recv() == 0 next
     if (!c->ep.eofSeen) {
       c->ep.eofSeen = true;
       onTransportEof(c);
@@ -3493,10 +3398,7 @@ class Server {
 
   void epollWantOut(Connection* c, bool on) {
     if (c->ep.wantOut == on || c->ep.state >= 2 || c->ep.fd < 0) return;
-    epoll_event ev{};
-    ev.events = EPOLLIN | EPOLLRDHUP | (on ? EPOLLOUT : 0u);
-    ev.data.ptr = c;
-    ::epoll_ctl(epoll_->epfd, EPOLL_CTL_MOD, c->ep.fd, &ev);
+    uv_poll_start(&c->ep.poll, UV_READABLE | UV_DISCONNECT | (on ? UV_WRITABLE : 0), onConnPoll);
     c->ep.wantOut = on;
   }
 
@@ -3573,30 +3475,44 @@ class Server {
     c->ep.pendingBytes = 0;
   }
 
+  // The socket is closed once libuv has let go of its watcher (the close
+  // callback), never before: the descriptor number could be reused by the
+  // next accept while libuv still had it in its table. The Connection is
+  // freed from that same callback, on a clean stack.
   void epollCloseConn(Connection* c) {
     if (c->ep.state >= 2) return;
     c->ep.state = 2;
+    uv_poll_stop(&c->ep.poll);
+    uv_close(reinterpret_cast<uv_handle_t*>(&c->ep.poll), onConnPollClosed);
+  }
+  static void onConnPollClosed(uv_handle_t* h) {
+    Connection* c = static_cast<Connection*>(h->data);
     if (c->ep.fd >= 0) {
-      ::epoll_ctl(epoll_->epfd, EPOLL_CTL_DEL, c->ep.fd, nullptr);
       ::close(c->ep.fd);
       c->ep.fd = -1;
     }
-    epoll_->deferFree(c);
+    c->server->freeConnection(c);  // may delete the Server (checkFullyClosed)
   }
 
   void epollCloseListener() {
     if (listenFd_ < 0 || listenerClosing_) return;
     listenerClosing_ = true;
-    ::epoll_ctl(epoll_->epfd, EPOLL_CTL_DEL, listenFd_, nullptr);
-    ::close(listenFd_);
-    listenFd_ = -1;
-    epoll_->servers.erase(this);
-    epoll_->release();
-    liveHandles_--;
-    checkFullyClosed();  // tcp_'s pending uv_close keeps liveHandles_ > 0 here
+    uv_poll_stop(&listenPoll_);
+    uv_close(reinterpret_cast<uv_handle_t*>(&listenPoll_), onListenPollClosed);
+  }
+  static void onListenPollClosed(uv_handle_t* h) {
+    Server* s = static_cast<Server*>(h->data);
+    if (s->listenFd_ >= 0) {
+      ::close(s->listenFd_);
+      s->listenFd_ = -1;
+    }
+    s->epoll_->servers.erase(s);
+    s->liveHandles_--;
+    s->checkFullyClosed();  // may delete s
   }
 
   EpollLoop* epoll_ = nullptr;
+  uv_poll_t listenPoll_{};
 #endif
 
   // ---- deferred notifications ----
@@ -3683,7 +3599,6 @@ class Server {
   std::unordered_set<Connection*> conns_;  // all live connections (for close())
   TemplateStore templates_;
   bool batchOn_ = false;
-  uint32_t routesGen_ = 1;  // bumped by every route-table change (memo validity)
   uint32_t* batchControl_ = nullptr;
   // Keyed by path and looked up with the Connection's own std::string, so the
   // hot path allocates nothing. One or two methods per path in any real app,

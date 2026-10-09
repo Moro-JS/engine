@@ -18,10 +18,10 @@ a route whose reply is one path segment (`/user/:id`) is answered inside the
 engine as well, so a static-plus-echo route table never enters JS. 1.1.10
 answers those routes straight from the parser - scanned in place in the
 receive buffer, no request id, no header materialisation, one cached frame
-append - remembers each connection's last such request so a byte-for-byte
-repeat is answered without a parse, and puts the engine's own epoll loop
-under Linux by default, taking libuv's stream layer off the request path.
-Measured comparisons live in the
+append - and puts the engine's own socket path under Linux by default
+(plain sockets on libuv's epoll), taking libuv's stream layer off the
+request path; 1.1.11 takes that transport down to one `epoll_wait` per
+loop turn. Measured comparisons live in the
 [MoroJS Benchmark repo](https://github.com/Moro-JS/benchmark). In progress:
 ALPN HTTP/2 (vendored nghttp2). See [docs/DESIGN.md](docs/DESIGN.md) and
 [docs/ROADMAP.md](docs/ROADMAP.md).
@@ -36,8 +36,9 @@ ALPN HTTP/2 (vendored nghttp2). See [docs/DESIGN.md](docs/DESIGN.md) and
 - The Moro-shaped boundary (batched request snapshot, single corked response
   write) needs 2–4 JS crossings per request vs ~10–20 for a general-purpose
   binding.
-- Three transports behind one seam: the engine's own epoll loop (the Linux
-  default since 1.1.10, no libuv stream per connection), libuv streams (macOS,
+- Three transports behind one seam: the engine's own socket path on
+  libuv's epoll (the Linux default since 1.1.10, no libuv stream per
+  connection, one `epoll_wait` per loop turn), libuv streams (macOS,
   Windows, or `MORO_ENGINE_TRANSPORT=uv`) and an opt-in io_uring transport on
   Linux 6.1+ (`MORO_ENGINE_TRANSPORT=uring`: multishot accept/recv, half the
   syscalls per request) — identical bytes on the wire, the whole test matrix

@@ -152,13 +152,10 @@ setParamRoute(serverId, method: number, prefix: string, suffix: string, status?:
 clearParamRoutes(serverId): void;
 // Both kinds go through the engine's fast lane (1.1.10). A request that arrives whole in one
 // read on a connection with nothing queued in either direction is parsed in place - no copy,
-// every header validated and the framing ones interpreted, none stored - and answered from
-// the route's cached frame. The connection also remembers the bytes of that request: a
-// keep-alive client repeating it byte for byte (a poller, a health check, a load generator)
-// is answered without a parse. The memo covers the common shape only (HTTP/1.1 keep-alive,
-// not HEAD, nothing pipelined behind it, at most 512 bytes), keeps the Date line live, and is
-// dropped by any change to the route table: setStaticRoute/clearStaticRoutes/setParamRoute/
-// clearParamRoutes take effect on the very next request, repeat or not.
+// every header validated and the framing ones interpreted, none stored - routed, and answered
+// from the route's prepared response head (rebuilt when the Date second changes). Every
+// request is parsed and routed; a route-table change (setStaticRoute/clearStaticRoutes/
+// setParamRoute/clearParamRoutes) takes effect on the very next request.
 
 // ---- prepared response templates (capabilities.responseTemplates) ----
 // The part of a response that never varies - status + the app header block - is
@@ -382,18 +379,19 @@ sequential dispatch is proven by `test/batch-dispatch.test.mjs`.
 ## I/O transports
 
 Everything above runs on one of three transports, chosen once per process.
-On Linux the engine's own epoll loop is the default since 1.1.10; libuv is
-the default on macOS and Windows and available on request; io_uring is
+On Linux the epoll transport is the default since 1.1.10; libuv streams
+are the default on macOS and Windows and available on request; io_uring is
 opt-in (`MORO_ENGINE_TRANSPORT=uring`), for the reasons measured in
 `docs/DESIGN.md` ("io_uring measurements"):
 
-- **epoll** (`transport: 'epoll'`): Linux, the default. One epoll fd per loop
-  thread, surfaced to libuv as a single poll handle so the engine stays on
-  Node's loop; accept, recv and send are made directly on plain non-blocking
-  sockets, with EPOLLOUT armed only while a write is backpressured. It
-  removes libuv's per-connection stream machinery (alloc/read callbacks,
-  write requests, handle close) from the request path: the same syscalls as
-  libuv, about a third less CPU around them.
+- **epoll** (`transport: 'epoll'`): Linux, the default. Every listening and
+  accepted socket is a libuv poll handle on the loop's epoll, so the engine
+  stays on Node's loop and one `epoll_wait` per loop turn delivers every
+  event; accept, recv and send are made directly
+  on plain non-blocking sockets, with writable interest armed only while a
+  write is backpressured. It removes libuv's per-connection stream machinery
+  (alloc/read callbacks, write requests, handle close) from the request
+  path: the same syscalls as libuv, about a third less CPU around them.
 - **libuv streams** (`transport: 'uv'`): macOS, Windows, and Linux when
   `MORO_ENGINE_TRANSPORT=uv` (A/B runs, bisecting).
 - **io_uring** (`transport: 'uring'`): Linux 6.1+, when `MORO_ENGINE_TRANSPORT=uring`
