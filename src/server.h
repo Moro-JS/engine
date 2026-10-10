@@ -3206,6 +3206,137 @@ class Server {
     std::vector<Ready> ready;  // sockets the poll phase reported this turn; served by serve()
     unsigned groups = 1;       // peer-CPU groups seen so far (max peerCpu + 2, -1 being a group)
     unsigned turn = 0;         // serve() calls; the group that goes first rotates with it
+
+    // Which order serves a turn. 'grouped', the default, sorts the turn's
+    // sockets by peer CPU (serve() below); 'arrival' serves them as the kernel
+    // reported them; 'auto' measures both and keeps whichever the current
+    // peers answer faster. A probe is four windows of 200 ms, grouped and
+    // arrival alternating, the first 50 ms of each not counted while the
+    // peers settle into the order. A probe whose two windows of one order
+    // disagree by more than 30% saw the load change and is repeated. Leaving
+    // the grouped order takes two consecutive probes that agree (one noisy
+    // probe never moves a loop off its default); returning to it takes one.
+    // The winner by more than 8% over its two windows then serves for a stay
+    // that grows with the margin: 1 s for a near tie, 4 s at a 5% margin,
+    // 16 s at 20% or more, and doubles each time the same order wins again,
+    // up to 64 s; a confident, repeated decision is kept, an uncertain one is
+    // soon re-examined. Stays end on boundaries of the monotonic clock, so
+    // the loops of one host (cluster workers, worker threads) probe in step
+    // and never measure each other's probes. The stay also ends when the
+    // peers change: the live rate (one-second windows) moves 25% away from
+    // what the probe measured, in either direction, or the loop accepts more
+    // new connections in a second than a quarter of the sockets it has been
+    // serving per turn. MORO_ENGINE_SERVE_ORDER=grouped|arrival|auto selects
+    // the order (grouped unless set); MORO_ENGINE_SERVE_DEBUG=1 logs the
+    // decisions.
+    enum class Order : uint8_t { Grouped, Arrival };
+    bool autoOrder = false;
+    bool debug = false;
+    Order order = Order::Grouped;
+    uint64_t winStart = 0;     // uv_hrtime() at the start of the current window
+    size_t winServed = 0;      // sockets served in it (after the settle time)
+    uint8_t phase = 0;         // 0..3: probe windows (G, A, G, A); 4: serving the winner
+    double sumGrouped = 0, sumArrival = 0;
+    double winGrouped[2] = {0, 0}, winArrival[2] = {0, 0};  // the probe's four windows
+    double winnerRate = 0;     // the winner's probe rate
+    Order lastWinner = Order::Grouped;
+    unsigned repeats = 0;      // consecutive probes won by the same order
+    bool arrivalPending = false;  // arrival won the last probe; it needs a second one to take over
+    Order before = Order::Grouped;  // the order in effect when the running probe began
+    uint64_t subStart = 0;     // live-rate sub-window while serving the winner
+    size_t subServed = 0;
+    size_t subAccepts = 0;     // connections accepted in the sub-window
+    size_t subPeak = 0;        // largest turn in the sub-window (a proxy for the live connection count)
+    void noteAccept() { subAccepts++; }
+    static constexpr uint64_t kSettleNs = 50ull * 1000 * 1000;
+    static constexpr uint64_t kProbeNs = 200ull * 1000 * 1000;
+    static constexpr uint64_t kExploitNs = 4000ull * 1000 * 1000;
+    uint64_t exploitNs = kExploitNs;  // this stay's length: kExploitNs x (margin / 5%), 0.25x..4x
+    static constexpr uint64_t kSubNs = 1000ull * 1000 * 1000;
+    EpollLoop() {
+      const char* e = getenv("MORO_ENGINE_SERVE_ORDER");
+      if (e && strcmp(e, "arrival") == 0) order = Order::Arrival;
+      else if (e && strcmp(e, "auto") == 0) autoOrder = true;
+      const char* d = getenv("MORO_ENGINE_SERVE_DEBUG");
+      debug = d && *d && *d != '0';
+    }
+    static Order probeOrder(uint8_t ph) { return (ph & 1u) ? Order::Arrival : Order::Grouped; }
+    void startProbe(uint64_t now) {
+      before = order;
+      phase = 0; order = Order::Grouped; winStart = now; winServed = 0; sumGrouped = sumArrival = 0;
+    }
+    void tune(size_t served) {
+      if (!autoOrder) return;
+      const uint64_t now = uv_hrtime();
+      if (winStart == 0) { startProbe(now); return; }
+      const uint64_t elapsed = now - winStart;
+      if (phase == 4) {
+        subServed += served;
+        if (served > subPeak) subPeak = served;
+        // The stay ends at the next multiple of its length on the monotonic
+        // clock (never sooner than half its length), so co-located loops
+        // with the same stay probe together.
+        bool reprobe = elapsed >= exploitNs / 2 && (now / exploitNs) != (winStart / exploitNs);
+        if (!reprobe && now - subStart >= kSubNs) {
+          const double live = static_cast<double>(subServed) * 1e9 / static_cast<double>(now - subStart);
+          if (live < winnerRate * 0.75 || live > winnerRate * 1.25) {
+            reprobe = true;
+            if (debug) fprintf(stderr, "[serve] live %.0f/s vs %.0f/s: re-probe\n", live, winnerRate);
+          } else if (subAccepts * 4 > subPeak && subAccepts >= 8) {
+            reprobe = true;
+            if (debug) fprintf(stderr, "[serve] %zu new connections against turns of %zu: re-probe\n", subAccepts, subPeak);
+          }
+          subStart = now; subServed = 0; subAccepts = 0; subPeak = 0;
+        }
+        if (reprobe) startProbe(now);
+        return;
+      }
+      if (elapsed >= kSettleNs) winServed += served;
+      if (elapsed < kProbeNs) return;
+      const double rate = static_cast<double>(winServed) * 1e9 / static_cast<double>(elapsed - kSettleNs);
+      if (probeOrder(phase) == Order::Grouped) { sumGrouped += rate; winGrouped[phase / 2] = rate; }
+      else { sumArrival += rate; winArrival[phase / 2] = rate; }
+      if (debug) fprintf(stderr, "[serve] probe %u %s %.0f/s\n", phase, probeOrder(phase) == Order::Grouped ? "grouped" : "arrival", rate);
+      phase++;
+      winStart = now; winServed = 0;
+      if (phase < 4) { order = probeOrder(phase); return; }
+      // The load changed during the probe (an order's two windows disagree by
+      // more than 30%): nothing can be concluded from it. Probe again.
+      const auto steady = [](const double* w) {
+        const double hi = std::max(w[0], w[1]), lo = std::min(w[0], w[1]);
+        return hi <= 0 || lo >= hi * 0.7;
+      };
+      if (!steady(winGrouped) || !steady(winArrival)) {
+        if (debug) fprintf(stderr, "[serve] probe unsteady (grouped %.0f/%.0f, arrival %.0f/%.0f): again\n", winGrouped[0], winGrouped[1], winArrival[0], winArrival[1]);
+        startProbe(now);
+        return;
+      }
+      // Grouped unless arrival is clearly better over both of its windows,
+      // and, when the loop is still on grouped, better in two probes in a row.
+      Order winner = sumArrival > sumGrouped * 1.08 ? Order::Arrival : Order::Grouped;
+      if (winner == Order::Arrival && before == Order::Grouped && !arrivalPending) {
+        arrivalPending = true;
+        order = Order::Grouped;
+        winnerRate = sumGrouped / 2.0;
+        exploitNs = kExploitNs / 4;  // a short stay: the confirming probe follows soon
+        subStart = now; subServed = 0; subAccepts = 0; subPeak = 0;
+        if (debug) fprintf(stderr, "[serve] arrival ahead (grouped %.0f/s, arrival %.0f/s): confirming\n", sumGrouped / 2, sumArrival / 2);
+        return;
+      }
+      arrivalPending = false;
+      order = winner;
+      winnerRate = (winner == Order::Arrival ? sumArrival : sumGrouped) / 2.0;
+      subAccepts = 0; subPeak = 0;
+      const double hi = std::max(sumArrival, sumGrouped), lo = std::min(sumArrival, sumGrouped);
+      const double margin = hi > 0 ? (hi - lo) / hi : 0.0;  // 0.1 = 10%
+      const double stretch = std::min(4.0, std::max(0.25, margin / 0.05));
+      repeats = winner == lastWinner ? std::min(repeats + 1, 4u) : 0;
+      lastWinner = winner;
+      exploitNs = static_cast<uint64_t>(static_cast<double>(kExploitNs) * stretch) << repeats;
+      if (exploitNs > 64000ull * 1000 * 1000) exploitNs = 64000ull * 1000 * 1000;
+      subStart = now; subServed = 0;
+      if (debug) fprintf(stderr, "[serve] winner %s (grouped %.0f/s, arrival %.0f/s)\n", winner == Order::Grouped ? "grouped" : "arrival", sumGrouped / 2, sumArrival / 2);
+    }
     std::unordered_set<Server*> servers;
 
     static EpollLoop*& slot() {
@@ -3258,6 +3389,13 @@ class Server {
       if (ready.empty()) return;
       std::vector<Ready> list;
       list.swap(ready);
+      tune(list.size());
+      if (order == Order::Arrival) {
+        for (const Ready& r : list) {
+          if (r.c->ep.state < 2) r.c->server->epollOnConn(r.c, r.events);
+        }
+        return;
+      }
       const unsigned n = groups, rot = turn++ % n;
       const auto key = [n, rot](const Ready& r) { return (static_cast<unsigned>(r.c->ep.peerCpu + 1) + rot) % n; };
       std::sort(list.begin(), list.end(), [&key](const Ready& a, const Ready& b) {
@@ -3389,6 +3527,7 @@ class Server {
       return;
     }
     liveHandles_++;  // balanced by freeConnection (from onConnPollClosed)
+    epoll_->noteAccept();
     attachConnection(c);
     if (!readBuf_) {
       readBuf_.reset(new char[65536]);

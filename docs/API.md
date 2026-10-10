@@ -393,10 +393,17 @@ opt-in (`MORO_ENGINE_TRANSPORT=uring`), for the reasons measured in
   (alloc/read callbacks, write requests, handle close) from the request
   path: the same syscalls as libuv, about a third less CPU around them.
   The sockets a loop turn reports readable are served in the check phase of
-  that turn, grouped by the CPU their peer's packets arrive on
-  (`SO_INCOMING_CPU`: the peer thread's CPU over loopback, the receive
-  queue's behind a NIC), so a peer driving many connections from one event
-  loop gets its replies back to back and wakes once per group.
+  that turn, in one of two orders: grouped by the CPU their peer's packets
+  arrive on (`SO_INCOMING_CPU`: the peer thread's CPU over loopback, the
+  receive queue's behind a NIC), so a peer driving many connections from one
+  event loop gets its replies back to back and wakes once per group (the
+  default); or as the kernel reported them (`MORO_ENGINE_SERVE_ORDER=arrival`);
+  or, with `MORO_ENGINE_SERVE_ORDER=auto`, whichever of the two the loop
+  measures the current peers answering faster (200 ms probe windows, an 8%
+  margin, two agreeing probes to leave grouped, a stay on the winner that
+  grows with the margin and with repeated wins and ends when the live rate
+  moves 25% from what was probed or the peers reconnect en masse).
+  `MORO_ENGINE_SERVE_DEBUG=1` logs the decisions.
 - **libuv streams** (`transport: 'uv'`): macOS, Windows, and Linux when
   `MORO_ENGINE_TRANSPORT=uv` (A/B runs, bisecting).
 - **io_uring** (`transport: 'uring'`): Linux 6.1+, when `MORO_ENGINE_TRANSPORT=uring`

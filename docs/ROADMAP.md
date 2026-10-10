@@ -21,6 +21,7 @@ Windows (MSVC) CI build leg (the local build has landed in `tools/build.mjs`).
 | 1.1.10 engine-answered routes + epoll transport | ✅ done | static and parameter routes answered straight from the parser (scanned in place, reply framed from a prepared head, one cached-frame append); the engine's own socket path on libuv's epoll becomes the Linux default |
 | 1.1.11 epoll transport | ✅ done | every listening and accepted socket a libuv poll handle on the loop's epoll: one `epoll_wait` per loop turn, sockets closed from their handle's close callback |
 | 1.1.12 service order | ✅ done | each loop turn's readable sockets served in its check phase grouped by `SO_INCOMING_CPU` (the peer's CPU) and socket number, leading group rotating per turn; +25-40% under a six-thread generator and ~10% under the harness generator on a two-core Linux VM, a single-threaded client unchanged |
+| 1.1.13 selectable order | ✅ done | the grouped order loses to arrival order when every request enters JS under a generator that oversubscribes its cores (−24% at 256 connections); `MORO_ENGINE_SERVE_ORDER=grouped|arrival|auto` selects the order, `auto` probing both (4 × 200 ms, 8% margin) and keeping the faster for a stay that grows with the margin and repeated wins, ending early when the live rate moves 25% or the peers reconnect; grouped stays the default |
 
 ## Beyond 1.0
 
