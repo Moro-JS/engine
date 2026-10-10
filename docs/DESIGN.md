@@ -8,9 +8,9 @@ Goal: saturate the hardware (~105k req/s hello-world reference ceiling on the be
 
 ### L1 — Socket/event layer
 - Integrates with Node's own libuv loop (`uv_poll` on the main loop; libuv ships with Node's headers and is the platform API).
-- Two transports behind one seam (`TransportKind` per server, `src/server.h`): **libuv streams** everywhere (the default), and **io_uring** on Linux 6.1+ (`src/uring.h`, a hand-rolled ring with no liburing dependency), opt-in in 1.1.6 through `MORO_ENGINE_TRANSPORT=uring` (see "io_uring measurements" below for why it is not auto-selected yet). The ring is probed once per process at the first `listen()` — mandatory setup flags (`SINGLE_ISSUER | COOP_TASKRUN | TASKRUN_FLAG`; not `DEFER_TASKRUN`, which never wakes an epoll-driven loop), required features, opcode probe, a provided-buffer ring, and a socketpair self-test — and any refusal (`EPERM` under Docker's default seccomp profile, `ENOSYS` under gVisor, `EINVAL` on older kernels) silently selects libuv. One ring per loop thread, driven from the same libuv loop (`uv_poll` on the ring fd, `uv_prepare` flushes SQEs before the loop blocks), multishot accept and multishot recv into kernel-provided buffers, one in-flight `SEND` per connection, shutdown(2)-then-cancel-close on teardown (the FIN goes out synchronously, so the server still closes first on a `Connection: close` exchange). Byte streams are identical across transports (`test/transport-parity.test.mjs`); `probe().transport` says which one is live and `transportReason` why.
+- Three transports behind one seam (`TransportKind` per server, `src/server.h`). **epoll** (Linux, the default since 1.1.10): every listening and accepted socket is a libuv poll handle on the loop's own epoll, so one `epoll_wait` per loop turn delivers every event (1.1.11); accept, recv and send are made directly on plain non-blocking sockets, writable interest is armed only while a write is backpressured, and a socket is closed from its handle's close callback. The sockets a turn reports readable are served in that turn's check phase (`EpollLoop::serve`), grouped by the CPU their peer's packets arrive on (`SO_INCOMING_CPU`, read at accept and every 1024 reads) and by socket number within a group, the leading group rotating per turn (1.1.12): the kernel's readiness order says nothing about who is on the other end, and a peer that multiplexes many connections on one event loop then gets its replies back to back and wakes once per group instead of once per reply, a wake-up that is paid in this side's `send()` (see "epoll transport measurements" below). **libuv streams** on macOS and Windows, or anywhere with `MORO_ENGINE_TRANSPORT=uv`. **io_uring** on Linux 6.1+ (`src/uring.h`, a hand-rolled ring with no liburing dependency), opt-in since 1.1.6 through `MORO_ENGINE_TRANSPORT=uring` (see "io_uring measurements" below for why it is not auto-selected). The ring is probed once per process at the first `listen()` — mandatory setup flags (`SINGLE_ISSUER | COOP_TASKRUN | TASKRUN_FLAG`; not `DEFER_TASKRUN`, which never wakes an epoll-driven loop), required features, opcode probe, a provided-buffer ring, and a socketpair self-test — and any refusal (`EPERM` under Docker's default seccomp profile, `ENOSYS` under gVisor, `EINVAL` on older kernels) silently selects libuv. One ring per loop thread, driven from the same libuv loop (`uv_poll` on the ring fd, `uv_prepare` flushes SQEs before the loop blocks), multishot accept and multishot recv into kernel-provided buffers, one in-flight `SEND` per connection, shutdown(2)-then-cancel-close on teardown (the FIN goes out synchronously, so the server still closes first on a `Connection: close` exchange). Byte streams are identical across transports (`test/transport-parity.test.mjs`); `probe().transport` says which one is live and `transportReason` why.
 - Accept, per-socket state machines, corked writes, backpressure, idle/slowloris timeouts, graceful shutdown.
-- **`TCP_NODELAY` is inherited, not set per connection**: the listening socket carries it (uv arm: `listen()`; io_uring arm: `uringListen`) and Linux and XNU copy it to every accepted socket, which `test/sockopt-unit.cpp` verifies on the running kernel — one `setsockopt` less on every accept (Windows keeps `uv_tcp_nodelay` per socket).
+- **`TCP_NODELAY` is inherited, not set per connection**: the listening socket carries it (uv arm: `listen()`; epoll arm: `epollListen`; io_uring arm: `uringListen`) and Linux and XNU copy it to every accepted socket, which `test/sockopt-unit.cpp` verifies on the running kernel — one `setsockopt` less on every accept (Windows keeps `uv_tcp_nodelay` per socket).
 - **The FIN rides with the last bytes of a `Connection: close` response, and the connection then lingers** (`tTryWriteLast`, `closeAfterResponse`). macOS: `TCP_NOPUSH` on, `send`, `TCP_NOPUSH` off, `shutdown(SHUT_WR)` — XNU does not run `tcp_output` when the option is cleared, and a `send(MSG_EOF)` under `TCP_NOPUSH` stays held too; the pending FIN is what pushes data + FIN as one segment. Linux: `send(MSG_MORE)` + `shutdown(SHUT_WR)`. So the peer can never close first: two segments a few microseconds apart let a fast client (wrk, oha) become the active closer and hold the TIME_WAIT, and on macOS, with no port reuse, a churning client then drains its 16k ephemeral ports (measured: 5.8k conn/s over 40 s; 27.5k after, ahead of Bun's 25.9k and uWS's 23.5k on the same harness). After the FIN the socket is **not** closed: it lingers with its input discarded until the peer's FIN arrives or `kLingerMs` (2 s, the sweep's granularity floor) passes — RFC 9112 §9.6's staged close. A client that writes its next request the moment a response completes, before it has seen the FIN (autocannon does exactly this), would otherwise have that request answered by the kernel with a RST, and a RST discards whatever of the response the client has not yet read. Measured with autocannon and `connection: close`: one error per connection and two reconnects per cycle before, none after. uWebSockets.js and node:http linger the same way; Bun.serve resets. Lingering connections count against `maxConnections` and are bounded by the deadline (THREAT_MODEL §6). TLS keeps the close_notify-then-close sequence, WebSockets the Close-frame sequence.
 - Multi-core via SO_REUSEPORT: one engine per worker **thread** (MoroJS 1.9+, one process, shared code pages) or per worker process. A server still open when its thread's environment is torn down is closed by an environment cleanup hook (`capabilities.workerThreads`), so `worker.terminate()` never leaves libuv handles behind.
 
@@ -83,6 +83,43 @@ completions stay queued as local task work until the engine's own
 `io_uring_enter(GETEVENTS)` runs them as one batch, so the per-completion
 round trip that cost the CPU above is paid once per wake. The 1.1.6 mode
 remains selectable with `MORO_ENGINE_URING_TASKRUN=coop` for A/B runs.
+These numbers predate the epoll transport: since 1.1.10 the Linux default is
+the engine's own socket path on libuv's epoll, not libuv streams, and the
+open comparison is epoll against io_uring on bare metal (`docs/ROADMAP.md`).
+
+### epoll transport measurements (2026-10-08)
+
+Same box as above (Docker Desktop VM, linuxkit 6.12, arm64), the server
+pinned to two vCPUs and the load generator to the other six inside the
+server's network namespace, engine-answered routes, every request parsed
+and routed, medians of two interleaved rounds, thousands of requests per
+second at 64 / 256 / 512 connections:
+
+| generator | 1.1.11 | 1.1.12 |
+|---|---|---|
+| wrk, 6 threads, a new `/user/{n}` id per request | 393 / 458 / 517 | 494 / 641 / 683 |
+| zrk, the web-frameworks harness settings (12 threads, fixed request) | 450 / 510 / 536 | 493 / 550 / 571 |
+| uSockets' `http_load_test`, single-threaded, 40 connections | level | level |
+
+Nothing in the server's own work changed between the two: syscalls per
+request (2.0), `epoll_wait` per request, batch sizes and user-space CPU are
+identical, and the server never sleeps under either. The whole difference is
+one kernel symbol, `sock_def_readable`, the client's wake-up, which the
+server pays inside its own `send()` and which ran from 17% to 34% of server
+CPU depending only on the order replies went out in; the client's context
+switches per request tracked it exactly (0.10-0.23). A client thread whose
+replies arrive back to back wakes once for the group; interleaved with other
+threads' replies it wakes once per reply. Serving a turn's sockets in
+peer-CPU order is what makes the grouping deterministic. Tried and set
+aside on the way: edge-triggered delivery (a private epoll fd with
+`EPOLLET`, and `EPOLLET` applied to libuv's own registrations), which only
+changes the order by accident and lands flat at ~450k at every concurrency
+(ahead at 64 connections, behind at 512); a 1024-event drain batch (no
+change); a sort by socket number alone (the full gain when the accept order
+happens to group the client's threads, a 30% loss when it does not). A
+single-threaded client is never asleep when a reply lands, so it sees no
+change, and the VM amplifies the wake-up cost, so the bare-metal size of the
+gain is the open measurement (`docs/ROADMAP.md`).
 
 ## Milestones (benchmark/conformance-gated)
 
@@ -95,6 +132,7 @@ remains selectable with `MORO_ENGINE_URING_TASKRUN=coop` for A/B runs.
 - **M5 — hardening** ✅: libFuzzer harnesses + seed corpus for both parsers (`test/fuzz/`), nightly CI fuzz + sanitizer jobs, ASan/UBSan clean, idle/ slowloris timeout, functional load soak (no crash/hang/leak), `SECURITY.md` + `docs/THREAT_MODEL.md`. Found+fixed a Content-Length overflow smuggling bug during the threat-model pass. As with any TLS-terminating software, a formal independent security audit is recommended for the highest-assurance untrusted-facing deployments.
 - **M6 — GA 1.0.0** ✅: the first published release — HTTP/1.1, WebSocket (+ permessage-deflate), in-process TLS, and fully runtime-configurable limits behind a stable surface. MoroJS ships the engine as its default (`engine: 'moro'`) with automatic Node.js fallback.
 - **1.1.6 — the JS boundary and the toolchain**: deferred `onAborted`/`onWritable` delivery (never re-entrant from a binding call), prepared response templates + static routes, V8 fast API calls on the hot entry points, zero-copy string bodies through `String::ValueView` (Node 23+) with the Node 25/26 write API fixed, an environment cleanup hook that makes the engine safe inside `worker_threads`, HTTP/1.1 keep-alive responses without a redundant `Connection: keep-alive` line, an export-drift gate (`tools/check-exports.mjs`), and a PGO release toolchain (clang + lld, `tools/pgo.mjs`). Wire bytes are proven identical across every response path by `test/wire-parity.test.mjs`.
+- **1.1.9-1.1.12 — engine-answered routes and the socket path**: parameter routes (1.1.9, `setParamRoute`), a route whose reply is one path segment answered inside the engine; static and parameter routes answered straight from the parser (1.1.10): scanned in place in the receive buffer, no request id, no header materialisation, the reply framed from the route's prepared head (rebuilt when the Date second changes) with one cached-frame append; the engine's own socket path on libuv's epoll as the Linux default (1.1.10), down to one `epoll_wait` per loop turn (1.1.11), serving each turn's sockets grouped by peer CPU (1.1.12). Measured in "epoll transport measurements" above and, against the field, in the MoroJS Benchmark repo.
 
 ## Packaging
 

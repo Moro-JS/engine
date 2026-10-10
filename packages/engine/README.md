@@ -72,12 +72,16 @@ platform/ABI falls back to Node's `http` server via MoroJS.
 
 ## I/O transport
 
-The engine runs on libuv streams by default. On Linux 6.1+ an io_uring
+On Linux the engine runs its own socket path on libuv's epoll by default
+(since 1.1.10): plain non-blocking sockets as libuv poll handles, one
+`epoll_wait` per loop turn, each turn's sockets served grouped by the CPU
+their peer sends from. macOS and Windows run on libuv streams, which Linux
+can also select with `MORO_ENGINE_TRANSPORT=uv`. On Linux 6.1+ an io_uring
 transport is available opt-in (`MORO_ENGINE_TRANSPORT=uring`): it is probed
 once per process by a feature check and a self-test, and anywhere it is
 unavailable (kernels before 6.1, gVisor, containers under Docker's default
 seccomp profile, which blocks `io_uring_setup`) the engine silently stays on
-libuv. Neither transport changes a byte on the wire. `probe().transport`
+epoll. No transport changes a byte on the wire. `probe().transport`
 reports which one is live, `probe().transportReason` why, and
 `probe().transportMode` which io_uring ring mode is running: `defer-taskrun`
 (completions run as one batch inside the engine's own `io_uring_enter`, woken

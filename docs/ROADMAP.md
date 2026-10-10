@@ -16,6 +16,11 @@ Windows (MSVC) CI build leg (the local build has landed in `tools/build.mjs`).
 | M5 hardening | ✅ done | libFuzzer harnesses + corpus, ASan/UBSan clean, idle/slowloris timeout, CI fuzz/sanitizer jobs, SECURITY.md + THREAT_MODEL.md; found+fixed a Content-Length overflow smuggling bug. As with any TLS-terminating software, a formal independent security audit is recommended for the highest-assurance untrusted-facing deployments. |
 | M6 GA 1.0.0 | ✅ done | first published release; stable surface; every cap runtime-configurable via serve() options; `probe().capabilities` feature flags; MoroJS ships the engine as its default (`engine: 'moro'`) with Node fallback |
 | v1.1.0 perf | ✅ done | pipelined response corking (one write per batch) + zero-allocation warm hot path (header slot reuse, snapshot swaps, scratch response buffer, zero-copy fast-path writes); ~3.7× pipelined throughput vs 1.0.0 |
+| 1.1.6 JS boundary | ✅ done | prepared response templates + static routes, V8 fast API calls on the hot entry points, deferred `onAborted`/`onWritable`, zero-copy string bodies, worker-thread teardown hook, batched pipelined dispatch, io_uring transport opt-in, PGO release toolchain |
+| 1.1.9 parameter routes | ✅ done | `setParamRoute`/`clearParamRoutes`: a route whose reply is one path segment is answered inside the engine |
+| 1.1.10 engine-answered routes + epoll transport | ✅ done | static and parameter routes answered straight from the parser (scanned in place, reply framed from a prepared head, one cached-frame append); the engine's own socket path on libuv's epoll becomes the Linux default |
+| 1.1.11 epoll transport | ✅ done | every listening and accepted socket a libuv poll handle on the loop's epoll: one `epoll_wait` per loop turn, sockets closed from their handle's close callback |
+| 1.1.12 service order | ✅ done | each loop turn's readable sockets served in its check phase grouped by `SO_INCOMING_CPU` (the peer's CPU) and socket number, leading group rotating per turn; +25-40% under a six-thread generator and ~10% under the harness generator on a two-core Linux VM, a single-threaded client unchanged |
 
 ## Beyond 1.0
 
@@ -103,19 +108,24 @@ lane), linux musl x64+arm64, and win32 x64 (MSVC), with a Node 20–26 smoke
 matrix on every flavour, full conformance legs on Linux/macOS/Windows, ASan/
 UBSan lanes, an in-repo h1spec job, and a strict PGO cycle.
 
-## io_uring: from opt-in to default
+## Transports: where they stand
 
-1.1.6 ships the io_uring transport opt-in (`MORO_ENGINE_TRANSPORT=uring`);
-see `docs/DESIGN.md` "io_uring measurements" for the numbers that keep libuv
-the default. Work that could flip the default, in order of expected payoff:
+Three transports sit behind one seam (`docs/API.md`, "transports"): the
+engine's own socket path on libuv's epoll is the Linux default since 1.1.10,
+libuv streams are the default on macOS and Windows, and io_uring (opt-in
+since 1.1.6, `MORO_ENGINE_TRANSPORT=uring`) stays opt-in. Of the io_uring
+follow-ups listed in 1.1.6, `DEFER_TASKRUN` behind a registered eventfd is
+the ring's first-choice mode since 1.1.7, ring-batched sends were already
+the case (one `io_uring_enter` submits a round's SQEs), and
+`IORING_RECVSEND_BUNDLE` cannot help a one-request-in-flight keep-alive
+shape. What is still open, in order of expected payoff:
 
-- `IORING_SETUP_DEFER_TASKRUN` behind a registered eventfd (`uv_poll` on the
-  eventfd, one `read` + one `io_uring_enter(GETEVENTS)` per loop turn): task
-  work runs batched inside our own enter instead of a signal-driven round
-  trip per completion.
-- Ring-submitted sends batched per loop turn (`IORING_OP_SEND` + `SUBMIT_ALL`
-  in the prepare flush) instead of one `sendto` per response; the corked
-  pipelined path already writes once per batch.
-- `IORING_RECVSEND_BUNDLE` (6.10+) for multi-segment receives.
-- Re-run `bench/transport-ab.sh` on bare-metal Linux (the VM numbers are
-  relative only) before any default change.
+- **Bare-metal Linux numbers.** Every transport comparison so far is from a
+  Docker VM, where the numbers are relative only. The 1.1.12 service order in
+  particular saves client wake-ups, which a VM makes unusually expensive, so
+  its bare-metal size is the open measurement before any claim beyond "no
+  regression" (its cost is a sort of a turn's ready sockets, nothing else).
+- **The 1.1.12 service order on the ring.** io_uring reaps completions in
+  ring order; the same peer-CPU grouping could be applied to a reap round.
+- **Re-run `bench/transport-ab.sh`** epoll against io_uring on bare metal
+  before any default change.
