@@ -3,6 +3,7 @@
 One file per release in [`changelog/`](changelog/); the GitHub Release for a
 tag carries the same text. Newest first.
 
+- [1.1.12](changelog/v1.1.12.md) — epoll transport serves each loop turn's sockets grouped by peer CPU.
 - [1.1.11](changelog/v1.1.11.md) — epoll transport on one `epoll_wait` per loop turn; engine-answered routes parsed and routed per request.
 - [1.1.10](changelog/v1.1.10.md) — engine-answered routes parsed in place and framed from a prepared head; epoll transport the Linux default; request-registry fix.
 - [1.1.9](changelog/v1.1.9.md) — parameter routes (`setParamRoute`, `clearParamRoutes`).

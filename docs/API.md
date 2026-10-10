@@ -392,6 +392,11 @@ opt-in (`MORO_ENGINE_TRANSPORT=uring`), for the reasons measured in
   write is backpressured. It removes libuv's per-connection stream machinery
   (alloc/read callbacks, write requests, handle close) from the request
   path: the same syscalls as libuv, about a third less CPU around them.
+  The sockets a loop turn reports readable are served in the check phase of
+  that turn, grouped by the CPU their peer's packets arrive on
+  (`SO_INCOMING_CPU`: the peer thread's CPU over loopback, the receive
+  queue's behind a NIC), so a peer driving many connections from one event
+  loop gets its replies back to back and wakes once per group.
 - **libuv streams** (`transport: 'uv'`): macOS, Windows, and Linux when
   `MORO_ENGINE_TRANSPORT=uv` (A/B runs, bisecting).
 - **io_uring** (`transport: 'uring'`): Linux 6.1+, when `MORO_ENGINE_TRANSPORT=uring`

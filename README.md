@@ -21,7 +21,8 @@ receive buffer, no request id, no header materialisation, one cached frame
 append - and puts the engine's own socket path under Linux by default
 (plain sockets on libuv's epoll), taking libuv's stream layer off the
 request path; 1.1.11 takes that transport down to one `epoll_wait` per
-loop turn. Measured comparisons live in the
+loop turn, and 1.1.12 serves each turn's sockets grouped by the CPU their
+peer sends from. Measured comparisons live in the
 [MoroJS Benchmark repo](https://github.com/Moro-JS/benchmark); release notes in
 [CHANGELOG.md](CHANGELOG.md). In progress:
 ALPN HTTP/2 (vendored nghttp2). See [docs/DESIGN.md](docs/DESIGN.md) and

@@ -31,7 +31,8 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#if defined(__linux__)
+#ifndef SO_INCOMING_CPU
+#define SO_INCOMING_CPU 49  // kernel 3.19+; older libc headers lack the name
 #endif
 #include "uring.h"
 #endif
@@ -177,6 +178,8 @@ struct EpollConn {
   size_t pendingBytes;  // queued write bytes the kernel has not accepted
   void* wqHead;         // WriteReq* queue (intrusive, FIFO; WriteReq::next / sent)
   void* wqTail;
+  int peerCpu;          // SO_INCOMING_CPU: the CPU the peer's packets arrive on (-1 unknown); see EpollLoop::serve
+  uint32_t reads;       // recv() calls that returned data; peerCpu is re-read every 1024
 };
 #endif
 
@@ -3196,6 +3199,13 @@ class Server {
     bool checkClosed = false;
     int emfileFd = -1;
     std::vector<Connection*> completions;  // fully-sent queued writes to complete
+    struct Ready {
+      Connection* c;
+      int events;
+    };
+    std::vector<Ready> ready;  // sockets the poll phase reported this turn; served by serve()
+    unsigned groups = 1;       // peer-CPU groups seen so far (max peerCpu + 2, -1 being a group)
+    unsigned turn = 0;         // serve() calls; the group that goes first rotates with it
     std::unordered_set<Server*> servers;
 
     static EpollLoop*& slot() {
@@ -3226,16 +3236,50 @@ class Server {
       completions.push_back(c);
       armCheck();
     }
+    void deferReady(Connection* c, int events) {
+      ready.push_back({c, events});
+      armCheck();
+    }
     static void onCheck(uv_check_t* h) { static_cast<EpollLoop*>(h->data)->settle(); }
 
-    // Clean-stack work: complete fully-sent writes, which may surface further
-    // requests and queue more writes - those complete in the next pass. A
-    // connection closed by a completion is skipped by its state.
+    // Service order. The poll phase only records which sockets are readable;
+    // they are served here, in the check phase of the same loop turn, grouped
+    // by the CPU their peer's packets arrive on (SO_INCOMING_CPU: the peer
+    // thread's CPU over loopback, the receive queue's CPU behind a NIC) and by
+    // socket number within a group. The kernel reports readiness in an order
+    // that says nothing about who is on the other end; a peer that drives many
+    // connections from one event loop - a proxy, a connection pool, a load
+    // generator - then gets its replies back to back and is woken once per
+    // group instead of once per reply. That wake-up is paid on this side, in
+    // send(), so the grouping is cheaper for both ends. Every socket reported
+    // in a turn is served in that turn; which group goes first rotates from
+    // turn to turn, so no peer is always the last to be answered.
+    void serve() {
+      if (ready.empty()) return;
+      std::vector<Ready> list;
+      list.swap(ready);
+      const unsigned n = groups, rot = turn++ % n;
+      const auto key = [n, rot](const Ready& r) { return (static_cast<unsigned>(r.c->ep.peerCpu + 1) + rot) % n; };
+      std::sort(list.begin(), list.end(), [&key](const Ready& a, const Ready& b) {
+        const unsigned ka = key(a), kb = key(b);
+        if (ka != kb) return ka < kb;
+        return a.c->ep.fd < b.c->ep.fd;
+      });
+      for (const Ready& r : list) {
+        if (r.c->ep.state < 2) r.c->server->epollOnConn(r.c, r.events);
+      }
+    }
+
+    // Clean-stack work: serve this turn's readable sockets, then complete
+    // fully-sent writes, which may surface further requests and queue more
+    // writes - those complete in the next pass. A connection closed along the
+    // way is skipped by its state.
     void settle() {
       if (checkActive) {
         checkActive = false;
         uv_check_stop(&check);
       }
+      serve();
       for (int pass = 0; pass < 64 && !completions.empty(); pass++) {
         std::vector<Connection*> list;
         list.swap(completions);
@@ -3243,7 +3287,7 @@ class Server {
           if (c->ep.state < 2) c->server->epollCompleteWrites(c);
         }
       }
-      if (!completions.empty()) armCheck();
+      if (!completions.empty() || !ready.empty()) armCheck();
     }
 
     static void shutdownForThread() {
@@ -3336,7 +3380,9 @@ class Server {
     c->server = this;
     c->ep.fd = fd;
     c->ep.state = 1;
+    c->ep.reads = 0;
     c->ep.poll.data = c;
+    epollReadPeerCpu(c);
     if (uv_poll_init(loop_, &c->ep.poll, fd) != 0) {
       ::close(fd);
       delete c;
@@ -3364,7 +3410,15 @@ class Server {
       }
       return;
     }
-    c->server->epollOnConn(c, events);
+    c->server->epoll_->deferReady(c, events);
+  }
+
+  void epollReadPeerCpu(Connection* c) {
+    int cpu = -1;
+    socklen_t len = sizeof(cpu);
+    if (::getsockopt(c->ep.fd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, &len) != 0 || cpu < -1) cpu = -1;
+    c->ep.peerCpu = cpu;
+    if (static_cast<unsigned>(cpu + 2) > epoll_->groups) epoll_->groups = static_cast<unsigned>(cpu + 2);
   }
 
   void epollOnConn(Connection* c, int events) {
@@ -3375,6 +3429,7 @@ class Server {
     if (!(events & (UV_READABLE | UV_DISCONNECT))) return;
     ssize_t n = ::recv(c->ep.fd, readBuf_.get(), readBufSize_, 0);
     if (n > 0) {
+      if ((++c->ep.reads & 1023u) == 0) epollReadPeerCpu(c);  // the peer may have moved CPU
       // Level-triggered: anything left in the socket raises the next event.
       onTransportData(c, readBuf_.get(), static_cast<size_t>(n));
       return;
