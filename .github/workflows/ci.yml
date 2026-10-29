@@ -415,7 +415,7 @@ jobs:
           path: build/*.node
 
   # Smoke every published binary flavor on a real instance of its target:
-  # macos-14 = darwin-arm64, ubuntu = linux-gnu, alpine container = linux-musl.
+  # macos-15 = darwin-arm64 (macos-14 retired 2026-11-02), ubuntu = linux-gnu, alpine container = linux-musl.
   # darwin-x64 is still BUILT (Intel Macs) but not load-smoked here: GitHub's
   # Intel macOS runners (macos-13) are scarce and being retired, so queueing on
   # them stalls the gate. Binary filenames carry platform/arch/libc/abi, so
@@ -424,7 +424,7 @@ jobs:
     needs: [darwin, linux-gnu, linux-musl]
     strategy:
       matrix:
-        os: [macos-14, ubuntu-22.04]
+        os: [macos-15, ubuntu-22.04]
         node: [20, 22, 23, 24, 25, 26]
     runs-on: ${{ matrix.os }}
     steps:
@@ -490,7 +490,7 @@ jobs:
       fail-fast: false
       matrix:
         node: [20, 22, 23, 24, 25, 26]
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
@@ -528,9 +528,9 @@ jobs:
   # Full conformance on macOS for the running ABI. The darwin binaries ship to
   # real users, so at least one darwin leg must run the whole suite (the smoke
   # matrix above only load-tests). Same Homebrew-LLVM CXX setup as the darwin
-  # build job; same runner flavor as the darwin smoke leg (macos-14 = arm64).
+  # build job; same runner flavor as the darwin smoke leg (macos-15 = arm64).
   conformance-macos:
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       MORO_ENGINE_REQUIRE_TRANSPORT: uv
     steps:
