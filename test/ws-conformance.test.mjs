@@ -762,6 +762,81 @@ describe('@morojs/engine RFC 6455 WebSocket conformance', { skip }, () => {
 
   // ---- Connection reuse & larger payloads ----
 
+  // ---- Pipelined frames: one read, one write ----
+  //
+  // A client that writes several frames back to back lands them in one TCP
+  // segment. The engine answers every frame the read buffer holds into one
+  // corked write (feedWebSocket), so the echoes must all arrive, in order,
+  // byte-identical - and a Close frame inside the batch must be answered after
+  // the frames ahead of it, with the socket closing only once everything is
+  // out.
+
+  it('pipelined: sixteen masked frames in one segment all echo, in order', T, async () => {
+    const { client } = await connectAndHandshake(server);
+    try {
+      const frames = [];
+      const batch = [];
+      for (let i = 0; i < 16; i++) {
+        const isBinary = i % 3 === 2;
+        const payload = isBinary
+          ? Buffer.from([i, 0x00, 0xff, i * 7])
+          : Buffer.from(`frame ${i} ${'x'.repeat(i * 9)}`, 'utf8');
+        frames.push({ opcode: isBinary ? OP.BINARY : OP.TEXT, payload });
+        batch.push(buildFrame({ opcode: isBinary ? OP.BINARY : OP.TEXT, payload }));
+      }
+      await client.send(Buffer.concat(batch));
+      for (let i = 0; i < 16; i++) {
+        const f = await client.nextFrame();
+        assert.equal(f.opcode, frames[i].opcode, `frame ${i}: opcode must match`);
+        assert.equal(f.fin, true);
+        assert.equal(f.masked, false, 'server frames are never masked (§5.1)');
+        assert.ok(f.payload.equals(frames[i].payload), `frame ${i}: payload must round-trip in order`);
+      }
+    } finally {
+      client.destroy();
+    }
+  });
+
+  it('pipelined: a Ping and a Close inside a batch are answered in order, then the socket closes', T, async () => {
+    const before = server.events.closes.length;
+    const { client } = await connectAndHandshake(server);
+    try {
+      const wsId = server.events.opens.at(-1).wsId;
+      const batch = Buffer.concat([
+        buildFrame({ opcode: OP.TEXT, payload: Buffer.from('one') }),
+        buildFrame({ opcode: OP.PING, payload: Buffer.from('ping!') }),
+        buildFrame({ opcode: OP.TEXT, payload: Buffer.from('two') }),
+        buildFrame({ opcode: OP.CLOSE, payload: Buffer.from([0x03, 0xe8]) }),
+        // Anything after a Close in the same segment must be ignored (§5.5.1)
+        buildFrame({ opcode: OP.TEXT, payload: Buffer.from('ignored') }),
+      ]);
+      await client.send(batch);
+      const a = await client.nextFrame();
+      assert.equal(a.opcode, OP.TEXT);
+      assert.equal(a.payload.toString(), 'one');
+      const p = await client.nextFrame();
+      assert.equal(p.opcode, OP.PONG, 'the Ping is answered where it stood in the batch');
+      assert.equal(p.payload.toString(), 'ping!');
+      const b = await client.nextFrame();
+      assert.equal(b.opcode, OP.TEXT);
+      assert.equal(b.payload.toString(), 'two');
+      const c = await client.nextFrame();
+      assert.equal(c.opcode, OP.CLOSE, 'the Close is echoed after the frames ahead of it');
+      assert.equal(c.payload.readUInt16BE(0), 1000);
+      await client.waitClose();
+      assert.equal(client.closed, true, 'the TCP socket closes once the batch is out');
+      await waitForEvent(() => server.events.closes.length > before, { message: 'onWsClose never fired' });
+      assert.equal(server.events.closes.at(-1).code, 1000);
+      assert.equal(
+        server.events.messages.filter((m) => m.wsId === wsId).length,
+        2,
+        'only the two frames ahead of the Close reach onWsMessage; the one after it must not'
+      );
+    } finally {
+      client.destroy();
+    }
+  });
+
   it('connection reuse: two sequential messages on one connection both echo', T, async () => {
     const { client } = await connectAndHandshake(server);
     try {

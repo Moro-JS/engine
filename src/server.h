@@ -1045,8 +1045,13 @@ class Server {
       c->wsId = ++globalWsCounter();
     } while (c->wsId == 0 || wsMap.count(c->wsId));
     wsMap[c->wsId] = c;
-    // This request's reqId is done; the connection is now a WebSocket.
+    // This request's reqId is done; the connection is now a WebSocket. The
+    // id is zeroed as well: the per-request bookkeeping that runs on a
+    // terminal frame (finishResponse, completeCorkedResponse) erases
+    // c->reqId from the registry, and 0 is the one value that can never
+    // name a live request there.
     globalRequests().erase(c->reqId);
+    c->reqId = 0;
     c->active = false;
     writeOut(c, std::move(resp), /*terminal=*/false);
 
@@ -1100,7 +1105,9 @@ class Server {
                 /*fin=*/true, /*rsv1=*/compressed);
     writeOutView(c, out, /*terminal=*/false);
     releaseScratch(c);
-    size_t q = tPendingBytes(c);
+    // Frames corked for this read's batch (feedWebSocket) are queued too:
+    // they leave with the flush, so the backpressure signal counts them.
+    size_t q = tPendingBytes(c) + c->corkBuf.size();
     if (limits_.wsBackpressureLimit && q > limits_.wsBackpressureLimit) {
       // Slow/stalled consumer - shed it (1013 Try Again Later) so its queued frames can't grow memory without bound (limits_.wsBackpressureLimit, 0 = unlimited; maxBackpressure defense).
       wsClose(c, 1013, "", 0);
@@ -1175,17 +1182,35 @@ class Server {
     if (c->closing) return;
     if (data.empty() && !terminal) return;
     if (c->tls) {
-      std::string cipher;
-      if (!data.empty() &&
-          !c->tls->writePlain(data.data(), data.size(), cipher)) {
-        // Encrypting failed (session torn down / pre-handshake write): the response can never reach the peer - drop the connection.
-        doClose(c);
-        return;
-      }
-      transportWrite(c, std::move(cipher), terminal);
+      tlsWrite(c, data, terminal);
       return;
     }
     transportWrite(c, std::move(data), terminal);
+  }
+
+  // TLS tail shared by writeOut and writeOutView: the plaintext is encrypted
+  // into the server's one ciphertext scratch buffer (a fresh std::string per
+  // reply was a malloc/free pair on every TLS response) and the transport is
+  // handed a view of it, copying only what it cannot send right away. The
+  // scratch is free again before anything below can reach JS: the view is
+  // consumed by the send(), the cork append or the queued copy, all of which
+  // happen ahead of finishResponse.
+  void tlsWrite(Connection* c, std::string_view plain, bool terminal) {
+    std::string& cipher = cipherScratch_;
+    cipher.clear();
+    if (!plain.empty() &&
+        !c->tls->writePlain(plain.data(), plain.size(), cipher)) {
+      // Encrypting failed (session torn down / pre-handshake write): the response can never reach the peer - drop the connection.
+      doClose(c);
+      return;
+    }
+    transportWriteView(c, cipher, terminal);
+    // One huge response must not pin its ciphertext capacity to the loop
+    // (same 64 KiB watermark the read buffer uses).
+    if (cipher.capacity() > 65536) {
+      cipher.clear();
+      cipher.shrink_to_fit();
+    }
   }
 
   // Transport-level write: bytes go to the socket verbatim (ciphertext on TLS connections, plaintext otherwise).
@@ -1242,15 +1267,17 @@ class Server {
     if (c->closing) return;
     if (data.empty() && !terminal) return;
     if (c->tls) {
-      std::string cipher;
-      if (!data.empty() &&
-          !c->tls->writePlain(data.data(), data.size(), cipher)) {
-        doClose(c);
-        return;
-      }
-      transportWrite(c, std::move(cipher), terminal);
+      tlsWrite(c, data, terminal);
       return;
     }
+    transportWriteView(c, data, terminal);
+  }
+
+  // Transport-level write from a view the caller owns (Connection::scratch,
+  // the TLS ciphertext scratch): the corked and try-write paths read straight
+  // from it, and only a queued or backpressured remainder is copied.
+  void transportWriteView(Connection* c, std::string_view data, bool terminal) {
+    if (c->closing) return;
     if (c->corked) {
       if (!data.empty()) c->corkBuf.append(data);
       if (terminal) completeCorkedResponse(c);
@@ -1841,6 +1868,21 @@ class Server {
   // again until the next uv_read/TLS record, after consume() returns.
   void feedWebSocket(Connection* c, char* data, size_t len) {
     if (c->wsClosing || !c->wsParser) return;
+    // Corked for the whole read: every reply this buffer provokes - the echo
+    // of each frame of a pipelined batch, a Pong, a Close - accumulates in
+    // corkBuf and leaves in ONE write once consume() returns, where it used
+    // to be one send() per frame (sixteen frames in a segment, sixteen
+    // syscalls). The replies keep their order; the Close frame of a batch
+    // sets batchClose through completeCorkedResponse exactly as a
+    // Connection: close response does inside an HTTP batch, and the tail
+    // below closes the socket once the flush is out. Nested inside an HTTP
+    // dispatch loop (frames that arrived with the upgrade request, fed from
+    // upgradeToWebSocket) the enclosing loop's own tail flushes and closes.
+    const bool outerCorked = c->corked;
+    if (!outerCorked) {
+      c->corked = true;
+      c->batchClose = false;
+    }
     // Set when an inbound message fails inflate/UTF-8 (RFC 7692/6455): the parser itself succeeds, so surface the close code out-of-band.
     uint16_t pmdFail = 0;
     bool ok = c->wsParser->consume(
@@ -1880,7 +1922,7 @@ class Server {
               encodeFrame(out, WsOpcode::Pong, payload);
               writeOut(c, std::move(out), /*terminal=*/false);
               // Bound the outgoing queue: a peer flooding Pings while never reading our Pongs would otherwise grow libuv's write buffer without limit (OOM). Shed it, same as wsSend's backpressure cap.
-              size_t q = tPendingBytes(c);
+              size_t q = tPendingBytes(c) + c->corkBuf.size();
               if (limits_.wsBackpressureLimit && q > limits_.wsBackpressureLimit)
                 wsClose(c, 1013, "", 0);
               break;
@@ -1911,6 +1953,14 @@ class Server {
     } else if (pmdFail && !c->wsClosing) {
       // Inflate/UTF-8 failure on a compressed message: close with the RFC 7692/6455 code (1009 too-big, 1007 bad UTF-8) via the same flush-then-close machinery as a parser failure.
       wsClose(c, pmdFail, "", 0);
+    }
+    if (outerCorked) return;  // the enclosing dispatch loop flushes and closes
+    c->corked = false;
+    if (c->closing) return;   // torn down mid-batch: whatever was corked is moot
+    flushCork(c);
+    if (c->batchClose && !c->closing) {
+      if (c->pendingWrites == 0) closeAfterResponse(c);
+      else c->closeAfterFlush = true;
     }
   }
 
@@ -3805,6 +3855,9 @@ class Server {
   // ownership without the TLS indirection on every read and response.
   std::string dateCache_;
   time_t dateCachedAt_ = 0;
+  // Ciphertext of the TLS response being written (tlsWrite): one buffer per
+  // loop, reused across responses, so a TLS reply allocates nothing.
+  std::string cipherScratch_;
   const std::string& dateLine() {
     refreshHttpDateLine(dateCache_, dateCachedAt_);
     return dateCache_;
