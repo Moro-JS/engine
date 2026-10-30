@@ -3,6 +3,7 @@
 One file per release in [`changelog/`](changelog/); the GitHub Release for a
 tag carries the same text. Newest first.
 
+- [1.1.15](changelog/v1.1.15.md) — WebSocket upgrades performed by the engine (`setWsAutoUpgrade`, handshake accessors); frames built in the cork buffer; TLS record buffers kept between records.
 - [1.1.14](changelog/v1.1.14.md) — WebSocket replies corked per read (one write for a pipelined batch); one ciphertext buffer per loop on the TLS write path.
 - [1.1.13](changelog/v1.1.13.md) — epoll transport: the service order is selectable (grouped, arrival, or measured `auto`); the default is unchanged.
 - [1.1.12](changelog/v1.1.12.md) — epoll transport serves each loop turn's sockets grouped by peer CPU.

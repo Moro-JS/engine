@@ -59,6 +59,10 @@ export interface EngineCapabilities {
   /** Batched pipelined dispatch: the onRequestBatch callback, getBatchBuffers()
    *  and getPath(). Off under MORO_ENGINE_BATCH=0. */
   batchDispatch: boolean;
+  /** setWsAutoUpgrade(), wsGetHeaders(), wsGetQuery() and wsGetRemoteAddress()
+   *  exist: the engine can perform valid WebSocket upgrades itself, firing
+   *  onWsOpen without the request ever reaching onRequest. */
+  wsAutoUpgrade: boolean;
 }
 
 export interface FastApiInfo {
@@ -420,6 +424,20 @@ export function upgradeToWebSocket(reqId: number): number;
 export function wsSend(wsId: number, data: string | ArrayBuffer | Uint8Array | Buffer, isBinary: boolean): boolean;
 /** Send a Close frame and close the connection. */
 export function wsClose(wsId: number, code?: number, reason?: string): void;
+/** With `on`, every valid WebSocket handshake is answered by the engine itself:
+ *  the 101 goes out, onWsOpen fires (and any frames pipelined with the
+ *  handshake reach onWsMessage), and onRequest is never called for it. An
+ *  invalid handshake is surfaced to onRequest as any other request. Applies
+ *  to this server only; register it again after close() + serve(). */
+export function setWsAutoUpgrade(serverId: number, on: boolean): void;
+/** The handshake request's headers, flat [name, value, ...] with names
+ *  lowercased (the shape getHeaders() gives), kept for the socket's lifetime;
+ *  undefined once the socket is gone. */
+export function wsGetHeaders(wsId: number): string[] | undefined;
+/** The handshake request's raw query string ('' when it had none). */
+export function wsGetQuery(wsId: number): string | undefined;
+/** The peer's address, as getRemoteAddress() gives it for a request. */
+export function wsGetRemoteAddress(wsId: number): string | undefined;
 
 /** Non-throwing load diagnostics. Never throws. */
 export function probe(): EngineProbeResult;
@@ -461,6 +479,10 @@ declare const engine: {
   upgradeToWebSocket: typeof upgradeToWebSocket;
   wsSend: typeof wsSend;
   wsClose: typeof wsClose;
+  setWsAutoUpgrade: typeof setWsAutoUpgrade;
+  wsGetHeaders: typeof wsGetHeaders;
+  wsGetQuery: typeof wsGetQuery;
+  wsGetRemoteAddress: typeof wsGetRemoteAddress;
   probe: typeof probe;
   version: string;
 };

@@ -254,10 +254,11 @@ function openWs(port, host = '127.0.0.1') {
 // ---------------------------------------------------------------------------
 
 function startWsServer(serveOptions) {
-  const events = { opens: [], messages: [], closes: [], rejected: [] };
+  const events = { opens: [], messages: [], closes: [], rejected: [], requests: [] };
 
   const callbacks = {
     onRequest(reqId) {
+      events.requests.push(reqId);
       const wsId = engine.upgradeToWebSocket(reqId);
       if (wsId === -1) {
         // Not a valid upgrade request (§4.2.1): keep it HTTP and answer 400.
@@ -835,6 +836,109 @@ describe('@morojs/engine RFC 6455 WebSocket conformance', { skip }, () => {
     } finally {
       client.destroy();
     }
+  });
+
+  // ---- Engine-side upgrades (capabilities.wsAutoUpgrade) ----
+
+  describe('wsAutoUpgrade: the engine performs the handshake itself', { skip: typeof engine.setWsAutoUpgrade !== 'function' }, () => {
+    let auto;
+    before(() => {
+      auto = startWsServer();
+      engine.setWsAutoUpgrade(auto.serverId, true);
+    });
+    after(() => {
+      if (auto) auto.close();
+    });
+
+    it('a valid handshake gets its 101 and onWsOpen without onRequest ever running', T, async () => {
+      const requestsBefore = auto.events.requests.length;
+      const client = await openWs(auto.port);
+      try {
+        const key = crypto.randomBytes(16).toString('base64');
+        const { req } = upgradeRequest('/room?org=42&x=y', { key, extra: `X-Token: abc${CRLF}Cookie: a=1${CRLF}Cookie: b=2${CRLF}` });
+        await client.send(req);
+        const head = parseHead(await client.readHandshake());
+        assert.equal(head.status, 101);
+        assert.equal(head.headers['sec-websocket-accept'], computeAccept(key));
+        await waitForEvent(() => auto.events.opens.length > 0, { message: 'onWsOpen never fired' });
+        const open = auto.events.opens.at(-1);
+        assert.equal(open.path, '/room', 'onWsOpen gets the request path');
+        assert.equal(auto.events.requests.length, requestsBefore, 'onRequest must not see an engine-side upgrade');
+
+        // The handshake stays readable on the socket
+        const flat = engine.wsGetHeaders(open.wsId);
+        assert.ok(Array.isArray(flat) && flat.length >= 2);
+        const headers = {};
+        for (let i = 0; i + 1 < flat.length; i += 2) headers[flat[i]] = headers[flat[i]] ? headers[flat[i]] + ', ' + flat[i + 1] : flat[i + 1];
+        assert.equal(headers['x-token'], 'abc', 'custom header, name lowercased');
+        assert.equal(headers['sec-websocket-key'], key);
+        assert.equal(headers['cookie'], 'a=1, b=2', 'every line is kept, in order');
+        assert.equal(engine.wsGetQuery(open.wsId), 'org=42&x=y');
+        assert.equal(engine.wsGetRemoteAddress(open.wsId), '127.0.0.1');
+
+        // ...and the socket echoes like any other
+        await client.sendFrame({ opcode: OP.TEXT, payload: Buffer.from('hi') });
+        const f = await client.nextFrame();
+        assert.equal(f.payload.toString(), 'hi');
+      } finally {
+        client.destroy();
+      }
+    });
+
+    it('frames pipelined with the handshake still arrive, in order', T, async () => {
+      const client = await openWs(auto.port);
+      try {
+        const { req } = upgradeRequest('/');
+        await client.send(Buffer.concat([
+          Buffer.from(req),
+          buildFrame({ opcode: OP.TEXT, payload: Buffer.from('first') }),
+          buildFrame({ opcode: OP.BINARY, payload: Buffer.from([1, 2, 3]) }),
+        ]));
+        const head = parseHead(await client.readHandshake());
+        assert.equal(head.status, 101);
+        const a = await client.nextFrame();
+        assert.equal(a.opcode, OP.TEXT);
+        assert.equal(a.payload.toString(), 'first');
+        const b = await client.nextFrame();
+        assert.equal(b.opcode, OP.BINARY);
+        assert.ok(b.payload.equals(Buffer.from([1, 2, 3])));
+      } finally {
+        client.destroy();
+      }
+    });
+
+    it('an invalid handshake and a plain request still reach onRequest', T, async () => {
+      const before = auto.events.requests.length;
+      let client = await openWs(auto.port);
+      try {
+        const { req } = upgradeRequest('/', { version: '8' });
+        await client.send(req);
+        const head = parseHead(await client.readHandshake());
+        assert.equal(head.status, 400, 'the fixture answers a non-upgrade request with 400');
+      } finally {
+        client.destroy();
+      }
+      client = await openWs(auto.port);
+      try {
+        await client.send(`GET /plain HTTP/1.1${CRLF}Host: 127.0.0.1${CRLF}${CRLF}`);
+        const head = parseHead(await client.readHandshake());
+        assert.equal(head.status, 400);
+      } finally {
+        client.destroy();
+      }
+      assert.equal(auto.events.requests.length, before + 2, 'both went through onRequest');
+    });
+
+    it('the accessors answer undefined once the socket is closed', T, async () => {
+      const { client } = await connectAndHandshake(auto);
+      const wsId = auto.events.opens.at(-1).wsId;
+      assert.equal(engine.wsGetRemoteAddress(wsId), '127.0.0.1');
+      client.destroy();
+      await waitForEvent(() => auto.events.closes.some((c) => c.wsId === wsId), { message: 'onWsClose never fired' });
+      assert.equal(engine.wsGetHeaders(wsId), undefined);
+      assert.equal(engine.wsGetQuery(wsId), undefined);
+      assert.equal(engine.wsGetRemoteAddress(wsId), undefined);
+    });
   });
 
   it('connection reuse: two sequential messages on one connection both echo', T, async () => {

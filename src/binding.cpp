@@ -1519,6 +1519,50 @@ static void WsClose(const FunctionCallbackInfo<Value>& args) {
   c->server->wsClose(c, code, reason.data(), reason.size());
 }
 
+// setWsAutoUpgrade(serverId, on): the engine performs valid WebSocket
+// upgrades itself (capabilities.wsAutoUpgrade). Re-applied by the caller
+// after close() + serve(), like static routes.
+static void SetWsAutoUpgrade(const FunctionCallbackInfo<Value>& args) {
+  Isolate* iso = args.GetIsolate();
+  JsServer* js = serverFrom(args);
+  if (!js || !js->server) return;
+  js->server->setWsAutoUpgrade(args.Length() >= 2 && args[1]->BooleanValue(iso));
+}
+
+// wsGetHeaders(wsId) -> flat [name, value, ...] of the handshake request,
+// names lowercased (the same shape getHeaders() gives a request), or
+// undefined once the socket is gone.
+static void WsGetHeaders(const FunctionCallbackInfo<Value>& args) {
+  Isolate* iso = args.GetIsolate();
+  Local<Context> ctx = iso->GetCurrentContext();
+  Connection* c = wsFrom(args);
+  if (!c) return;
+  const auto& headers = c->server->wsHeaders(c);
+  size_t hint = headers.size() * 2;
+  if (hint > static_cast<size_t>(INT_MAX)) hint = static_cast<size_t>(INT_MAX);
+  Local<Array> arr = Array::New(iso, static_cast<int>(hint));
+  uint32_t idx = 0;
+  for (const auto& h : headers) {
+    (void)arr->Set(ctx, idx++, str(iso, h.name)).FromMaybe(false);
+    (void)arr->Set(ctx, idx++, str(iso, h.value)).FromMaybe(false);
+  }
+  args.GetReturnValue().Set(arr);
+}
+
+// wsGetQuery(wsId) -> the handshake request's raw query string ('' when none).
+static void WsGetQuery(const FunctionCallbackInfo<Value>& args) {
+  Connection* c = wsFrom(args);
+  if (!c) return;
+  args.GetReturnValue().Set(str(args.GetIsolate(), c->server->wsQuery(c)));
+}
+
+// wsGetRemoteAddress(wsId) -> the peer's address, as getRemoteAddress() gives it.
+static void WsGetRemoteAddress(const FunctionCallbackInfo<Value>& args) {
+  Connection* c = wsFrom(args);
+  if (!c) return;
+  args.GetReturnValue().Set(str(args.GetIsolate(), c->server->remoteAddress(c)));
+}
+
 // getBatchBuffers(serverId) -> { descriptors: Uint32Array(3*16), control:
 // Uint32Array(1), paths: string[] } - the same objects every call.
 static void GetBatchBuffers(const FunctionCallbackInfo<Value>& args) {
@@ -1618,6 +1662,10 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   // Batched pipelined dispatch: getBatchBuffers()/getPath() and the
   // onRequestBatch callback (Server::dispatchBatch).
   setCap("batchDispatch", g_batchEnabled);
+  // setWsAutoUpgrade(serverId, on): valid WebSocket handshakes are answered by
+  // the engine itself (onWsOpen, never onRequest), with wsGetHeaders()/
+  // wsGetQuery()/wsGetRemoteAddress() reading the handshake afterwards.
+  setCap("wsAutoUpgrade", true);
   set("capabilities", caps);
   set("notify", str(iso, g_notifyDeferred ? "deferred" : "sync"));
   // I/O transport in use on this host: 'uring' (Linux, io_uring usable) or
@@ -1713,6 +1761,10 @@ static const ExportDef kExports[] = {
     {"upgradeToWebSocket", UpgradeToWebSocket, nullptr, nullptr},
     {"wsSend", WsSend, nullptr, nullptr},
     {"wsClose", WsClose, nullptr, nullptr},
+    {"setWsAutoUpgrade", SetWsAutoUpgrade, nullptr, nullptr},
+    {"wsGetHeaders", WsGetHeaders, nullptr, nullptr},
+    {"wsGetQuery", WsGetQuery, nullptr, nullptr},
+    {"wsGetRemoteAddress", WsGetRemoteAddress, nullptr, nullptr},
     {"probe", Probe, nullptr, nullptr},
 };
 #undef MORO_FAST

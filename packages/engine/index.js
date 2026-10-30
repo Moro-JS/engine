@@ -180,6 +180,10 @@ const NATIVE_API = new Set([
   'upgradeToWebSocket',
   'wsSend',
   'wsClose',
+  'setWsAutoUpgrade',
+  'wsGetHeaders',
+  'wsGetQuery',
+  'wsGetRemoteAddress',
 ]);
 
 module.exports = new Proxy(

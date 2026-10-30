@@ -57,3 +57,7 @@ export let endWith = (...a) => (endWith = engine.endWith)(...a);
 export let upgradeToWebSocket = (...a) => (upgradeToWebSocket = engine.upgradeToWebSocket)(...a);
 export let wsSend = (...a) => (wsSend = engine.wsSend)(...a);
 export let wsClose = (...a) => (wsClose = engine.wsClose)(...a);
+export let setWsAutoUpgrade = (...a) => (setWsAutoUpgrade = engine.setWsAutoUpgrade)(...a);
+export let wsGetHeaders = (...a) => (wsGetHeaders = engine.wsGetHeaders)(...a);
+export let wsGetQuery = (...a) => (wsGetQuery = engine.wsGetQuery)(...a);
+export let wsGetRemoteAddress = (...a) => (wsGetRemoteAddress = engine.wsGetRemoteAddress)(...a);

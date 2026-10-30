@@ -203,6 +203,10 @@ struct StagedRequest {
   // response, after the responses ahead of it), as handleParse does for a
   // request the sequential loop surfaces.
   bool expectContinue = false;
+  // Upgrade: websocket was seen while this request was parsed (the batch
+  // ends with it): activateStaged may hand the handshake to the engine's own
+  // upgrade (wsAutoUpgrade) before anything reaches JS.
+  bool upgrade = false;
 };
 
 struct Connection {
@@ -465,6 +469,17 @@ class Server {
   // otherwise requests are surfaced one at a time (dispatchBatchSequential).
   void setBatchDispatch(bool on) { batchOn_ = on && cb_.onRequestBatch != nullptr; }
   bool batchDispatch() const { return batchOn_; }
+  // WebSocket upgrades performed by the engine itself (capabilities
+  // wsAutoUpgrade): a valid handshake is answered and onWsOpen fired without
+  // the request ever reaching onRequest; what the handshake carried stays
+  // readable on the WebSocket through wsHeaders()/wsQuery()/remoteAddress().
+  // An invalid handshake is surfaced to JS like any other request.
+  void setWsAutoUpgrade(bool on) { wsAutoUpgrade_ = on; }
+  bool wsAutoUpgrade() const { return wsAutoUpgrade_; }
+  // The handshake request's headers and query string, kept on the connection
+  // for its WebSocket lifetime (nothing parses HTTP on it again).
+  const std::vector<Header>& wsHeaders(Connection* c) const { return c->headers; }
+  const std::string& wsQuery(Connection* c) const { return c->query; }
   // The control cell JS polls between slots: the index of the slot that is
   // active within the current batch call, or the batch's count once every
   // slot has been answered. Owned by the binding (an ArrayBuffer's storage),
@@ -1091,20 +1106,28 @@ class Server {
     }
     std::string_view payload = compressed ? std::string_view(deflated)
                                           : std::string_view(data, len);
-    // Frame into the connection's reusable scratch buffer (same policy as
-    // respond()'s non-corked path): a warm connection sends with zero
-    // allocations, and releaseScratch keeps one huge frame from pinning its
-    // capacity. writeOutView never keeps a reference past the call: the bytes
-    // reach the kernel synchronously (uv_try_write) or are copied first -
-    // into a queued WriteReq, the TLS ciphertext buffer (writePlain), or
-    // corkBuf (a wsSend issued from onWsOpen/onWsMessage inside the upgrade's
-    // still-corked dispatch).
-    std::string& out = c->scratch;
-    out.clear();
-    encodeFrame(out, isBinary ? WsOpcode::Binary : WsOpcode::Text, payload,
-                /*fin=*/true, /*rsv1=*/compressed);
-    writeOutView(c, out, /*terminal=*/false);
-    releaseScratch(c);
+    const WsOpcode opcode = isBinary ? WsOpcode::Binary : WsOpcode::Text;
+    if (c->corked && !c->tls) {
+      // Inside a read's batch (feedWebSocket) on a plaintext connection: the
+      // frame is built straight into the cork buffer, the way respond() builds
+      // a corked HTTP reply, so an echo costs one append and no scratch copy.
+      // The flush at the high-water mark is the one transportWrite applies.
+      encodeFrame(c->corkBuf, opcode, payload, /*fin=*/true, /*rsv1=*/compressed);
+      if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
+    } else {
+      // Frame into the connection's reusable scratch buffer (same policy as
+      // respond()'s non-corked path): a warm connection sends with zero
+      // allocations, and releaseScratch keeps one huge frame from pinning its
+      // capacity. writeOutView never keeps a reference past the call: the
+      // bytes reach the kernel synchronously (uv_try_write) or are copied
+      // first - into a queued WriteReq, the TLS ciphertext buffer
+      // (writePlain), or corkBuf on a TLS connection.
+      std::string& out = c->scratch;
+      out.clear();
+      encodeFrame(out, opcode, payload, /*fin=*/true, /*rsv1=*/compressed);
+      writeOutView(c, out, /*terminal=*/false);
+      releaseScratch(c);
+    }
     // Frames corked for this read's batch (feedWebSocket) are queued too:
     // they leave with the flush, so the backpressure signal counts them.
     size_t q = tPendingBytes(c) + c->corkBuf.size();
@@ -1602,6 +1625,7 @@ class Server {
     sr.isHead = (sr.method == Method::HEAD);
     sr.reqKeepAlive = c->parser.keepAlive;
     sr.reqHttp11 = c->parser.minorVersion >= 1;
+    sr.upgrade = upgrade;
     c->parser.reset();
     return !sr.reqKeepAlive || upgrade;
   }
@@ -1633,7 +1657,8 @@ class Server {
       std::string cont = "HTTP/1.1 100 Continue\r\n\r\n";
       writeOut(c, std::move(cont), /*terminal=*/false);
     }
-    if (hasEngineRoutes()) tryStaticRoute(c);
+    if (hasEngineRoutes() && tryStaticRoute(c)) return;
+    if (sr.upgrade && wsAutoUpgrade_) upgradeToWebSocket(c);
   }
 
   uint32_t nextReqId() {
@@ -2024,6 +2049,10 @@ class Server {
     // calls, so framing, HEAD handling, corking and keep-alive are identical -
     // the only thing skipped is the trip through JS.
     if (hasEngineRoutes() && tryStaticRoute(c)) return;
+    // The engine's own upgrade (wsAutoUpgrade): a valid WebSocket handshake
+    // is answered here and onWsOpen fired; the request never reaches JS. An
+    // invalid one (upgradeToWebSocket returns 0) is surfaced as usual.
+    if (wsAutoUpgrade_ && c->parser.hasUpgrade() && upgradeToWebSocket(c) != 0) return;
     if (cb_.onRequest) cb_.onRequest(cb_.user, c);
   }
 
@@ -3843,6 +3872,7 @@ class Server {
   std::unordered_set<Connection*> conns_;  // all live connections (for close())
   TemplateStore templates_;
   bool batchOn_ = false;
+  bool wsAutoUpgrade_ = false;
   uint32_t* batchControl_ = nullptr;
   // Keyed by path and looked up with the Connection's own std::string, so the
   // hot path allocates nothing. One or two methods per path in any real app,
