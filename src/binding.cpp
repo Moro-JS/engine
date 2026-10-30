@@ -301,10 +301,11 @@ class ByteSource {
   // `borrow`: take the zero-copy String::ValueView path. A ValueView pins the
   // V8 heap (no allocation, hence no JS) for its lifetime, so it is legal
   // only on entry points whose engine call cannot reach JS: the HTTP
-  // response functions under deferred notification. Sync notification mode
-  // (MORO_ENGINE_NOTIFY=sync) delivers onAborted re-entrantly from inside
-  // respond()/write(), and wsSend() sheds a stalled consumer through the
-  // synchronous onWsClose - both must copy instead.
+  // response functions and wsSend() under deferred notification (wsSend's
+  // shed of a stalled consumer is queued to a later turn since 1.1.16). Sync
+  // notification mode (MORO_ENGINE_NOTIFY=sync) delivers onAborted
+  // re-entrantly from inside respond()/write() and the shed from inside
+  // wsSend() - it must copy instead.
   ByteSource(Isolate* iso, Local<Value> v, bool borrow = g_notifyDeferred) {
     if (v->IsString()) {
       Local<String> s = v.As<String>();
@@ -769,9 +770,15 @@ static void cbOnWsMessage(void* user, Connection* c, const char* data,
     // cast negative (V8 reads `data` as NUL-terminated and over-reads) or, just
     // past 2^32, wrap to a small positive length (silent truncation). Either
     // way it must never reach NewFromUtf8; take the drop-and-log path instead.
+    // A pure-ASCII payload (the parser already validated the UTF-8) is built
+    // as a one-byte string straight from the bytes, skipping the UTF-8
+    // decode; anything else takes NewFromUtf8.
+    const bool ascii = text::isAscii(reinterpret_cast<const uint8_t*>(data), len);
     if (len > static_cast<size_t>(INT_MAX) ||
-        !String::NewFromUtf8(iso, data, v8::NewStringType::kNormal,
-                             static_cast<int>(len))
+        !(ascii ? String::NewFromOneByte(iso, reinterpret_cast<const uint8_t*>(data),
+                                         v8::NewStringType::kNormal, static_cast<int>(len))
+                : String::NewFromUtf8(iso, data, v8::NewStringType::kNormal,
+                                      static_cast<int>(len)))
              .ToLocal(&text)) {
       // Payload exceeds V8's string cap (an operator raised wsMaxMessageSize
       // past ~512MB) or allocation failed: drop the message rather than
@@ -1494,9 +1501,12 @@ static void WsSend(const FunctionCallbackInfo<Value>& args) {
   Connection* c = wsFrom(args);
   if (!c) { args.GetReturnValue().Set(false); return; }
   bool isBinary = args.Length() >= 3 && args[2]->BooleanValue(iso);
-  // Never a borrow: wsSend() can shed the peer (wsBackpressureLimit) through
-  // the synchronous onWsClose callback while `data` is alive.
-  ByteSource data(iso, args[1], /*borrow=*/false);
+  // Borrowed under deferred notification, like the HTTP response bytes: the
+  // one way wsSend() used to reach JS from inside the call - shedding a
+  // stalled peer through onWsClose - is queued to a later loop turn now
+  // (Server::kNotifyWsShed), so nothing can run JS or move the string while
+  // the engine copies the payload into its frame. Sync mode still copies.
+  ByteSource data(iso, args[1]);
   bool ok = true;
   if (data.valid()) ok = c->server->wsSend(c, data.data(), data.size(), isBinary);
   args.GetReturnValue().Set(ok);

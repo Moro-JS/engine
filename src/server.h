@@ -309,6 +309,7 @@ struct Connection {
   uint32_t wsId = 0;
   WsParser* wsParser = nullptr;
   bool wsClosing = false;
+  bool wsShedPending = false;  // a 1013 Close is queued for this socket (wsSend backpressure)
   // permessage-deflate context (RFC 7692); null unless negotiated for this connection at upgrade time.
   PmdContext* pmd = nullptr;
   // Outbound compression goes through the Server's SharedDeflator instead of
@@ -1132,8 +1133,18 @@ class Server {
     // they leave with the flush, so the backpressure signal counts them.
     size_t q = tPendingBytes(c) + c->corkBuf.size();
     if (limits_.wsBackpressureLimit && q > limits_.wsBackpressureLimit) {
-      // Slow/stalled consumer - shed it (1013 Try Again Later) so its queued frames can't grow memory without bound (limits_.wsBackpressureLimit, 0 = unlimited; maxBackpressure defense).
-      wsClose(c, 1013, "", 0);
+      // Slow/stalled consumer - shed it (1013 Try Again Later) so its queued
+      // frames can't grow memory without bound (limits_.wsBackpressureLimit,
+      // 0 = unlimited; maxBackpressure defense). The Close goes out on a
+      // later loop turn, through the same queue as onAborted/onWritable: a
+      // synchronous onWsClose from inside wsSend() would reach JS while the
+      // binding still borrows the payload's bytes out of the V8 heap. Under
+      // sync notification (MORO_ENGINE_NOTIFY=sync) the binding copies and
+      // the shed is immediate, as before.
+      if (!c->wsShedPending) {
+        c->wsShedPending = true;
+        queueNotify(c->wsId, kNotifyWsShed);
+      }
       return false;
     }
     return q < limits_.writeHighWaterMark;
@@ -3797,7 +3808,9 @@ class Server {
   // for V8 fast API calls (which must never call back into JS). Queued by
   // reqId only: by delivery time the Connection may be gone (closing-phase
   // free), and the binding resolves reqIds through the registry anyway.
-  enum : uint8_t { kNotifyAborted = 0, kNotifyWritable = 1 };
+  // kNotifyWsShed carries a wsId, not a reqId: a WebSocket that wsSend()
+  // found past wsBackpressureLimit, closed with 1013 on this later turn.
+  enum : uint8_t { kNotifyAborted = 0, kNotifyWritable = 1, kNotifyWsShed = 2 };
   struct PendingNotify {
     uint32_t reqId;
     uint8_t kind;
@@ -3819,6 +3832,11 @@ class Server {
   }
 
   void deliverNotify(uint32_t reqId, uint8_t kind) {
+    if (kind == kNotifyWsShed) {
+      Connection* c = lookupWs(reqId);
+      if (c && !c->wsClosing && !c->closing) wsClose(c, 1013, "", 0);
+      return;
+    }
     if (kind == kNotifyAborted) {
       if (cb_.onAborted) cb_.onAborted(cb_.user, reqId);
     } else {

@@ -179,12 +179,12 @@ class TlsContext {
     SSL_CTX_set_min_proto_version(ctx_, cfg.minVersion);
     SSL_CTX_set_options(ctx_, SSL_OP_NO_RENEGOTIATION | SSL_OP_NO_COMPRESSION |
                                   SSL_OP_CIPHER_SERVER_PREFERENCE);
-    // The record buffers stay with the session between records: with
-    // SSL_MODE_RELEASE_BUFFERS OpenSSL frees its read and write buffers after
-    // every record and allocates them again for the next, a malloc/free pair
-    // per reply on a busy connection for ~34 KB of memory per idle one.
-    // SSL_write reports partial progress so large responses never stall.
-    SSL_CTX_set_mode(ctx_, SSL_MODE_ENABLE_PARTIAL_WRITE |
+    // Release idle buffers between records (~34KB/conn saved when quiet) and
+    // let SSL_write report partial progress so large responses never stall.
+    // (1.1.15 kept the buffers between records to save the malloc/free pair
+    // per reply; measured on the HttpArena TLS profiles it moved nothing
+    // outside noise, so the memory goes back to being saved.)
+    SSL_CTX_set_mode(ctx_, SSL_MODE_RELEASE_BUFFERS | SSL_MODE_ENABLE_PARTIAL_WRITE |
                                SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
     // Optional explicit cipher/group policy (ssl.ciphers / ssl.ciphersuites /
