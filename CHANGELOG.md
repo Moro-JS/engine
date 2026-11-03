@@ -3,6 +3,7 @@
 One file per release in [`changelog/`](changelog/); the GitHub Release for a
 tag carries the same text. Newest first.
 
+- [1.1.17](changelog/v1.1.17.md) — TLS on the engine's own BIOs (one copy in, one append out, no zeroing); bodies over 8 KiB encrypted from the caller's bytes; ciphertext scratch kept up to 1 MiB.
 - [1.1.16](changelog/v1.1.16.md) — `wsSend()` borrows its payload (the backpressure shed is deferred); ASCII text frames as one-byte strings; TLS record buffers released again.
 - [1.1.15](changelog/v1.1.15.md) — WebSocket upgrades performed by the engine (`setWsAutoUpgrade`, handshake accessors); frames built in the cork buffer; TLS record buffers kept between records.
 - [1.1.14](changelog/v1.1.14.md) — WebSocket replies corked per read (one write for a pipelined batch); one ciphertext buffer per loop on the TLS write path.

@@ -781,6 +781,22 @@ class Server {
 
     std::string& out = c->scratch;
     out.clear();
+    const size_t sendLen = (!c->isHead && !bodyless) ? bodyLen : 0;
+    if (c->tls && sendLen > kTlsInlineBody) {
+      // TLS, large body: the head is built in scratch and the body is
+      // encrypted straight from the caller's bytes - two SSL_writes into one
+      // ciphertext buffer, no plaintext copy of the body. The frame used to
+      // be assembled whole in scratch, whose capacity was then released
+      // again, so a large static file paid a copy and fresh pages per reply.
+      // A small body still rides the head's record: one copy of a few
+      // kilobytes costs less than a record of its own.
+      appendResponseHead(out, c, status, headersBlock, customCL, bodyLen, bodyless);
+      c->responseStarted = true;
+      c->responseEnded = true;
+      tlsWrite(c, out, std::string_view(body, sendLen), /*terminal=*/true);
+      releaseScratch(c);
+      return;
+    }
     out.reserve(bodyLen + headersBlock.size() + 128);
     appendResponse(out, c, status, headersBlock, customCL, body, bodyLen,
                    bodyless);
@@ -799,6 +815,14 @@ class Server {
   void appendResponse(std::string& out, Connection* c, int status,
                       const std::string& headersBlock, long long customCL,
                       const char* body, size_t bodyLen, bool bodyless) {
+    appendResponseHead(out, c, status, headersBlock, customCL, bodyLen, bodyless);
+    if (!c->isHead && bodyLen) out.append(body, bodyLen);
+  }
+
+  // The status line and header block of appendResponse, without the body.
+  void appendResponseHead(std::string& out, Connection* c, int status,
+                          const std::string& headersBlock, long long customCL,
+                          size_t bodyLen, bool bodyless) {
     appendStatusLine(out, status);
     out += dateLine();
     out += headersBlock;
@@ -817,7 +841,6 @@ class Server {
     }
     out += connectionHeader(c);
     out += "\r\n";
-    if (!c->isHead && bodyLen) out.append(body, bodyLen);
   }
 
   // One huge response must not pin its capacity to an idle connection; small
@@ -1210,6 +1233,11 @@ class Server {
   // exactly once). 1 GiB < INT_MAX, so every length/return cast below a
   // segment boundary is exact.
   static constexpr size_t kMaxWriteChunk = static_cast<size_t>(1) << 30;
+  // A TLS body up to this size rides in the head's record (one copy of a few
+  // kilobytes); above it the body is encrypted from the caller's bytes.
+  static constexpr size_t kTlsInlineBody = 8192;
+  // Ciphertext scratch capacity kept between replies (see tlsWrite).
+  static constexpr size_t kCipherScratchKeep = 1u << 20;
 
   // Frame-level write: response/frame bytes from the HTTP/WS machinery. On a TLS connection the plaintext is encrypted first; `terminal` rides the (single) ciphertext buffer so the flush-then-finish semantics (onWrite -> finishResponse) are identical on both transports.
   void writeOut(Connection* c, std::string&& data, bool terminal) {
@@ -1230,18 +1258,26 @@ class Server {
   // consumed by the send(), the cork append or the queued copy, all of which
   // happen ahead of finishResponse.
   void tlsWrite(Connection* c, std::string_view plain, bool terminal) {
+    tlsWrite(c, plain, std::string_view(), terminal);
+  }
+
+  // Two plaintext pieces (a response head and its body) encrypted back to
+  // back into the one ciphertext buffer and handed to the transport as one
+  // write: the body is read where it lives, never copied behind the head.
+  void tlsWrite(Connection* c, std::string_view head, std::string_view body, bool terminal) {
     std::string& cipher = cipherScratch_;
     cipher.clear();
-    if (!plain.empty() &&
-        !c->tls->writePlain(plain.data(), plain.size(), cipher)) {
+    if ((!head.empty() && !c->tls->writePlain(head.data(), head.size(), cipher)) ||
+        (!body.empty() && !c->tls->writePlain(body.data(), body.size(), cipher))) {
       // Encrypting failed (session torn down / pre-handshake write): the response can never reach the peer - drop the connection.
       doClose(c);
       return;
     }
     transportWriteView(c, cipher, terminal);
-    // One huge response must not pin its ciphertext capacity to the loop
-    // (same 64 KiB watermark the read buffer uses).
-    if (cipher.capacity() > 65536) {
+    // The buffer is one per loop, so its capacity is kept up to a generous
+    // watermark: released after every large reply (the old 64 KiB), a static
+    // file's worth of pages was faulted in and zeroed again for each of them.
+    if (cipher.capacity() > kCipherScratchKeep) {
       cipher.clear();
       cipher.shrink_to_fit();
     }
@@ -1840,6 +1876,16 @@ class Server {
       bool ok = c->tls->onCiphertext(
           base, nread,
           [&](const char* d, size_t n) {
+            // Handshake output ahead of this plaintext (the session tickets
+            // TLS 1.3 sends right after the handshake, when the request rode
+            // in with the client's Finished) goes out before the dispatch
+            // can answer: records are sequenced, and a response written
+            // first would arrive at the peer out of order.
+            if (!cipherOut.empty() && !c->closing) {
+              std::string flight;
+              flight.swap(cipherOut);
+              s->transportWrite(c, std::move(flight), /*terminal=*/false);
+            }
             if (!c->closing) s->dispatchPlaintext(c, d, n);
           },
           cipherOut);

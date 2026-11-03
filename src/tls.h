@@ -441,12 +441,22 @@ class TlsContext {
 
 // Per-connection TLS transform. Pure: consumes/produces byte buffers, never
 // touches the socket. The caller (server.h) owns all I/O and lifetimes.
+//
+// The BIOs are the engine's own. The read BIO is a view over the caller's
+// buffer for the duration of one onCiphertext(): OpenSSL's record layer copies
+// records out of it, and that is the only copy on the way in (BIO_s_mem put a
+// second one, into its own buffer, ahead of it). The write BIO appends
+// ciphertext straight into the string the caller passed: a record is one
+// append, where BIO_s_mem grew its own buffer by copying, was copied out of
+// again in drain(), and then zeroed its whole capacity on reset - three
+// passes over a large body on top of the encryption, each paid again as fresh
+// pages once the buffers were freed between replies.
 class TlsSession {
  public:
   explicit TlsSession(SSL_CTX* ctx) {
     ssl_ = SSL_new(ctx);
-    rbio_ = BIO_new(BIO_s_mem());
-    wbio_ = BIO_new(BIO_s_mem());
+    rbio_ = BIO_new(viewReadMethod());
+    wbio_ = BIO_new(appendWriteMethod());
     if (!ssl_ || !rbio_ || !wbio_) {
       // Allocation failure. SSL_set_bio must only see valid BIOs, so
       // ownership never transferred - free each piece individually and latch
@@ -461,6 +471,8 @@ class TlsSession {
       fatal_ = true;
       return;
     }
+    BIO_set_data(rbio_, this);
+    BIO_set_data(wbio_, this);
     // SSL_set_bio transfers BIO ownership to the SSL object; SSL_free frees all.
     SSL_set_bio(ssl_, rbio_, wbio_);
     SSL_set_accept_state(ssl_);
@@ -489,28 +501,39 @@ class TlsSession {
   // fatal TLS error OR a clean close_notify - either way the connection is
   // done receiving.
   //
+  // `data` is only read during this call: the record layer copies what it
+  // needs into its own buffer, a partial record included, so the caller's
+  // buffer is free again on return.
+  //
   // plainSink may tear the connection down (doClose sets Connection.closing);
   // the caller re-checks that after this returns. The session itself stays
   // valid until destroyed.
+  //
+  // Ordering: ciphertext already in cipherOut when plainSink runs (a TLS 1.3
+  // session ticket, sent on the heels of the handshake) precedes, in record
+  // sequence, anything plainSink then encrypts with writePlain. A caller
+  // that answers from inside plainSink must put cipherOut on the wire
+  // first - server.h does, before every dispatch - or the peer sees records
+  // out of sequence and fails the MAC.
   template <typename Sink>
   bool onCiphertext(const char* data, size_t len, Sink&& plainSink,
                     std::string& cipherOut) {
     if (fatal_) return false;
-    // BIO_s_mem grows as needed; a short write here is out-of-memory.
-    // Cap each BIO_write at 1 MiB: a >= 2 GiB remainder would cast negative
-    // (BIO_write takes int) and be misread as an error.
-    size_t off = 0;
-    while (off < len) {
-      const int chunk = static_cast<int>(std::min<size_t>(len - off, 1u << 20));
-      int w = BIO_write(rbio_, data + off, chunk);
-      if (w <= 0) {
-        fatal_ = true;
-        drain(cipherOut);
-        return false;
-      }
-      off += static_cast<size_t>(w);
+    // Bytes the record layer left unread last time (it never does; kept so a
+    // future OpenSSL that stops short mid-buffer cannot lose them).
+    if (!carry_.empty()) {
+      carry_.append(data, len);
+      in_ = carry_.data();
+      inLen_ = carry_.size();
+    } else {
+      in_ = data;
+      inLen_ = len;
     }
+    inOff_ = 0;
+    out_ = &cipherOut;
+    flushStash();
 
+    bool ok = true;
     if (!handshakeDone_) {
       ERR_clear_error();
       int r = SSL_accept(ssl_);
@@ -520,20 +543,19 @@ class TlsSession {
         int err = SSL_get_error(ssl_, r);
         if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
           // Garbage, protocol mismatch, or a failed client-cert verify. The
-          // alert (if any) is already in wbio - flush it, then fail.
+          // alert (if any) is already in cipherOut - fail.
           ERR_clear_error();
           fatal_ = true;
-          drain(cipherOut);
-          return false;
+          ok = false;
         }
-        drain(cipherOut);  // handshake flight
-        return true;       // need more ciphertext
+        // Otherwise the handshake flight is in cipherOut; need more ciphertext.
+        endIo(ok);
+        return ok;
       }
     }
 
     // Established (possibly just now, with app data in the same flight):
     // drain every complete record.
-    bool ok = true;
     for (;;) {
       char buf[16 * 1024];
       ERR_clear_error();
@@ -555,7 +577,7 @@ class TlsSession {
       ok = false;
       break;
     }
-    drain(cipherOut);
+    endIo(ok);
     return ok;
   }
 
@@ -565,6 +587,15 @@ class TlsSession {
   // this indicates a bug or a torn-down session).
   bool writePlain(const char* data, size_t len, std::string& cipherOut) {
     if (fatal_ || !handshakeDone_) return false;
+    // Usually called from inside onCiphertext's plainSink (a request answered
+    // synchronously): the outer call's target is put back afterwards.
+    std::string* const outer = out_;
+    out_ = &cipherOut;
+    flushStash();
+    // One record per 16 KiB of plaintext, a few dozen bytes of framing each
+    // (TLS 1.3: 5-byte header, inner content type, 16-byte tag): reserved up
+    // front so the appends never regrow the buffer mid-body.
+    cipherOut.reserve(cipherOut.size() + len + 64 + (len / 16384 + 1) * 32);
     // Cap each SSL_write at 1 MiB: a >= 2 GiB remainder would cast negative
     // (SSL_write takes int) and tear the connection down as a fake error.
     size_t off = 0;
@@ -573,15 +604,15 @@ class TlsSession {
       const int chunk = static_cast<int>(std::min<size_t>(len - off, 1u << 20));
       int n = SSL_write(ssl_, data + off, chunk);
       if (n <= 0) {
-        // With mem-BIOs WANT_WRITE cannot happen (wbio grows); anything else
-        // is fatal.
+        // The write BIO always accepts, so WANT_WRITE cannot happen; anything
+        // else is fatal.
         fatal_ = true;
-        drain(cipherOut);
+        out_ = outer;
         return false;
       }
       off += static_cast<size_t>(n);
     }
-    drain(cipherOut);
+    out_ = outer;
     return true;
   }
 
@@ -589,28 +620,141 @@ class TlsSession {
   // ciphertext to cipherOut (empty when the handshake never completed).
   void shutdown(std::string& cipherOut) {
     if (fatal_ || !handshakeDone_) return;
+    std::string* const outer = out_;
+    out_ = &cipherOut;
+    flushStash();
     ERR_clear_error();
     SSL_shutdown(ssl_);
-    drain(cipherOut);
+    out_ = outer;
   }
 
  private:
-  void drain(std::string& out) {
-    if (!wbio_) return;
-    // wbio_ is exclusively SSL-written and caller-drained, so after copying
-    // the whole buffer a reset cannot discard bytes anyone still expects;
-    // one BIO_get_mem_data + BIO_reset replaces a 16 KB BIO_read loop.
-    char* p = nullptr;
-    long n = BIO_get_mem_data(wbio_, &p);
-    if (n > 0) {
-      out.append(p, static_cast<size_t>(n));
-      (void)BIO_reset(wbio_);
+  // The read view is over for this call: whatever the record layer did not
+  // take is kept (never, in practice - it reads everything a BIO offers).
+  void endIo(bool ok) {
+    if (ok && inOff_ < inLen_) {
+      std::string rest(in_ + inOff_, inLen_ - inOff_);
+      carry_.swap(rest);
+    } else {
+      carry_.clear();
     }
+    in_ = nullptr;
+    inLen_ = inOff_ = 0;
+    out_ = nullptr;
+  }
+
+  // Ciphertext OpenSSL produced while no caller buffer was set (it does not,
+  // outside the calls above; stash_ is the safety net) goes to the next one.
+  void flushStash() {
+    if (!stash_.empty() && out_) {
+      out_->append(stash_);
+      stash_.clear();
+    }
+  }
+
+  // ---- the BIO methods: built once per process, shared by every session ----
+
+  static int bioCreate(BIO* b) {
+    BIO_set_init(b, 1);
+    return 1;
+  }
+  static int bioDestroy(BIO* b) {
+    if (!b) return 0;
+    BIO_set_data(b, nullptr);
+    BIO_set_init(b, 0);
+    return 1;
+  }
+
+  // Read side: records are copied out of the current view; an empty view is
+  // "would block", which SSL_read reports as WANT_READ.
+  static int rbioRead(BIO* b, char* out, int len) {
+    auto* s = static_cast<TlsSession*>(BIO_get_data(b));
+    BIO_clear_retry_flags(b);
+    if (!s || !out || len <= 0) return 0;
+    const size_t avail = s->inLen_ - s->inOff_;
+    if (avail == 0) {
+      BIO_set_retry_read(b);
+      return -1;
+    }
+    const size_t n = std::min(avail, static_cast<size_t>(len));
+    memcpy(out, s->in_ + s->inOff_, n);
+    s->inOff_ += n;
+    return static_cast<int>(n);
+  }
+  static int rbioWrite(BIO* b, const char*, int) {
+    BIO_clear_retry_flags(b);
+    return -1;  // the read BIO is never written
+  }
+  static long rbioCtrl(BIO* b, int cmd, long, void*) {
+    switch (cmd) {
+      case BIO_CTRL_FLUSH:
+        return 1;
+      case BIO_CTRL_PENDING: {
+        auto* s = static_cast<TlsSession*>(BIO_get_data(b));
+        return s ? static_cast<long>(s->inLen_ - s->inOff_) : 0;
+      }
+      default:
+        return 0;  // EOF: no; WPENDING: 0; everything else: unsupported
+    }
+  }
+
+  // Write side: every record is appended to the caller's buffer as it is
+  // produced, never buffered here.
+  static int wbioWrite(BIO* b, const char* in, int len) {
+    auto* s = static_cast<TlsSession*>(BIO_get_data(b));
+    BIO_clear_retry_flags(b);
+    if (!s || len < 0) return -1;
+    if (len == 0) return 0;
+    std::string* out = s->out_ ? s->out_ : &s->stash_;
+    out->append(in, static_cast<size_t>(len));
+    return len;
+  }
+  static int wbioRead(BIO* b, char*, int) {
+    BIO_clear_retry_flags(b);
+    return -1;  // the write BIO is never read
+  }
+  static long wbioCtrl(BIO*, int cmd, long, void*) {
+    return cmd == BIO_CTRL_FLUSH ? 1 : 0;
+  }
+
+  static BIO_METHOD* viewReadMethod() {
+    static BIO_METHOD* method = [] {
+      BIO_METHOD* m = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "moro-engine view");
+      if (!m) return m;
+      BIO_meth_set_read(m, rbioRead);
+      BIO_meth_set_write(m, rbioWrite);
+      BIO_meth_set_ctrl(m, rbioCtrl);
+      BIO_meth_set_create(m, bioCreate);
+      BIO_meth_set_destroy(m, bioDestroy);
+      return m;
+    }();
+    return method;
+  }
+  static BIO_METHOD* appendWriteMethod() {
+    static BIO_METHOD* method = [] {
+      BIO_METHOD* m = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "moro-engine append");
+      if (!m) return m;
+      BIO_meth_set_read(m, wbioRead);
+      BIO_meth_set_write(m, wbioWrite);
+      BIO_meth_set_ctrl(m, wbioCtrl);
+      BIO_meth_set_create(m, bioCreate);
+      BIO_meth_set_destroy(m, bioDestroy);
+      return m;
+    }();
+    return method;
   }
 
   SSL* ssl_ = nullptr;
   BIO* rbio_ = nullptr;  // wire -> SSL (owned by ssl_ after SSL_set_bio)
   BIO* wbio_ = nullptr;  // SSL -> wire (owned by ssl_)
+  // The read view of the call in progress (onCiphertext).
+  const char* in_ = nullptr;
+  size_t inLen_ = 0;
+  size_t inOff_ = 0;
+  // Where ciphertext goes during the call in progress; stash_ between calls.
+  std::string* out_ = nullptr;
+  std::string stash_;
+  std::string carry_;
   bool handshakeDone_ = false;
   bool fatal_ = false;
 };
