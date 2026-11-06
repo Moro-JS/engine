@@ -35,6 +35,7 @@ static const char* kEngineVersion = "1.1.17";
 
 using v8::Array;
 using v8::ArrayBuffer;
+using v8::BackingStore;
 using v8::Context;
 using v8::Function;
 using v8::FunctionCallbackInfo;
@@ -1231,16 +1232,39 @@ static void GetHeader(const FunctionCallbackInfo<Value>& args) {
   }
 }
 
+// The body is handed over without a copy: the connection's string moves to a
+// holder that becomes the ArrayBuffer's backing store, freed when JS lets go
+// of it. A plain V8 backing store, deliberately not node::Buffer::New's
+// free-callback form: that one books the bytes as external memory, and at
+// 10 KB a request the 64 MB external budget forced a full mark-compact every
+// few thousand requests (a tenth of the worker's CPU in marking). This way
+// the buffer dies in the scavenge like any young object. The storage stays
+// on the connection until the next request, so a second call returns the
+// same bytes again - the same storage, not a snapshot.
+static void FreeBodyHolder(void*, size_t, void* hint) { delete static_cast<std::string*>(hint); }
+
 static void GetBody(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
   Connection* c = connFrom(args);
-  if (!c || c->body.empty()) {
+  if (!c) {
     args.GetReturnValue().SetNull();
     return;
   }
-  Local<ArrayBuffer> ab = ArrayBuffer::New(iso, c->body.size());
-  memcpy(ab->Data(), c->body.data(), c->body.size());
-  args.GetReturnValue().Set(ab);
+  if (c->jsBody) {
+    args.GetReturnValue().Set(
+        ArrayBuffer::New(iso, std::static_pointer_cast<BackingStore>(c->jsBody)));
+    return;
+  }
+  if (c->body.empty()) {
+    args.GetReturnValue().SetNull();
+    return;
+  }
+  auto* holder = new std::string(std::move(c->body));
+  c->body.clear();
+  std::shared_ptr<BackingStore> store = ArrayBuffer::NewBackingStore(
+      holder->data(), holder->size(), FreeBodyHolder, holder);
+  c->jsBody = std::static_pointer_cast<void>(store);
+  args.GetReturnValue().Set(ArrayBuffer::New(iso, std::move(store)));
 }
 
 static void GetRemoteAddress(const FunctionCallbackInfo<Value>& args) {

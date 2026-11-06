@@ -322,6 +322,9 @@ export function getQuery(reqId: number): string;
 /** Flat [k0,v0,k1,v1,...] with lowercased keys. */
 export function getHeaders(reqId: number): string[];
 export function getHeader(reqId: number, lowercaseName: string): string | undefined;
+/** The request body, or null when there is none. The bytes are handed over
+ *  without a copy and stay valid for as long as JS holds the buffer; a second
+ *  call during the same request returns the same storage, not a snapshot. */
 export function getBody(reqId: number): ArrayBuffer | null;
 export function getRemoteAddress(reqId: number): string;
 export function isAborted(reqId: number): boolean;

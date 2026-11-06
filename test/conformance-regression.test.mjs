@@ -21,6 +21,7 @@ import {
   openRaw,
   parseResponse,
   parseResponses,
+  responsesComplete,
 } from './helpers.mjs';
 
 const engine = await loadEngine();
@@ -219,6 +220,160 @@ describe('@morojs/engine regression conformance', { skip }, () => {
       const res = parseResponse(raw);
       assert.equal(res.status, 400, 'a malformed version must be 400, not served');
       assert.equal(server.requests.length, 0);
+    });
+  });
+
+  // Request bodies are collected straight into the body buffer as they
+  // arrive (not accumulated in the read buffer and copied out whole at the
+  // end), and handed to JS without a copy. These pin the paths that differ
+  // from the one-read case: a body that trails its head across several
+  // reads, a head that arrives alone, a pipelined request behind a body in
+  // the same read, and the hand-over being repeatable.
+  describe('request body collection and hand-over', () => {
+    const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+    const payload = (n) => Array.from({ length: n }, (_, i) => String.fromCharCode(33 + ((i * 7) % 94))).join('');
+    const echoBody = (ctx) => ctx.respond(200, null, ctx.body() ?? '');
+
+    it('Content-Length body arriving in pieces after its head is echoed intact', T, async () => {
+      const body = payload(40000);
+      await withServer(echoBody, async ({ port }) => {
+        const client = await openRaw(port);
+        try {
+          const head = `POST /u HTTP/1.1${CRLF}Host: t${CRLF}Content-Length: ${body.length}${CRLF}${CRLF}`;
+          // head plus a first slice in one write, then the rest in uneven slices
+          await client.send(head + body.slice(0, 1000));
+          let off = 1000;
+          for (const size of [1, 7000, 3, 20000, 11996]) {
+            await delay(15);
+            await client.send(body.slice(off, off + size));
+            off += size;
+          }
+          assert.equal(off, body.length);
+          const res = parseResponse(await client.read({ until: responsesComplete(1), timeout: 5000 }));
+          assert.equal(res.status, 200);
+          assert.equal(res.body.length, body.length);
+          assert.equal(res.body, body);
+        } finally {
+          client.destroy();
+        }
+      });
+    });
+
+    it('head alone, then the body: echoed intact (buffered head, direct body)', T, async () => {
+      const body = payload(30000);
+      await withServer(echoBody, async ({ port }) => {
+        const client = await openRaw(port);
+        try {
+          await client.send(`POST /u HTTP/1.1${CRLF}Host: t${CRLF}Content-Length: ${body.length}${CRLF}${CRLF}`);
+          await delay(20);
+          await client.send(body.slice(0, 12345));
+          await delay(20);
+          await client.send(body.slice(12345));
+          const res = parseResponse(await client.read({ until: responsesComplete(1), timeout: 5000 }));
+          assert.equal(res.status, 200);
+          assert.equal(res.body, body);
+        } finally {
+          client.destroy();
+        }
+      });
+    });
+
+    it('a head split inside a header line, with the body in the same later write', T, async () => {
+      const body = payload(5000);
+      await withServer(echoBody, async ({ port }) => {
+        const client = await openRaw(port);
+        try {
+          await client.send(`POST /u HTTP/1.1${CRLF}Host: t${CRLF}Content-Le`);
+          await delay(20);
+          await client.send(`ngth: ${body.length}${CRLF}${CRLF}${body}`);
+          const res = parseResponse(await client.read({ until: responsesComplete(1), timeout: 5000 }));
+          assert.equal(res.status, 200);
+          assert.equal(res.body, body);
+        } finally {
+          client.destroy();
+        }
+      });
+    });
+
+    it('pipelined request behind a body in one write: both answered in order', T, async () => {
+      const first = payload(9000);
+      const second = payload(300);
+      await withServer(echoBody, async ({ port }) => {
+        const raw = await rawRequest(
+          port,
+          `POST /a HTTP/1.1${CRLF}Host: t${CRLF}Content-Length: ${first.length}${CRLF}${CRLF}${first}` +
+            `POST /b HTTP/1.1${CRLF}Host: t${CRLF}Content-Length: ${second.length}${CRLF}${CRLF}${second}`,
+          { until: responsesComplete(2) }
+        );
+        const [a, b] = parseResponses(raw);
+        assert.equal(a.status, 200);
+        assert.equal(a.body, first);
+        assert.equal(b.status, 200);
+        assert.equal(b.body, second);
+      });
+    });
+
+    it('pipelined request arriving in the write that completes a body', T, async () => {
+      const first = payload(8000);
+      await withServer(echoBody, async ({ port }) => {
+        const client = await openRaw(port);
+        try {
+          await client.send(`POST /a HTTP/1.1${CRLF}Host: t${CRLF}Content-Length: ${first.length}${CRLF}${CRLF}${first.slice(0, 5000)}`);
+          await delay(20);
+          await client.send(`${first.slice(5000)}GET /b HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`);
+          const [a, b] = parseResponses(await client.read({ until: responsesComplete(2), timeout: 5000 }));
+          assert.equal(a.status, 200);
+          assert.equal(a.body, first);
+          assert.equal(b.status, 200);
+          assert.equal(b.body, '');
+        } finally {
+          client.destroy();
+        }
+      });
+    });
+
+    it('body() twice in one request: the same bytes both times, and nothing after the response', T, async () => {
+      const body = payload(6000);
+      let seen = null;
+      await withServer((ctx) => {
+        const one = ctx.body();
+        const two = ctx.body();
+        seen = {
+          same: Buffer.from(one).equals(Buffer.from(two)),
+          length: one.byteLength,
+        };
+        ctx.respond(200, null, two);
+      }, async ({ port }) => {
+        const raw = await rawRequest(
+          port,
+          `POST /u HTTP/1.1${CRLF}Host: t${CRLF}Content-Length: ${body.length}${CRLF}${CRLF}${body}`,
+          { until: responsesComplete(1) }
+        );
+        const res = parseResponse(raw);
+        assert.equal(res.status, 200);
+        assert.equal(res.body, body);
+        assert.deepEqual(seen, { same: true, length: body.length });
+      });
+    });
+
+    it('a request without a body reports null, before and after one with a body', T, async () => {
+      const body = payload(100);
+      const bodies = [];
+      await withServer((ctx) => {
+        const b = ctx.body();
+        bodies.push(b === null ? null : b.byteLength);
+        ctx.respond(200, null, 'ok');
+      }, async ({ port }) => {
+        const raw = await rawRequest(
+          port,
+          `GET /a HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}` +
+            `POST /b HTTP/1.1${CRLF}Host: t${CRLF}Content-Length: ${body.length}${CRLF}${CRLF}${body}` +
+            `GET /c HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`,
+          { until: responsesComplete(3) }
+        );
+        assert.equal(parseResponses(raw).length, 3);
+        assert.deepEqual(bodies, [null, 100, null]);
+      });
     });
   });
 });

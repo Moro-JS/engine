@@ -186,6 +186,7 @@ class HttpParser {
   // Zero-copy head scan for a request that arrives whole in one read and is
   // answered inside the engine (parse() tries it first; see the definitions).
   bool parseDirect(const char* data, size_t len, ParseStatus& st);
+  bool parseDirectStored(const char* data, size_t len, size_t pos, ParseStatus& st);
   int scanLightHeaders(const unsigned char* d, size_t len, size_t& pos);
 
   const Limits* limits_;
@@ -216,6 +217,9 @@ class HttpParser {
   size_t bodyReceived_ = 0;
   size_t chunkRemaining_ = 0;
   size_t headEnd_ = 0;         // index in buf_ where headers ended (body starts)
+  // A Content-Length body being collected straight into `body` from each
+  // read: the head is parsed and buf_ holds nothing of this request past it.
+  bool directBody_ = false;
   size_t chunkTrailerStart_ = 0;  // buf_ index where the chunk trailer began
 };
 
@@ -328,6 +332,7 @@ inline void HttpParser::reset() {
   if (buf_.capacity() > 65536 && buf_.size() <= 65536) buf_.shrink_to_fit();
   scanPos_ = consumed_;
   state_ = State::RequestLine;
+  directBody_ = false;
   method = Method::OTHER;
   methodStr.clear();
   path.clear();
@@ -684,11 +689,7 @@ inline bool HttpParser::parseDirect(const char* data, size_t len, ParseStatus& s
   }
   light_ = routeHook(routeHookUser, method, path);
   state_ = State::Headers;
-  if (!light_) {  // JS will see this request: its headers are stored as always
-    buf_.append(data, len);
-    scanPos_ = nextScan;
-    return false;
-  }
+  if (!light_) return parseDirectStored(data, len, nextScan, st);
   size_t pos = nextScan;
   const int r = scanLightHeaders(reinterpret_cast<const unsigned char*>(data), len, pos);
   if (r < 0) {
@@ -723,7 +724,102 @@ inline bool HttpParser::parseDirect(const char* data, size_t len, ParseStatus& s
   return true;
 }
 
+// The stored-header twin of the light scan above: a request JS will see,
+// arriving on an idle connection. Its header lines are parsed from the read
+// buffer in place (parseHeaderLine stores them exactly as the buffered path
+// does), so the head is never copied into buf_. A Content-Length body is
+// collected straight into `body`: what arrived with the head is copied once,
+// and every later read appends to `body` directly (parse() sees directBody_)
+// instead of growing buf_ and copying the whole body out of it at the end.
+// An unfinished head, a chunked body and every error hand over to the
+// buffered path with the bytes in buf_, as before. Returns true when `st` is
+// the result.
+inline bool HttpParser::parseDirectStored(const char* data, size_t len, size_t pos,
+                                          ParseStatus& st) {
+  for (;;) {
+    const void* nlp = memchr(data + pos, '\n', len - pos);
+    if (!nlp) {  // head unfinished: the buffered path resumes from this line
+      buf_.append(data, len);
+      scanPos_ = pos;
+      return false;
+    }
+    const size_t nl = static_cast<size_t>(static_cast<const char*>(nlp) - data);
+    size_t lineEnd = nl;
+    if (lineEnd > pos && data[lineEnd - 1] == '\r') --lineEnd;
+    const std::string_view line(data + pos, lineEnd - pos);
+    pos = nl + 1;
+    if (line.empty()) break;  // blank line terminates the head
+    if (headerCount_ >= limits_->maxHeaders) {
+      errorStatus = 431;
+      buf_.append(data, len);
+      st = ParseStatus::Error;
+      return true;
+    }
+    if (!parseHeaderLine(line)) {
+      buf_.append(data, len);
+      st = ParseStatus::Error;
+      return true;
+    }
+  }
+  // The same checks the buffered path applies at the blank line, on the
+  // head's true size.
+  if (pos > limits_->maxHeadSize) {
+    errorStatus = 431;
+    buf_.append(data, len);
+    st = ParseStatus::Error;
+    return true;
+  }
+  headers.resize(headerCount_);
+  if (!finalizeHeaders()) {
+    buf_.append(data, len);
+    st = ParseStatus::Error;
+    return true;
+  }
+  consumed_ = 0;
+  scanPos_ = 0;
+  headEnd_ = 0;
+  if (chunked_) {  // the chunk loop reads from buf_: only the body bytes go there
+    buf_.assign(data + pos, len - pos);
+    state_ = State::ChunkSize;
+    return false;
+  }
+  if (!hasBody_) {  // complete, nothing copied; buf_ holds only what follows
+    if (pos < len) buf_.assign(data + pos, len - pos);
+    state_ = State::Done;
+    st = ParseStatus::Complete;
+    return true;
+  }
+  const size_t avail = len - pos;
+  const size_t take = avail < contentLength_ ? avail : contentLength_;
+  body.reserve(contentLength_);
+  body.assign(data + pos, take);
+  if (take == contentLength_) {
+    if (pos + take < len) buf_.assign(data + pos + take, len - pos - take);
+    state_ = State::Done;
+    st = ParseStatus::Complete;
+    return true;
+  }
+  directBody_ = true;
+  state_ = State::Body;
+  st = ParseStatus::NeedMore;
+  return true;
+}
+
 inline ParseStatus HttpParser::parse(const char* data, size_t len) {
+  // A Content-Length body collected straight into `body` (directBody_): the
+  // head is parsed and nothing of this request sits in buf_ past it, so the
+  // bytes go to `body` without a stop in buf_. What follows the body is the
+  // next request and is buffered as always.
+  if (directBody_) {
+    const size_t need = contentLength_ - body.size();
+    const size_t take = len < need ? len : need;
+    if (take) body.append(data, take);  // parse(nullptr, 0) is a legal re-entry
+    if (take < need) return ParseStatus::NeedMore;
+    if (take < len) buf_.append(data + take, len - take);
+    directBody_ = false;
+    state_ = State::Done;
+    return ParseStatus::Complete;
+  }
   if (len) {
     // A fresh request with nothing buffered ahead of it: the zero-copy scan
     // first. When it hands the request over instead, it has appended the
@@ -822,11 +918,22 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
       return ParseStatus::Complete;
     }
     size_t available = buf_.size() - headEnd_;
-    if (available < contentLength_) return ParseStatus::NeedMore;
-    body.assign(buf_.data() + headEnd_, contentLength_);
-    consumed_ = headEnd_ + contentLength_;
-    state_ = State::Done;
-    return ParseStatus::Complete;
+    if (available >= contentLength_) {
+      body.assign(buf_.data() + headEnd_, contentLength_);
+      consumed_ = headEnd_ + contentLength_;
+      state_ = State::Done;
+      return ParseStatus::Complete;
+    }
+    // Partial: what has arrived moves to `body` now and the rest is appended
+    // there by later reads (directBody_), so the body is copied once instead
+    // of growing buf_ and being copied out of it whole at the end. The head
+    // is consumed; buf_ keeps it (dead) until reset() compacts.
+    body.reserve(contentLength_);
+    body.assign(buf_.data() + headEnd_, available);
+    buf_.resize(headEnd_);
+    consumed_ = headEnd_;
+    directBody_ = true;
+    return ParseStatus::NeedMore;
   }
 
   // --- chunked body (RFC 9112 §7.1) ---

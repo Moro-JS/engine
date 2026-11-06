@@ -3,6 +3,7 @@
 One file per release in [`changelog/`](changelog/); the GitHub Release for a
 tag carries the same text. Newest first.
 
+- [1.1.18](changelog/v1.1.18.md) — request bodies collected straight into the body buffer (one copy, half the peak memory of an upload); `getBody()` hands the bytes over without a copy.
 - [1.1.17](changelog/v1.1.17.md) — TLS on the engine's own BIOs (one copy in, one append out, no zeroing); bodies over 8 KiB encrypted from the caller's bytes; ciphertext scratch kept up to 1 MiB.
 - [1.1.16](changelog/v1.1.16.md) — `wsSend()` borrows its payload (the backpressure shed is deferred); ASCII text frames as one-byte strings; TLS record buffers released again.
 - [1.1.15](changelog/v1.1.15.md) — WebSocket upgrades performed by the engine (`setWsAutoUpgrade`, handshake accessors); frames built in the cork buffer; TLS record buffers kept between records.

@@ -250,6 +250,10 @@ struct Connection {
   std::string query;
   std::vector<Header> headers;
   std::string body;
+  // The body once handed to JS (binding getBody): its storage, kept so a
+  // second call hands over the same bytes again. Opaque here; cleared when
+  // the next request is surfaced.
+  std::shared_ptr<void> jsBody;
   bool isHead = false;
   bool reqKeepAlive = true;
   // Snapshotted with reqKeepAlive (the parser may already be on a later
@@ -1092,6 +1096,7 @@ class Server {
     globalRequests().erase(c->reqId);
     c->reqId = 0;
     c->active = false;
+    c->jsBody.reset();
     writeOut(c, std::move(resp), /*terminal=*/false);
 
     const uint32_t wsId = c->wsId;
@@ -1470,6 +1475,7 @@ class Server {
     uint32_t oldId = c->reqId;
     globalRequests().erase(oldId);
     c->active = false;
+    c->jsBody.reset();  // a body JS kept lives on in JS; nothing pins it to an idle connection
 
     if (!c->reqKeepAlive) {
       if (c->pendingWrites == 0) closeAfterResponse(c);
@@ -1494,6 +1500,7 @@ class Server {
   void completeCorkedResponse(Connection* c) {
     globalRequests().erase(c->reqId);
     c->active = false;
+    c->jsBody.reset();
     if (!c->reqKeepAlive) {
       c->batchClose = true;
       return;
@@ -1691,6 +1698,7 @@ class Server {
     c->query.swap(sr.query);
     c->headers.swap(sr.headers);
     c->body.swap(sr.body);
+    c->jsBody.reset();
     c->isHead = sr.isHead;
     c->reqKeepAlive = sr.reqKeepAlive;
     c->reqHttp11 = sr.reqHttp11;
@@ -2095,6 +2103,7 @@ class Server {
     c->query.swap(c->parser.query);
     c->headers.swap(c->parser.headers);
     c->body.swap(c->parser.body);
+    c->jsBody.reset();
     c->isHead = (c->method == Method::HEAD);
     c->reqKeepAlive = c->parser.keepAlive;
     c->reqHttp11 = c->parser.minorVersion >= 1;
