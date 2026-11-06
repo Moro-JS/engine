@@ -1048,4 +1048,58 @@ describe('@morojs/engine RFC 6455 WebSocket conformance', { skip }, () => {
       client.destroy();
     }
   });
+
+  // One Node callback scope per read: the microtasks a frame handler queues
+  // run after the last frame of the read (as Node's own 'data' callback would
+  // run them for the frames of one segment), and before the next read.
+  describe('frames of one read share a callback scope', () => {
+    it('microtasks queued by frame handlers run after the read, before the next one', T, async () => {
+      const order = [];
+      const callbacks = {
+        onRequest(reqId) {
+          engine.upgradeToWebSocket(reqId);
+        },
+        onAborted() {},
+        onWritable() {},
+        onWsOpen() {},
+        onWsMessage(wsId, data) {
+          order.push(`msg:${data}`);
+          Promise.resolve().then(() => {
+            order.push(`micro:${data}`);
+            engine.wsSend(wsId, `m:${data}`, false);
+          });
+          engine.wsSend(wsId, data, false);
+        },
+        onWsClose() {},
+      };
+      const serverId = engine.serve(callbacks, {});
+      const port = engine.listen(serverId, '127.0.0.1', 0);
+      const client = await openWs(port);
+      try {
+        const { req } = upgradeRequest('/');
+        await client.send(req);
+        assert.equal(parseHead(await client.readHandshake()).status, 101);
+        // two frames in one write: one read on the server
+        await client.send(
+          Buffer.concat([
+            buildFrame({ opcode: 0x1, payload: Buffer.from('a') }),
+            buildFrame({ opcode: 0x1, payload: Buffer.from('b') }),
+          ])
+        );
+        const got = [];
+        for (let i = 0; i < 4; i++) got.push((await client.nextFrame({ timeout: 2000 })).payload.toString());
+        assert.deepEqual(got, ['a', 'b', 'm:a', 'm:b']);
+        assert.deepEqual(order, ['msg:a', 'msg:b', 'micro:a', 'micro:b']);
+        // a later read: its microtasks run on its own return
+        await client.sendFrame({ opcode: 0x1, payload: Buffer.from('c') });
+        const later = [];
+        for (let i = 0; i < 2; i++) later.push((await client.nextFrame({ timeout: 2000 })).payload.toString());
+        assert.deepEqual(later, ['c', 'm:c']);
+        assert.deepEqual(order.slice(4), ['msg:c', 'micro:c']);
+      } finally {
+        client.destroy();
+        engine.close(serverId);
+      }
+    });
+  });
 });

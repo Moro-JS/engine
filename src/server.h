@@ -368,6 +368,14 @@ struct ServerCallbacks {
   void (*onWsMessage)(void* user, Connection* c, const char* data, size_t len,
                       bool isBinary) = nullptr;
   void (*onWsClose)(void* user, Connection* c, int code) = nullptr;
+  // One read's worth of frames (Server::feedWebSocket). When set, the
+  // binding is handed the buffer and must call Server::feedWebSocketFrames
+  // with it exactly once from inside the call: that lets it open whatever a
+  // JS call needs on its own stack once per read rather than once per frame
+  // (onWsMessage/onWsClose then fire inside that frame). May nest: frames
+  // that came with the upgrade request are fed from inside the request's
+  // dispatch.
+  void (*onWsRead)(void* user, Connection* c, char* data, size_t len) = nullptr;
 };
 
 class Server {
@@ -1958,6 +1966,21 @@ class Server {
   // again until the next uv_read/TLS record, after consume() returns.
   void feedWebSocket(Connection* c, char* data, size_t len) {
     if (c->wsClosing || !c->wsParser) return;
+    // The binding, when it asks for it, wraps the whole read in the scopes
+    // a JS call needs and calls feedWebSocketFrames from inside.
+    if (cb_.onWsRead) {
+      cb_.onWsRead(cb_.user, c, data, len);
+      return;
+    }
+    feedWebSocketFrames(c, data, len);
+  }
+
+  // The frames of one read, each delivered through the callbacks. Called
+  // from feedWebSocket, or from the binding's onWsRead (see ServerCallbacks),
+  // which is why it is public.
+ public:
+  void feedWebSocketFrames(Connection* c, char* data, size_t len) {
+    if (c->wsClosing || !c->wsParser) return;
     // Corked for the whole read: every reply this buffer provokes - the echo
     // of each frame of a pipelined batch, a Pong, a Close - accumulates in
     // corkBuf and leaves in ONE write once consume() returns, where it used
@@ -2054,6 +2077,7 @@ class Server {
     }
   }
 
+ private:
   void handleParse(Connection* c, ParseStatus st) {
     if (c->closing) return;
 

@@ -53,11 +53,26 @@ using v8::Uint8Array;
 using v8::Value;
 
 // Per-serve() JS callback set + context, referenced by Server callbacks.
+struct JsServer;
+
+// A Node callback scope on the server's async resource: what every entry into
+// JS from the engine opens, so async hooks and the microtask checkpoint see
+// the call (defined after JsServer, which it reads).
+struct CallbackScopeFor {
+  node::CallbackScope scope;
+  CallbackScopeFor(JsServer* js, Isolate* iso);
+};
+
 struct JsServer {
   Isolate* isolate;
   Global<Context> context;
   Global<Function> onRequest;
   Global<Function> onRequestBatch;
+  // Depth of cbOnWsRead: while > 0 the context and Node callback scope of
+  // the read are open on its stack, and cbOnWsMessage/cbOnWsClose add only
+  // a handle scope per frame. Counted because a read can be fed from inside
+  // a request dispatch, which has scopes of its own.
+  int wsReadDepth = 0;
   Global<Function> onAborted;
   Global<Function> onWritable;
   Global<Function> onWsOpen;
@@ -586,13 +601,10 @@ static void reportCaught(Isolate* iso, TryCatch& tc, const char* where);
 // delivered from inside upgradeToWebSocket(), an onAborted delivered from
 // inside close()) drain nothing themselves; the outermost one does. Cost per
 // call: an async-context push/pop and, with an empty queue, one cheap check.
-struct CallbackScopeFor {
-  node::CallbackScope scope;
-  CallbackScopeFor(JsServer* js, Isolate* iso)
-      : scope(iso,
-              js->asyncResource.IsEmpty() ? Object::New(iso) : js->asyncResource.Get(iso),
-              node::async_context{0, 0}) {}
-};
+inline CallbackScopeFor::CallbackScopeFor(JsServer* js, Isolate* iso)
+    : scope(iso,
+            js->asyncResource.IsEmpty() ? Object::New(iso) : js->asyncResource.Get(iso),
+            node::async_context{0, 0}) {}
 
 static void invokeJs(JsServer* js, Global<Function>& fn, uint32_t reqId,
                      bool withExtra, int32_t methodIdx, const std::string& path) {
@@ -748,6 +760,42 @@ static void cbOnWsOpen(void* user, Connection* c, const std::string& path) {
   reportCaught(iso, tc, "onWsOpen");
 }
 
+// One WebSocket read: the context and Node callback scope are opened here,
+// on this stack frame, around every frame the engine delivers from the
+// buffer; cbOnWsMessage/cbOnWsClose then add only a handle scope and a
+// TryCatch per frame. The microtask checkpoint runs once when the scope
+// closes, after the last frame of the read, which is when Node's own 'data'
+// callback would run it for the frames of one segment. A read fed from
+// inside a request dispatch, or from inside another read, runs under the
+// scopes already open.
+static void cbOnWsRead(void* user, Connection* c, char* data, size_t len) {
+  JsServer* js = static_cast<JsServer*>(user);
+  if (js->tearingDown || js->wsReadDepth > 0) {
+    js->server->feedWebSocketFrames(c, data, len);
+    return;
+  }
+  Isolate* iso = js->isolate;
+  HandleScope scope(iso);
+  Local<Context> ctx = js->context.Get(iso);
+  Context::Scope cs(ctx);
+  CallbackScopeFor cb(js, iso);
+  js->wsReadDepth++;
+  js->server->feedWebSocketFrames(c, data, len);
+  js->wsReadDepth--;
+}
+
+// Opens the per-call scopes a frame needs when it is not inside a read
+// (cbOnWsRead) - a close fired from wsClose() by a timer, say.
+struct WsCallScopes {
+  std::optional<Context::Scope> ctx;
+  std::optional<CallbackScopeFor> cb;
+  WsCallScopes(JsServer* js, Isolate* iso, Local<Context> context) {
+    if (js->wsReadDepth > 0) return;
+    ctx.emplace(context);
+    cb.emplace(js, iso);
+  }
+};
+
 static void cbOnWsMessage(void* user, Connection* c, const char* data,
                           size_t len, bool isBinary) {
   JsServer* js = static_cast<JsServer*>(user);
@@ -756,8 +804,7 @@ static void cbOnWsMessage(void* user, Connection* c, const char* data,
   Isolate* iso = js->isolate;
   HandleScope scope(iso);
   Local<Context> ctx = js->context.Get(iso);
-  Context::Scope cs(ctx);
-  CallbackScopeFor cb(js, iso);
+  WsCallScopes scopes(js, iso, ctx);
   TryCatch tc(iso);
   // Binary -> ArrayBuffer, text -> string (already UTF-8 validated natively)
   Local<Value> payload;
@@ -805,8 +852,7 @@ static void cbOnWsClose(void* user, Connection* c, int code) {
   Isolate* iso = js->isolate;
   HandleScope scope(iso);
   Local<Context> ctx = js->context.Get(iso);
-  Context::Scope cs(ctx);
-  CallbackScopeFor cb(js, iso);
+  WsCallScopes scopes(js, iso, ctx);
   TryCatch tc(iso);
   Local<Value> argv[2] = {Integer::NewFromUnsigned(iso, c->wsId),
                           Integer::New(iso, code)};
@@ -1034,6 +1080,7 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
   scb.onWsOpen = cbOnWsOpen;
   scb.onWsMessage = cbOnWsMessage;
   scb.onWsClose = cbOnWsClose;
+  scb.onWsRead = cbOnWsRead;
 
   js->server = new Server(loop, scb, limits);
   js->server->setDeferredNotify(g_notifyDeferred);
