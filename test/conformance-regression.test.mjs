@@ -376,4 +376,104 @@ describe('@morojs/engine regression conformance', { skip }, () => {
       });
     });
   });
+
+  // The epoll transport records ready sockets in the poll phase and serves
+  // them once per loop turn. libuv waits again within a turn whenever a wait
+  // fills its 1024-event buffer; with more ready sockets than that, each used
+  // to be queued once per wait and read that many times. They are now served
+  // a full buffer at a time, each socket once a turn. These prove that every
+  // one of them is still answered, with its own reply, turn after turn.
+  describe('more ready sockets than one poll reports', () => {
+    const net = () => import('node:net');
+    const N = 1500;
+    const big = process.platform === 'linux' ? false : 'needs a few thousand descriptors; run on Linux (the epoll transport)';
+
+    // In waves well under the listen backlog: a burst of connects larger than
+    // the accept queue is the kernel's to drop or reset, which is not what
+    // these are about.
+    async function connectAll(port) {
+      const { default: netMod } = await net();
+      const socks = [];
+      while (socks.length < N) {
+        const wave = Math.min(200, N - socks.length);
+        socks.push(...(await Promise.all(
+          Array.from({ length: wave }, () => new Promise((resolve, reject) => {
+            const s = netMod.connect(port, '127.0.0.1');
+            s.buf = '';
+            s.setEncoding('latin1');
+            s.on('data', (d) => { s.buf += d; });
+            s.on('error', reject);
+            s.once('connect', () => resolve(s));
+          }))
+        )));
+      }
+      return socks;
+    }
+    // One request on every socket in the same tick, so the server's next
+    // wait finds all of them readable; resolves once each holds one reply.
+    async function round(socks, tag) {
+      for (const s of socks) s.buf = '';
+      socks.forEach((s, i) => s.write(`GET /${tag}/${i} HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`));
+      const deadline = Date.now() + 20000;
+      while (socks.some((s) => parseResponses(s.buf).length < 1)) {
+        if (Date.now() > deadline) assert.fail(`${socks.filter((s) => parseResponses(s.buf).length < 1).length} of ${N} sockets were never answered`);
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      socks.forEach((s, i) => {
+        const all = parseResponses(s.buf);
+        assert.equal(all.length, 1, `socket ${i} got ${all.length} replies`);
+        assert.equal(all[0].status, 200);
+        assert.equal(all[0].body, `/${tag}/${i}`);
+      });
+    }
+
+    it(`${N} sockets readable at once are each answered once, over repeated turns`, { ...T, skip: big }, async () => {
+      await withServer((ctx) => ctx.respond(200, ['content-type', 'text/plain'], ctx.path), async ({ port }) => {
+        const socks = await connectAll(port);
+        try {
+          await round(socks, 'a');
+          await round(socks, 'b');
+          await round(socks, 'c');
+        } finally {
+          for (const s of socks) s.destroy();
+        }
+      });
+    });
+
+    it(`${N} sockets readable at once with replies sent later from timers`, { ...T, skip: big }, async () => {
+      const later = (ctx) => { const path = ctx.path; setTimeout(() => ctx.respond(200, ['content-type', 'text/plain'], path), 5); };
+      await withServer(later, async ({ port }) => {
+        const socks = await connectAll(port);
+        try {
+          await round(socks, 'x');
+          await round(socks, 'y');
+        } finally {
+          for (const s of socks) s.destroy();
+        }
+      });
+    });
+
+    it('a socket that sends again while its turn is being served is answered at the next', { ...T, skip: big }, async () => {
+      // Each socket pipelines a second request a moment after the first, while
+      // the server is still working through the first wave.
+      await withServer((ctx) => ctx.respond(200, ['content-type', 'text/plain'], ctx.path), async ({ port }) => {
+        const socks = await connectAll(port);
+        try {
+          socks.forEach((s, i) => s.write(`GET /p/${i} HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`));
+          await new Promise((r) => setImmediate(r));
+          socks.forEach((s, i) => s.write(`GET /q/${i} HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`));
+          const deadline = Date.now() + 20000;
+          while (socks.some((s) => parseResponses(s.buf).length < 2)) {
+            if (Date.now() > deadline) assert.fail('not every socket received both replies');
+            await new Promise((r) => setTimeout(r, 10));
+          }
+          socks.forEach((s, i) => {
+            assert.deepEqual(parseResponses(s.buf).map((r) => r.body), [`/p/${i}`, `/q/${i}`]);
+          });
+        } finally {
+          for (const s of socks) s.destroy();
+        }
+      });
+    });
+  });
 });

@@ -175,6 +175,9 @@ struct EpollConn {
   bool eofSeen;         // EOF/error already routed once
   bool inFlush;         // epollFlush is on the stack (re-entrant queueWrite just enqueues)
   bool completionPending;  // fully-sent WriteReqs wait for epollCompleteWrites (clean stack)
+  bool readyQueued;     // already on EpollLoop::ready for this turn (see deferReady)
+  int readyEvents;      // the events reported for it this turn, OR-ed
+  uint32_t servedTurn;  // EpollLoop::iteration when it was last served (one service per loop turn)
   size_t pendingBytes;  // queued write bytes the kernel has not accepted
   void* wqHead;         // WriteReq* queue (intrusive, FIFO; WriteReq::next / sent)
   void* wqTail;
@@ -3368,11 +3371,7 @@ class Server {
     bool checkClosed = false;
     int emfileFd = -1;
     std::vector<Connection*> completions;  // fully-sent queued writes to complete
-    struct Ready {
-      Connection* c;
-      int events;
-    };
-    std::vector<Ready> ready;  // sockets the poll phase reported this turn; served by serve()
+    std::vector<Connection*> ready;  // sockets the poll phase reported this turn, each once; served by serve()
     unsigned groups = 1;       // peer-CPU groups seen so far (max peerCpu + 2, -1 being a group)
     unsigned turn = 0;         // serve() calls; the group that goes first rotates with it
 
@@ -3536,9 +3535,45 @@ class Server {
       completions.push_back(c);
       armCheck();
     }
+    // One service per socket per loop turn. The watchers are level-triggered
+    // and the poll phase only records what it is told, so a socket reported
+    // once is reported again by every further epoll_wait of the same turn -
+    // and libuv waits again, up to 48 times, whenever a wait fills its event
+    // buffer. A loop with more ready sockets than that buffer holds used to
+    // queue each of them once per wait and recv() it that many times, all but
+    // the first for EAGAIN: a dozen wasted system calls per request at 4096
+    // connections on one loop, and the kernel re-polling a thousand sockets
+    // per wait to say so.
+    //
+    // So the turn's sockets are served as soon as a full buffer's worth has
+    // been recorded, which is exactly when libuv is about to wait again: the
+    // next wait then reports only what is new. And a socket already served in
+    // this turn is not queued a second time, whatever reports it: its report
+    // is either stale or about bytes that arrived since, and level-triggered
+    // readiness repeats the second kind at the next turn. Repeated reports of
+    // a socket still waiting for its service are OR-ed into its one entry.
+    static constexpr size_t kPollBatch = 1024;  // libuv's epoll event buffer (uv__io_poll)
+    uint32_t iteration = 1;  // the loop turn being served; advanced by settle()
     void deferReady(Connection* c, int events) {
-      ready.push_back({c, events});
+      // The check is armed for every report, the set-aside ones included: the
+      // turn then always ends in settle(), which advances `iteration`, so a
+      // socket is never left waiting on a turn that does not end.
       armCheck();
+      if (c->ep.servedTurn == iteration) return;
+      c->ep.readyEvents |= events;
+      if (c->ep.readyQueued) return;
+      c->ep.readyQueued = true;
+      ready.push_back(c);
+      if (ready.size() >= kPollBatch) serve();
+    }
+    // The turn's events for a queued socket, taken as it is served: the entry
+    // is spent and the socket is done for this turn.
+    int takeReady(Connection* c) const {
+      const int events = c->ep.readyEvents;
+      c->ep.readyEvents = 0;
+      c->ep.readyQueued = false;
+      c->ep.servedTurn = iteration;
+      return events;
     }
     static void onCheck(uv_check_t* h) { static_cast<EpollLoop*>(h->data)->settle(); }
 
@@ -3556,24 +3591,21 @@ class Server {
     // turn to turn, so no peer is always the last to be answered.
     void serve() {
       if (ready.empty()) return;
-      std::vector<Ready> list;
+      std::vector<Connection*> list;
       list.swap(ready);
       tune(list.size());
-      if (order == Order::Arrival) {
-        for (const Ready& r : list) {
-          if (r.c->ep.state < 2) r.c->server->epollOnConn(r.c, r.events);
-        }
-        return;
+      if (order == Order::Grouped) {
+        const unsigned n = groups, rot = turn++ % n;
+        const auto key = [n, rot](const Connection* c) { return (static_cast<unsigned>(c->ep.peerCpu + 1) + rot) % n; };
+        std::sort(list.begin(), list.end(), [&key](const Connection* a, const Connection* b) {
+          const unsigned ka = key(a), kb = key(b);
+          if (ka != kb) return ka < kb;
+          return a->ep.fd < b->ep.fd;
+        });
       }
-      const unsigned n = groups, rot = turn++ % n;
-      const auto key = [n, rot](const Ready& r) { return (static_cast<unsigned>(r.c->ep.peerCpu + 1) + rot) % n; };
-      std::sort(list.begin(), list.end(), [&key](const Ready& a, const Ready& b) {
-        const unsigned ka = key(a), kb = key(b);
-        if (ka != kb) return ka < kb;
-        return a.c->ep.fd < b.c->ep.fd;
-      });
-      for (const Ready& r : list) {
-        if (r.c->ep.state < 2) r.c->server->epollOnConn(r.c, r.events);
+      for (Connection* c : list) {
+        const int events = takeReady(c);
+        if (c->ep.state < 2) c->server->epollOnConn(c, events);
       }
     }
 
@@ -3587,6 +3619,7 @@ class Server {
         uv_check_stop(&check);
       }
       serve();
+      if (++iteration == 0) iteration = 1;  // what is reported from here on belongs to the next turn (0 marks a socket never served)
       for (int pass = 0; pass < 64 && !completions.empty(); pass++) {
         std::vector<Connection*> list;
         list.swap(completions);
