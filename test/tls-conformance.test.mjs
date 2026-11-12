@@ -237,12 +237,13 @@ describe('@morojs/engine TLS conformance', { skip }, () => {
     await withTlsServer(ok, ssl(), async (server1) => {
       await withTlsServer(ok, ssl(), async (server2) => {
         // Full handshake against server 1; capture the ticket. TLS 1.3
-        // delivers NewSessionTicket after the handshake, so wait for the
+        // delivers NewSessionTicket after the handshake - with the first
+        // response, on BoringSSL - so make a request and wait for the
         // 'session' event, not just secureConnect.
         const c1 = await openRawTls(server1.port);
         let session;
         try {
-          session = await c1.waitSession();
+          session = await c1.waitSession(GET());
         } finally {
           c1.destroy();
         }
@@ -269,7 +270,7 @@ describe('@morojs/engine TLS conformance', { skip }, () => {
             const c1 = await openRawTls(server1.port);
             let session;
             try {
-              session = await c1.waitSession();
+              session = await c1.waitSession(GET());
             } finally {
               c1.destroy();
             }

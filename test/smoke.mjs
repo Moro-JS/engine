@@ -8,7 +8,26 @@ import assert from 'assert';
 import https from 'node:https';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import engine, { probe } from '../packages/engine/index.mjs';
+
+// Two binaries ship per platform and ABI - BoringSSL inside, or node's
+// OpenSSL - and a process loads one, so each is smoked in a child of its own.
+// A run that names a library or a binary (MORO_ENGINE_TLS, MORO_ENGINE_BINARY)
+// smokes just that one.
+if (!process.env.MORO_ENGINE_TLS && !process.env.MORO_ENGINE_BINARY) {
+  for (const library of ['boringssl', 'openssl']) {
+    const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url)], {
+      stdio: 'inherit',
+      env: { ...process.env, MORO_ENGINE_TLS: library },
+    });
+    if (r.status !== 0) {
+      console.error(`smoke FAILED for the ${library} binary`);
+      process.exit(r.status ?? 1);
+    }
+  }
+  process.exit(0);
+}
 
 const result = probe();
 console.log('probe():', result);
@@ -17,6 +36,9 @@ assert.strictEqual(result.ok, true, `engine failed to load: ${result.error}`);
 assert.strictEqual(String(result.abi), String(process.versions.modules), 'ABI mismatch');
 assert.strictEqual(result.platform, process.platform);
 assert.ok(engine.version, 'version export missing');
+if (process.env.MORO_ENGINE_TLS === 'boringssl' || process.env.MORO_ENGINE_TLS === 'openssl') {
+  assert.strictEqual(result.tls?.library, process.env.MORO_ENGINE_TLS, 'the binary loaded is not the TLS library asked for');
+}
 
 // Every published binary is built with the V8 fast-call targets, and on a
 // host whose V8 matches the compiled one they must be installed. The smoke
@@ -62,4 +84,6 @@ if (result.capabilities?.tls) {
   console.log('tls smoke OK');
 }
 
-console.log(`smoke OK - @morojs/engine ${engine.version} on Node ${process.versions.node} (ABI ${process.versions.modules})`);
+console.log(
+  `smoke OK - @morojs/engine ${engine.version} on Node ${process.versions.node} (ABI ${process.versions.modules}), TLS: ${result.tls?.library} ${result.tls?.version}`
+);

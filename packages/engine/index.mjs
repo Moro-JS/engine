@@ -25,6 +25,8 @@ export default engine;
 
 // probe() lives on the loader itself (never loads the binding) - safe to alias.
 export const probe = engine.probe;
+// selectTls() is the loader's too: it decides which binary gets loaded.
+export const selectTls = engine.selectTls;
 
 export let serve = (...a) => (serve = engine.serve)(...a);
 export let listen = (...a) => (listen = engine.listen)(...a);

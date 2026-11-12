@@ -10,6 +10,7 @@
 #include <uv.h>
 #include <v8.h>
 
+#include <atomic>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
@@ -948,6 +949,37 @@ static bool buildTlsContext(Isolate* iso, const SslConfig& ssl, TlsContext& out)
   return true;
 }
 
+// Would this binary's TLS library take these ssl options? Returns "" when a
+// context can be built from them, otherwise the message serve() would throw.
+// The loader asks before it commits a thread to this binary: a configuration
+// the bundled BoringSSL has no support for (a key type, a cipher suite, a
+// group) is then served by the binary on node's OpenSSL instead of failing an
+// app that ran on 1.1.19. Builds a context and throws it away; never throws.
+// Not part of the API.
+static void TlsCheck(const FunctionCallbackInfo<Value>& args) {
+  Isolate* iso = args.GetIsolate();
+  Local<Context> ctx = iso->GetCurrentContext();
+  std::string problem;
+  if (args.Length() >= 1 && args[0]->IsObject()) {
+    v8::TryCatch tc(iso);
+    SslConfig ssl;
+    TlsContext scratch;
+    if (!parseSslOptions(iso, ctx, args[0].As<Object>(), ssl) ||
+        !buildTlsContext(iso, ssl, scratch)) {
+      problem = "the ssl options were not accepted";
+      Local<Value> message;
+      if (tc.HasCaught() && tc.Exception()->IsObject() &&
+          tc.Exception().As<Object>()->Get(ctx, str(iso, "message")).ToLocal(&message) &&
+          message->IsString()) {
+        String::Utf8Value text(iso, message);
+        if (*text) problem.assign(*text, text.length());
+      }
+      tc.Reset();
+    }
+  }
+  args.GetReturnValue().Set(str(iso, problem));
+}
+
 static void Serve(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
   Local<Context> ctx = iso->GetCurrentContext();
@@ -1863,6 +1895,14 @@ static void GetPath(const FunctionCallbackInfo<Value>& args) {
 
 // ---- diagnostics ----
 
+// True for the first caller in the process, false for every other (any
+// thread). The loader uses it so the one notice about an old bundled TLS
+// library is printed once, not once per worker thread. Not part of the API.
+static void TlsAgeNoticeOnce(const FunctionCallbackInfo<Value>& args) {
+  static std::atomic<bool> noticed{false};
+  args.GetReturnValue().Set(!noticed.exchange(true, std::memory_order_relaxed));
+}
+
 static void Probe(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
   Local<Context> ctx = iso->GetCurrentContext();
@@ -1939,6 +1979,15 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   // getBodyLent(): the body as an ArrayBuffer released with the request.
   setCap("bodyLent", true);
   set("capabilities", caps);
+  // The TLS library this binary terminates TLS with: "boringssl" (carried in
+  // the addon; `version` is the upstream tag it was pinned to) or "openssl"
+  // (the host node's; `version` is that library's own).
+  {
+    Local<Object> tls = Object::New(iso);
+    (void)tls->Set(ctx, str(iso, "library"), str(iso, tlsLibraryName())).FromMaybe(false);
+    (void)tls->Set(ctx, str(iso, "version"), str(iso, tlsLibraryVersion())).FromMaybe(false);
+    set("tls", tls);
+  }
   set("notify", str(iso, g_notifyDeferred ? "deferred" : "sync"));
   // I/O transport in use on this host: 'uring' (Linux, io_uring usable) or
   // 'uv' (libuv streams), with the reason when it is not uring.
@@ -2041,6 +2090,9 @@ static const ExportDef kExports[] = {
     {"wsGetQuery", WsGetQuery, nullptr, nullptr},
     {"wsGetRemoteAddress", WsGetRemoteAddress, nullptr, nullptr},
     {"probe", Probe, nullptr, nullptr},
+    // Loader-internal (leading underscore: not in NATIVE_API, not typed).
+    {"_tlsAgeNoticeOnce", TlsAgeNoticeOnce, nullptr, nullptr},
+    {"_tlsCheck", TlsCheck, nullptr, nullptr},
 };
 #undef MORO_FAST
 

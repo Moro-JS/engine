@@ -157,7 +157,7 @@ describe('@morojs/engine TLS reload (updateSsl)', { skip }, () => {
     });
     try {
       const first = await openRawTls(server.port);
-      const session = await first.waitSession();
+      const session = await first.waitSession(GET());
       first.destroy();
       assert.ok(session, 'server issued a session ticket');
 

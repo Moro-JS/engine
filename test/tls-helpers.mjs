@@ -32,10 +32,10 @@ export function sslInlineOptions() {
 /**
  * Open a raw TLS client to 127.0.0.1:port, trusting the fixture CA.
  * Resolves (after the handshake) to the raw-client contract plus `.socket`
- * for alpnProtocol/authorized inspection, plus `.waitSession()` which
+ * for alpnProtocol/authorized inspection, plus `.waitSession(request?)` which
  * resolves with the first session ticket the server delivers (TLS 1.3 sends
  * NewSessionTicket AFTER the handshake, so the listener is attached before
- * connecting to make the capture race-free).
+ * connecting to make the capture race-free; pass a request to make first).
  *
  * opts: { alpnProtocols?, servername = 'localhost', rejectUnauthorized = true,
  *         ca?, session? (a previously captured ticket, to attempt resumption),
@@ -54,7 +54,18 @@ export async function openRawTls(port, opts = {}) {
   });
   const firstSession = new Promise((resolve) => socket.once('session', resolve));
   const client = await wrapRawSocket(socket, 'secureConnect');
-  client.waitSession = () => firstSession;
+  // `request`: bytes of one request to make first. The ticket travels with
+  // the first thing the server writes after the handshake: OpenSSL sends it
+  // on the handshake's heels, BoringSSL keeps it for the first response (one
+  // packet where there would be two), so a test that needs the ticket from
+  // either library asks for something.
+  client.waitSession = async (request) => {
+    if (request) {
+      await client.send(request);
+      await client.read();
+    }
+    return firstSession;
+  };
   return client;
 }
 

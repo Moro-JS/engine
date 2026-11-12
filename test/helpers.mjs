@@ -46,6 +46,14 @@ export async function loadEngine() {
       );
     }
   }
+  // Same idea for the TLS library: a lane that means to test one binary must
+  // not pass on the other because the loader quietly fell back to it.
+  const requiredTls = process.env.MORO_ENGINE_REQUIRE_TLS;
+  if (requiredTls && info.tls?.library !== requiredTls) {
+    throw new Error(
+      `MORO_ENGINE_REQUIRE_TLS=${requiredTls} but the engine loaded '${info.tls?.library}' (${info.tls?.reason}${info.tls?.fallbackReason ? `: ${info.tls.fallbackReason}` : ''})`
+    );
+  }
   return engine;
 }
 

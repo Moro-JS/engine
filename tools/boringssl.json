@@ -1,0 +1,5 @@
+{
+  "repository": "https://boringssl.googlesource.com/boringssl",
+  "tag": "0.20261105.0",
+  "commit": "3dc4b63808921e914a3fb1fa61869abc3938781b"
+}

@@ -12,6 +12,13 @@
 //   node tools/build.mjs --abi 137       # build one specific ABI
 //   node tools/build.mjs --arch x64      # cross-target arch (darwin only)
 //   node tools/build.mjs --sanitize      # ASan/UBSan debug build (CI sanitizer job)
+//   node tools/build.mjs --tls=openssl   # only the binary that links Node's OpenSSL
+//   node tools/build.mjs --tls=boringssl # only the binary that carries BoringSSL
+//
+// Two binaries per ABI (--tls=all, the default). `..._<abi>.node` links the
+// OpenSSL the host node exports, as every binary did up to 1.1.19.
+// `..._<abi>_boringssl.node` carries BoringSSL (tools/boringssl.mjs: pinned,
+// fetched, built once per platform and cached) and is what the loader prefers.
 //
 // Raw-V8 bindings are ABI-specific by design (maximum perf), so a
 // new Node release = one line added to TARGETS + a CI run.
@@ -24,6 +31,7 @@ import { get } from 'https';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import os from 'os';
+import { ensureBoringSsl } from './boringssl.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const buildDir = join(root, 'build');
@@ -83,6 +91,8 @@ function parseArgs(argv) {
     // build must not replace the shippable one; the loader can be pointed at
     // it with MORO_ENGINE_BINARY).
     outDir: buildDir,
+    // Which TLS library the binary is built against: openssl | boringssl | all.
+    tls: process.env.MORO_BUILD_TLS || 'all',
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -98,10 +108,14 @@ function parseArgs(argv) {
     else if (key === '--pgo-dir') args.pgoDir = val ?? argv[++i];
     else if (key === '--pgo-profile') args.pgoProfile = val ?? argv[++i];
     else if (key === '--out-dir') args.outDir = val ?? argv[++i];
+    else if (key === '--tls') args.tls = val ?? argv[++i];
     else throw new Error(`unknown argument: ${a}`);
   }
   if (args.pgo && !['generate', 'use'].includes(args.pgo)) {
     throw new Error(`--pgo must be "generate" or "use", got "${args.pgo}"`);
+  }
+  if (!['openssl', 'boringssl', 'all'].includes(args.tls)) {
+    throw new Error(`--tls must be "openssl", "boringssl" or "all", got "${args.tls}"`);
   }
   if (args.pgo === 'use' && !args.pgoProfile) {
     throw new Error('--pgo=use requires --pgo-profile=<file.profdata|.pgd>');
@@ -259,9 +273,11 @@ function which(bin) {
   }
 }
 
-function compile({ includeDir, abi, arch, sanitize, libFile = null, fastApi = false, pgo = '', pgoDir = '', pgoProfile = '', outDir = buildDir }) {
+// `bssl` is what ensureBoringSsl() returned for the BoringSSL binary, null for
+// the one that links the host node's OpenSSL.
+function compile({ includeDir, abi, arch, sanitize, libFile = null, fastApi = false, pgo = '', pgoDir = '', pgoProfile = '', outDir = buildDir, bssl = null }) {
   mkdirSync(outDir, { recursive: true });
-  const output = join(outDir, `moro_engine_${platform}_${arch}${libcTag()}_${abi}.node`);
+  const output = join(outDir, `moro_engine_${platform}_${arch}${libcTag()}_${abi}${bssl ? '_boringssl' : ''}.node`);
   const sources = [join(root, 'src', 'binding.cpp')];
 
   // Profile-guided optimisation (clang spelling; tools/pgo.mjs drives the
@@ -298,6 +314,13 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null, fastApi = fa
         '-g',
         '-fno-omit-frame-pointer',
         '-fsanitize=address,undefined',
+        // Not the vptr check: it reads the type info behind an object's
+        // vtable, and node is built without RTTI. A std::shared_ptr control
+        // block for a v8::BackingStore has the same mangled vtable name here
+        // and inside node, the dynamic linker binds ours to node's copy, and
+        // every copy of such a pointer is then reported as "invalid vptr".
+        // The engine has no class hierarchy of its own for the check to guard.
+        '-fno-sanitize=vptr',
         '-fno-sanitize-recover=all',
       ]
     : [
@@ -330,6 +353,11 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null, fastApi = fa
     // nothing, and memchr/memcpy/memcmp run on every request.
     ...(!sanitize && platform === 'linux' ? ['-fno-plt'] : []),
     '-fvisibility=hidden',
+    // BoringSSL's <openssl/...> must be found before the copies of OpenSSL's
+    // headers that sit in the Node include directory.
+    // The version is passed as a bare token (src/tls.h stringifies it): no
+    // quoting to get right on three command lines.
+    ...(bssl ? [`-I${bssl.includeDir}`, `-DMORO_BORINGSSL_VERSION=${bssl.tag}`] : []),
     `-I${includeDir}`,
     '-DBUILDING_NODE_EXTENSION',
     // V8 fast-call targets (src/fast_api.h) compile in only when the per-tag
@@ -362,6 +390,9 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null, fastApi = fa
       `${arch === 'arm64' ? 'arm64' : 'x86_64'}-apple-macos12`,
       '-isysroot',
       sdk,
+      // The libraries are compiled with hidden visibility, so their symbols
+      // are bound inside the bundle at link time and none is exported.
+      ...(bssl ? [...bssl.libs, '-Wl,-dead_strip'] : []),
     ];
   } else if (platform === 'linux') {
     cmd = tc.cxx;
@@ -374,6 +405,14 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null, fastApi = fa
       // Linker hardening: read-only relocations, immediate binding, NX stack.
       '-Wl,-z,relro,-z,now',
       '-Wl,-z,noexecstack',
+      // BoringSSL inside the addon. --exclude-libs keeps every symbol of the
+      // archives out of the dynamic symbol table: the host node exports
+      // OpenSSL under the same names, and a reference that went through the
+      // dynamic linker would bind to node's copy. Unused code is dropped, and
+      // so is the debug info upstream's build always emits (12 MB of it).
+      ...(bssl
+        ? [...bssl.libs, '-Wl,--exclude-libs,ALL', '-Wl,--gc-sections', ...(sanitize ? [] : ['-Wl,--strip-debug']), '-pthread']
+        : []),
     ];
   } else if (platform === 'win32') {
     if (sanitize) {
@@ -410,6 +449,7 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null, fastApi = fa
       ...(fastApi ? ['/DMORO_FAST_API=1'] : []),
       '/DNOMINMAX',
       '/DWIN32_LEAN_AND_MEAN',
+      ...(bssl ? [`/I${bssl.includeDir}`, `/DMORO_BORINGSSL_VERSION=${bssl.tag}`] : []),
       `/I${includeDir}`,
       '/LD',
       ...sources,
@@ -425,6 +465,10 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null, fastApi = fa
       '/HIGHENTROPYVA',
       '/NXCOMPAT',
       '/DELAYLOAD:node.exe',
+      // Listed before node.lib: the linker takes each SSL_*/EVP_* reference
+      // from the first library that defines it, and node.lib (the import
+      // library for node.exe's OpenSSL) defines the same names.
+      ...(bssl ? [...bssl.libs, 'ws2_32.lib', 'advapi32.lib'] : []),
       libFile,
       'delayimp.lib',
       `/OUT:${output}`,
@@ -470,18 +514,21 @@ async function main() {
     } else {
       console.log('  fast API calls: disabled (--no-fast-api / MORO_FAST_API=0)');
     }
-    compile({
-      includeDir,
-      abi: target.abi,
-      arch: args.arch,
-      sanitize: args.sanitize,
-      libFile,
-      fastApi,
-      pgo: args.pgo,
-      pgoDir: args.pgoDir,
-      pgoProfile: args.pgoProfile,
-      outDir: args.outDir,
-    });
+    for (const tls of args.tls === 'all' ? ['openssl', 'boringssl'] : [args.tls]) {
+      compile({
+        includeDir,
+        abi: target.abi,
+        arch: args.arch,
+        sanitize: args.sanitize,
+        libFile,
+        fastApi,
+        pgo: args.pgo,
+        pgoDir: args.pgoDir,
+        pgoProfile: args.pgoProfile,
+        outDir: args.outDir,
+        bssl: tls === 'boringssl' ? ensureBoringSsl({ arch: args.arch, cxx: platform === 'win32' ? null : toolchain().cxx }) : null,
+      });
+    }
   }
   console.log('done');
 }

@@ -29,6 +29,9 @@ const all = (re, text, group = 1) => {
   return out;
 };
 const uniq = (a) => [...new Set(a)];
+// Served by the loader itself (never load the binding), and binding rows the
+// loader uses internally (leading underscore): neither is "native API".
+const loaderOnly = (n) => n !== 'probe' && n !== 'selectTls' && !n.startsWith('_');
 
 // ---- native function exports ------------------------------------------------
 
@@ -38,18 +41,16 @@ const uniq = (a) => [...new Set(a)];
 const bindingFns = uniq([
   ...all(/NODE_SET_METHOD\(exports,\s*"(\w+)"/g, binding),
   ...all(/^\s*\{"(\w+)",\s*[A-Za-z_]\w*/gm, binding.slice(binding.indexOf('kExports[]') === -1 ? binding.length : binding.indexOf('kExports[]'))),
-]).filter((n) => n !== 'probe'); // probe is served by the loader itself
+]).filter(loaderOnly);
 
 const nativeApiBlock = loaderJs.slice(loaderJs.indexOf('const NATIVE_API = new Set(['));
 const nativeApi = uniq(all(/'(\w+)'/g, nativeApiBlock.slice(0, nativeApiBlock.indexOf('])'))));
 
-const mjsExports = uniq(all(/^export (?:const|let) (\w+) =/gm, loaderMjs)).filter((n) => n !== 'probe');
+const mjsExports = uniq(all(/^export (?:const|let) (\w+) =/gm, loaderMjs)).filter(loaderOnly);
 
-const dtsFns = uniq(all(/^export function (\w+)\(/gm, dts)).filter((n) => n !== 'probe');
+const dtsFns = uniq(all(/^export function (\w+)\(/gm, dts)).filter(loaderOnly);
 const declareBlock = dts.slice(dts.indexOf('declare const engine: {'));
-const dtsDeclared = uniq(all(/^\s+(\w+): typeof \w+;/gm, declareBlock.slice(0, declareBlock.indexOf('};')))).filter(
-  (n) => n !== 'probe'
-);
+const dtsDeclared = uniq(all(/^\s+(\w+): typeof \w+;/gm, declareBlock.slice(0, declareBlock.indexOf('};')))).filter(loaderOnly);
 
 // ---- capability flags ---------------------------------------------------------
 

@@ -86,6 +86,27 @@ export interface FastApiInfo {
   runtimeV8: string;
 }
 
+/** The TLS library the loaded binary terminates TLS with, and why that binary. */
+export interface EngineTlsInfo {
+  /** 'boringssl': carried inside the addon (the default since 1.1.20).
+   *  'openssl': the OpenSSL the running node exports. */
+  library: 'boringssl' | 'openssl';
+  /** BoringSSL: the upstream version tag the build is pinned to
+   *  (`0.YYYYMMDD.N`). OpenSSL: that library's own version, e.g. '3.5.2'. */
+  version: string;
+  /** BoringSSL only: the day upstream cut that snapshot, 'YYYY-MM-DD' - how
+   *  old the bundled TLS code is. */
+  date?: string;
+  /** Why this library: 'default', 'selectTls()', 'MORO_ENGINE_TLS',
+   *  "node's OpenSSL is configured (...)" (FIPS mode, an OpenSSL config or
+   *  provider option), 'fallback' (the BoringSSL binary could not be loaded,
+   *  or BoringSSL did not accept the TLS configuration), or
+   *  'MORO_ENGINE_BINARY'. */
+  reason: string;
+  /** With reason 'fallback': why BoringSSL is not the one serving. */
+  fallbackReason?: string;
+}
+
 export interface EngineProbeResult {
   /** True when a native binary loaded for this platform/ABI */
   ok: boolean;
@@ -103,6 +124,8 @@ export interface EngineProbeResult {
   notify?: 'deferred' | 'sync';
   /** Fast-call build/install diagnostics. */
   fastApi?: FastApiInfo;
+  /** TLS library in use (1.1.20 and later). */
+  tls?: EngineTlsInfo;
   /** I/O transport in use: 'epoll' (Linux default since 1.1.10: the engine's
    *  own readiness loop on one uv_poll, no libuv stream per connection),
    *  'uring' (Linux 6.1+, MORO_ENGINE_TRANSPORT=uring, when the sandbox
@@ -255,8 +278,13 @@ export interface ServeOptions {
     rejectUnauthorized?: boolean;
     /** Explicit cipher/group policy for compliance baselines (PCI/FIPS/hardened
      *  profiles; feature-detect via probe().capabilities.tlsPolicy). Same
-     *  semantics as Node's tls.createSecureContext; unset = the host Node's
-     *  OpenSSL defaults; invalid values THROW from serve(). */
+     *  semantics as Node's tls.createSecureContext; invalid values THROW from
+     *  serve(). Unset: the TLS library's own set of ciphers, AES-128-GCM ahead
+     *  of AES-256-GCM, ChaCha20 for a client that lists it first. With the
+     *  bundled BoringSSL (probe().tls.library) `ciphersuites` can name
+     *  TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and
+     *  TLS_CHACHA20_POLY1305_SHA256, and `ciphers` has no DHE or CCM suites;
+     *  a policy that needs others selects OpenSSL (selectTls / MORO_ENGINE_TLS). */
     ciphers?: string; // TLS <= 1.2 cipher list
     ciphersuites?: string; // TLS 1.3 suites (colon-separated)
     ecdhCurve?: string; // key-share groups, e.g. 'X25519:P-256'; 'auto' = default
@@ -490,6 +518,36 @@ export function wsGetRemoteAddress(wsId: number): string | undefined;
 
 /** Non-throwing load diagnostics. Never throws. */
 export function probe(): EngineProbeResult;
+/**
+ * Choose the TLS library before the engine's binary is loaded. Returns the
+ * library in effect.
+ *
+ * - 'boringssl': BoringSSL, carried inside the addon. The default.
+ * - 'openssl': the OpenSSL of the running node - for FIPS mode, OpenSSL
+ *   providers or engines, a system crypto policy.
+ * - 'auto': no choice made in code. MORO_ENGINE_TLS decides if it is set;
+ *   otherwise BoringSSL, unless node's OpenSSL is specially configured
+ *   (--enable-fips, --force-fips, --openssl-config, --openssl-shared-config,
+ *   --openssl-legacy-provider, OPENSSL_CONF, OPENSSL_MODULES, or FIPS mode on),
+ *   in which case OpenSSL.
+ *
+ * The choice is per thread and must be made before the first probe() or
+ * serve() there: a loaded addon cannot be swapped, and asking for the other
+ * library afterwards throws (code 'MORO_ENGINE_TLS_LOADED'). The environment
+ * variable MORO_ENGINE_TLS takes the same three values and needs no code.
+ *
+ * `ssl`: the ssl options the server is about to be created with. When no
+ * library is named ('auto', no MORO_ENGINE_TLS), the load checks that
+ * BoringSSL accepts them - its set of key types, cipher suites and groups is
+ * narrower than OpenSSL's - and settles on OpenSSL when it does not
+ * (probe().tls: reason 'fallback'). Without it, serve() makes the same move
+ * for the first TLS server of a thread, as long as no other native function
+ * has been taken from the module yet.
+ */
+export function selectTls(
+  library: 'boringssl' | 'openssl' | 'auto',
+  ssl?: ServeOptions['ssl']
+): 'boringssl' | 'openssl' | 'auto';
 // The engine version comes from this package's package.json (stamped from the
 // release tag), available without loading the addon via `probe().version` or on
 // the default export as `engine.version` — neither forces the native addon to
@@ -536,6 +594,7 @@ declare const engine: {
   wsGetQuery: typeof wsGetQuery;
   wsGetRemoteAddress: typeof wsGetRemoteAddress;
   probe: typeof probe;
+  selectTls: typeof selectTls;
   version: string;
 };
 

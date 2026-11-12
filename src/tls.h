@@ -21,13 +21,18 @@
 
 #pragma once
 
+#include <openssl/ssl.h>
+#ifdef OPENSSL_IS_BORINGSSL
+#include <openssl/aead.h>
+#include <openssl/hmac.h>
+#else
 #include <openssl/core_names.h>
+#include <openssl/params.h>
+#endif
 #include <openssl/err.h>
 #include <openssl/evp.h>
-#include <openssl/params.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
-#include <openssl/ssl.h>
 #include <openssl/x509.h>
 
 #include <algorithm>
@@ -39,6 +44,30 @@
 
 namespace moro {
 namespace engine {
+
+// Which TLS library this binary is built against. Two binaries ship per
+// platform and ABI: one links the OpenSSL the host node exports, the other
+// carries BoringSSL inside the addon (tools/boringssl.mjs pins and builds it).
+// Both speak OpenSSL's API; the few places where they differ are marked
+// OPENSSL_IS_BORINGSSL in this file, and nowhere else in the engine.
+#ifdef OPENSSL_IS_BORINGSSL
+#define MORO_TLS_STR2(x) #x
+#define MORO_TLS_STR(x) MORO_TLS_STR2(x)
+inline const char* tlsLibraryName() { return "boringssl"; }
+// The upstream version tag the build was pinned to, `0.YYYYMMDD.N`: its date
+// is how old the bundled TLS code is.
+inline const char* tlsLibraryVersion() {
+#ifdef MORO_BORINGSSL_VERSION
+  return MORO_TLS_STR(MORO_BORINGSSL_VERSION);
+#else
+  return "";
+#endif
+}
+#else
+inline const char* tlsLibraryName() { return "openssl"; }
+// The host's library, asked at run time: it is whatever this node carries.
+inline const char* tlsLibraryVersion() { return OpenSSL_version(OPENSSL_VERSION_STRING); }
+#endif
 
 // TLS options accepted from JS (serve() options.ssl). Both MoroJS shapes are
 // supported: file paths (key_file_name/cert_file_name) and inline
@@ -57,10 +86,11 @@ struct SslConfig {
   std::string passphrase;   // decrypts an encrypted private key
   std::string ticketKeys;   // 48-byte session-ticket key material (Node layout)
   // Optional explicit cipher/group policy for compliance baselines
-  // (PCI/FIPS/hardened profiles); empty = the host Node's OpenSSL defaults.
-  // Mirrors Node's tls.createSecureContext knobs of the same names.
+  // (PCI/FIPS/hardened profiles); empty = the engine's default order over the
+  // TLS library's own set. Mirrors Node's tls.createSecureContext knobs of the
+  // same names.
   std::string ciphers;      // TLS <= 1.2 cipher list (SSL_CTX_set_cipher_list)
-  std::string ciphersuites; // TLS 1.3 suites (SSL_CTX_set_ciphersuites)
+  std::string ciphersuites; // TLS 1.3 suites by IANA name, colon-separated
   std::string ecdhCurve;    // key-share groups (SSL_CTX_set1_groups_list); "auto" = default
   int minVersion = TLS1_2_VERSION;
   bool requestCert = false;         // ask the client for a certificate
@@ -168,6 +198,11 @@ class TlsContext {
     // callback that implements the 16/16/16 layout with AES-128-CBC +
     // HMAC-SHA256. Tickets minted here are wire-compatible across any two
     // engine servers sharing the keys.
+    // The callbacks that take no user-data argument (ticket keys, the
+    // ClientHello look) find this TlsContext through SSL_CTX app_data,
+    // re-aimed on move (see operator=).
+    SSL_CTX_set_app_data(ctx_, this);
+
     if (!cfg.ticketKeys.empty()) {
       if (cfg.ticketKeys.size() != 48) {
         // The binding validates length before Server construction; this is a
@@ -176,12 +211,18 @@ class TlsContext {
                "16-byte HMAC secret + 16-byte AES key, Node's layout)";
       }
       ticketKeys_ = cfg.ticketKeys;
-      // The callback has no user-data argument; it finds this TlsContext via
-      // SSL_CTX app_data (re-aimed on move, see operator=).
-      SSL_CTX_set_app_data(ctx_, this);
+#ifdef OPENSSL_IS_BORINGSSL
+      // The same callback and the same ticket format (AES-128-CBC,
+      // HMAC-SHA256); BoringSSL hands it an HMAC_CTX where OpenSSL 3 hands an
+      // EVP_MAC_CTX.
+      if (SSL_CTX_set_tlsext_ticket_key_cb(ctx_, ticketKeyCb) != 1) {
+        return sslError("SSL_CTX_set_tlsext_ticket_key_cb");
+      }
+#else
       if (SSL_CTX_set_tlsext_ticket_key_evp_cb(ctx_, ticketKeyCb) != 1) {
         return sslError("SSL_CTX_set_tlsext_ticket_key_evp_cb");
       }
+#endif
     }
 
     // Hardening baseline: TLS >= 1.2 (configurable floor), no renegotiation
@@ -199,16 +240,16 @@ class TlsContext {
                                SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
     // Optional explicit cipher/group policy (ssl.ciphers / ssl.ciphersuites /
-    // ssl.ecdhCurve). Unset, the host Node's OpenSSL defaults apply. Config
+    // ssl.ecdhCurve). Unset, the default order below applies. Config
     // errors are LOUD, same as bad key material - a server that silently
     // ignored its compliance profile would be worse than one that won't boot.
     if (!cfg.ciphers.empty() &&
         SSL_CTX_set_cipher_list(ctx_, cfg.ciphers.c_str()) != 1) {
       return sslError(("ssl.ciphers '" + cfg.ciphers + "' selects no cipher").c_str());
     }
-    if (!cfg.ciphersuites.empty() &&
-        SSL_CTX_set_ciphersuites(ctx_, cfg.ciphersuites.c_str()) != 1) {
-      return sslError(("ssl.ciphersuites '" + cfg.ciphersuites + "' is invalid").c_str());
+    if (!cfg.ciphersuites.empty()) {
+      std::string err = setTls13Suites(cfg.ciphersuites);
+      if (!err.empty()) return err;
     }
     // No explicit policy: the default set, with the 128-bit key first.
     if (cfg.ciphers.empty() && cfg.ciphersuites.empty()) preferAes128();
@@ -303,8 +344,25 @@ class TlsContext {
   //   enc=1: 1 = ticket built with these keys, -1 = error (no ticket).
   //   enc=0: 1 = key name matched, decrypt; 0 = foreign key name, fall back
   //          to a FULL handshake (never a hard failure); -1 = error.
+#ifdef OPENSSL_IS_BORINGSSL
+  using TicketMacCtx = HMAC_CTX;
+  static bool ticketMacInit(HMAC_CTX* hctx, const unsigned char* key) {
+    return HMAC_Init_ex(hctx, key, 16, EVP_sha256(), nullptr) == 1;
+  }
+#else
+  using TicketMacCtx = EVP_MAC_CTX;
+  static bool ticketMacInit(EVP_MAC_CTX* hctx, const unsigned char* key) {
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST,
+                                         const_cast<char*>("sha256"), 0),
+        OSSL_PARAM_construct_end(),
+    };
+    return EVP_MAC_init(hctx, key, 16, params) == 1;
+  }
+#endif
+
   static int ticketKeyCb(SSL* ssl, unsigned char* name, unsigned char* iv,
-                         EVP_CIPHER_CTX* ectx, EVP_MAC_CTX* hctx, int enc) {
+                         EVP_CIPHER_CTX* ectx, TicketMacCtx* hctx, int enc) {
     SSL_CTX* sslCtx = SSL_get_SSL_CTX(ssl);
     TlsContext* self =
         static_cast<TlsContext*>(sslCtx ? SSL_CTX_get_app_data(sslCtx) : nullptr);
@@ -314,22 +372,17 @@ class TlsContext {
     const unsigned char* keyName = keys;        // [0,16)  ticket key name
     const unsigned char* hmacKey = keys + 16;   // [16,32) HMAC-SHA256 secret
     const unsigned char* aesKey = keys + 32;    // [32,48) AES-128-CBC key
-    OSSL_PARAM params[] = {
-        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST,
-                                         const_cast<char*>("sha256"), 0),
-        OSSL_PARAM_construct_end(),
-    };
     if (enc) {
       memcpy(name, keyName, 16);
       // iv is an EVP_MAX_IV_LENGTH buffer; AES-128-CBC uses 16 of it.
       if (RAND_bytes(iv, 16) <= 0) return -1;
       if (EVP_EncryptInit_ex(ectx, EVP_aes_128_cbc(), nullptr, aesKey, iv) != 1)
         return -1;
-      if (EVP_MAC_init(hctx, hmacKey, 16, params) != 1) return -1;
+      if (!ticketMacInit(hctx, hmacKey)) return -1;
       return 1;
     }
     if (memcmp(name, keyName, 16) != 0) return 0;  // not ours: full handshake
-    if (EVP_MAC_init(hctx, hmacKey, 16, params) != 1) return -1;
+    if (!ticketMacInit(hctx, hmacKey)) return -1;
     if (EVP_DecryptInit_ex(ectx, EVP_aes_128_cbc(), nullptr, aesKey, iv) != 1)
       return -1;
     return 1;
@@ -364,26 +417,109 @@ class TlsContext {
   // The default cipher preference, applied when the app names none.
   //
   // The server picks the cipher (SSL_OP_CIPHER_SERVER_PREFERENCE), and
-  // OpenSSL's own order puts AES-256-GCM ahead of AES-128-GCM, so every
-  // client that offers both is served with fourteen AES rounds per block
-  // where ten give a security level nothing is expected to reach: 128-bit
-  // AES-GCM is what BoringSSL and Go's crypto/tls choose first, and what
-  // TLS 1.3 makes mandatory to implement. On a reply of a few kilobytes the
-  // difference is a measurable share of the cost of encrypting it.
+  // AES-128-GCM goes ahead of AES-256-GCM: fourteen AES rounds per block
+  // where ten give a security level nothing is expected to reach. 128-bit
+  // AES-GCM is what Go's crypto/tls chooses first and what TLS 1.3 makes
+  // mandatory to implement, and on a reply of a few kilobytes the difference
+  // is a measurable share of the cost of encrypting it.
   //
-  // The set of ciphers is left exactly as the linked OpenSSL (and whatever
-  // policy configured it: security level, a distribution's crypto policy)
-  // gives it. Only the order changes: each AES-256-GCM suite moves behind the
-  // AES-128-GCM suite with the same key exchange and authentication, when
-  // there is one; everything else keeps its place. A client that offers only
-  // the 256-bit suite still gets it.
+  // The set of ciphers is left exactly as the TLS library (and whatever policy
+  // configured it: security level, a distribution's crypto policy) gives it.
+  // Only the order changes, and a client that offers only the 256-bit suite
+  // still gets it.
   //
-  // ChaCha20-Poly1305 goes first for a client that lists it first
-  // (SSL_OP_PRIORITIZE_CHACHA): that order is how a client without AES
-  // hardware says so, and for it ChaCha20 is the faster and safer choice.
+  // ChaCha20-Poly1305 goes first for a client that lists it first: that order
+  // is how a client without AES hardware says so, and for it ChaCha20 is the
+  // faster and safer choice.
   //
   // An app that wants another order sets ssl.ciphersuites / ssl.ciphers, and
   // none of this runs.
+#ifdef OPENSSL_IS_BORINGSSL
+  void preferAes128() {
+    // On a server without AES hardware BoringSSL already leads with ChaCha20,
+    // which is the right call for that machine: its order stands.
+    if (!EVP_has_aes_hardware()) return;
+    // TLS 1.3. BoringSSL's own server default is one equal-preference group
+    // (the client's order decides), which hands AES-256 to every client built
+    // on OpenSSL. TLS 1.2 needs nothing: its default list already opens with
+    // the ECDHE AES-128-GCM suites.
+    static const uint16_t kAes128First[] = {SSL_CIPHER_AES_128_GCM_SHA256,
+                                            SSL_CIPHER_AES_256_GCM_SHA384,
+                                            SSL_CIPHER_CHACHA20_POLY1305_SHA256};
+    if (SSL_CTX_set1_tls13_ciphers(ctx_, kAes128First, nullptr, 3) != 1) ERR_clear_error();
+    SSL_CTX_set_select_certificate_cb(ctx_, chaChaLedClientCb);
+  }
+
+  // Runs on the ClientHello, before anything is negotiated. A client whose
+  // first cipher suite is a ChaCha20 one is served ChaCha20: its TLS 1.3 list
+  // is reordered and, for TLS 1.2, its own order is followed. Every other
+  // client keeps the context's order. (OpenSSL does the same thing under
+  // SSL_OP_PRIORITIZE_CHACHA.)
+  static enum ssl_select_cert_result_t chaChaLedClientCb(const SSL_CLIENT_HELLO* hello) {
+    const uint8_t* p = hello->cipher_suites;
+    for (size_t i = 0; i + 1 < hello->cipher_suites_len; i += 2) {
+      // GREASE (RFC 8701) values are placeholders, not a preference: 0x?A?A.
+      if (p[i] == p[i + 1] && (p[i] & 0x0f) == 0x0a) continue;
+      const uint16_t id = static_cast<uint16_t>((p[i] << 8) | p[i + 1]);
+      if (id == SSL_CIPHER_CHACHA20_POLY1305_SHA256 ||
+          id == SSL_CIPHER_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 ||
+          id == SSL_CIPHER_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256) {
+        static const uint16_t kChaChaFirst[] = {SSL_CIPHER_CHACHA20_POLY1305_SHA256,
+                                                SSL_CIPHER_AES_128_GCM_SHA256,
+                                                SSL_CIPHER_AES_256_GCM_SHA384};
+        if (SSL_set1_tls13_ciphers(hello->ssl, kChaChaFirst, nullptr, 3) != 1) ERR_clear_error();
+        SSL_clear_options(hello->ssl, SSL_OP_CIPHER_SERVER_PREFERENCE);
+      }
+      break;
+    }
+    return ssl_select_cert_success;
+  }
+
+  // ssl.ciphersuites: TLS 1.3 suites by IANA name, in the app's order.
+  // BoringSSL takes them by number and implements exactly these three.
+  std::string setTls13Suites(const std::string& list) {
+    static const struct { const char* name; uint16_t id; } kSuites[] = {
+        {"TLS_AES_128_GCM_SHA256", SSL_CIPHER_AES_128_GCM_SHA256},
+        {"TLS_AES_256_GCM_SHA384", SSL_CIPHER_AES_256_GCM_SHA384},
+        {"TLS_CHACHA20_POLY1305_SHA256", SSL_CIPHER_CHACHA20_POLY1305_SHA256},
+    };
+    std::vector<uint16_t> ids;
+    size_t at = 0;
+    while (at <= list.size()) {
+      size_t end = list.find(':', at);
+      if (end == std::string::npos) end = list.size();
+      const std::string name = list.substr(at, end - at);
+      at = end + 1;
+      if (name.empty()) continue;
+      uint16_t id = 0;
+      for (const auto& suite : kSuites) {
+        if (name == suite.name) id = suite.id;
+      }
+      if (id == 0) {
+        return "ssl.ciphersuites '" + list + "' is invalid: '" + name +
+               "' is not a TLS 1.3 suite of the bundled TLS library (BoringSSL), which has "
+               "TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256";
+      }
+      if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+    }
+    if (ids.empty()) return "ssl.ciphersuites '" + list + "' is invalid: it names no suite";
+    if (SSL_CTX_set1_tls13_ciphers(ctx_, ids.data(), nullptr, ids.size()) != 1) {
+      return sslError(("ssl.ciphersuites '" + list + "' is invalid").c_str());
+    }
+    return "";
+  }
+#else
+  std::string setTls13Suites(const std::string& list) {
+    if (SSL_CTX_set_ciphersuites(ctx_, list.c_str()) != 1) {
+      return sslError(("ssl.ciphersuites '" + list + "' is invalid").c_str());
+    }
+    return "";
+  }
+
+  // OpenSSL's own order puts AES-256-GCM ahead of AES-128-GCM: each
+  // AES-256-GCM suite moves behind the AES-128-GCM suite with the same key
+  // exchange and authentication, when there is one; everything else keeps its
+  // place. SSL_OP_PRIORITIZE_CHACHA serves the client that leads with ChaCha20.
   void preferAes128() {
     STACK_OF(SSL_CIPHER)* all = SSL_CTX_get_ciphers(ctx_);
     if (!all) return;
@@ -442,6 +578,7 @@ class TlsContext {
     }
     return names;
   }
+#endif
 
   // Inline PEM: first cert = leaf, remainder = intermediate chain.
   std::string useCertPem(const std::string& pem) {

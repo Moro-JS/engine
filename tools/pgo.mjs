@@ -11,9 +11,11 @@
 //
 // Any failure in 2-5 leaves the plain binaries from step 1 in place and exits
 // 0 with a warning, unless --strict (the dedicated CI lane), which exits 1.
-// One profile per platform/arch is reused across ABIs: the engine code is
-// identical, only V8-header inlines differ (build.mjs silences the resulting
-// "unprofiled function" notes).
+// One profile per platform/arch is reused across ABIs and across the two TLS
+// variants: the engine code is identical, only V8-header inlines and the few
+// library-specific lines of src/tls.h differ (build.mjs silences the resulting
+// "unprofiled function" notes). It is trained on the BoringSSL binary, the one
+// the loader prefers.
 //
 //   node tools/pgo.mjs [--all | --abi N] [--arch A] [--strict] [--seconds=N] [--no-suites]
 //
@@ -40,6 +42,10 @@ const hostAbi = parseInt(process.versions.modules, 10);
 // is IR-level and applies to a cross-compiled --arch build just as well - the
 // darwin x64 binaries are built on arm64 hosts from the arm64 profile).
 const hostArch = process.arch;
+// --tls=openssl (a build without the bundled library) trains on that binary.
+const tlsArg = argv.find((a) => a.startsWith('--tls'));
+const tlsOnly = tlsArg ? (tlsArg.includes('=') ? tlsArg.slice(tlsArg.indexOf('=') + 1) : argv[argv.indexOf(tlsArg) + 1]) : 'all';
+const trainTls = tlsOnly === 'openssl' ? 'openssl' : 'boringssl';
 
 function run(cmd, args, opts = {}) {
   const r = spawnSync(cmd, args, { cwd: root, stdio: 'inherit', shell: platform === 'win32', ...opts });
@@ -91,10 +97,10 @@ function findProfdata() {
   return null;
 }
 
-function binaryName(abi) {
+function binaryName(abi, tls) {
   let libc = '';
   if (platform === 'linux') libc = existsSync('/etc/alpine-release') ? '_musl' : '_gnu';
-  return `moro_engine_${platform}_${hostArch}${libc}_${abi}.node`;
+  return `moro_engine_${platform}_${hostArch}${libc}_${abi}${tls === 'boringssl' ? '_boringssl' : ''}.node`;
 }
 
 function fail(msg) {
@@ -138,8 +144,9 @@ try {
     `--pgo-dir=${profDir}`,
     ...(platform === 'win32' ? [`--pgo-profile=${pgd}`] : []),
     `--out-dir=${instrDir}`,
+    `--tls=${trainTls}`,
   ]);
-  const instrBinary = join(instrDir, binaryName(hostAbi));
+  const instrBinary = join(instrDir, binaryName(hostAbi, trainTls));
   if (!existsSync(instrBinary)) throw new Error(`instrumented binary missing: ${instrBinary}`);
 
   // 3. train
@@ -179,9 +186,11 @@ try {
     `--pgo-profile=${profile}`,
     `--out-dir=${optDir}`,
   ]);
-  const optHost = join(optDir, binaryName(hostAbi));
-  if (existsSync(optHost)) {
-    run(process.execPath, [join(root, 'test', 'smoke.mjs')], { env: { ...process.env, MORO_ENGINE_BINARY: optHost } });
+  for (const tls of ['boringssl', 'openssl']) {
+    const optHost = join(optDir, binaryName(hostAbi, tls));
+    if (existsSync(optHost)) {
+      run(process.execPath, [join(root, 'test', 'smoke.mjs')], { env: { ...process.env, MORO_ENGINE_BINARY: optHost } });
+    }
   }
   let n = 0;
   for (const f of readdirSync(optDir)) {

@@ -19,11 +19,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 IMAGE=node:24-bookworm
-SETUP='apt-get update -qq >/dev/null && apt-get install -y -qq clang lld llvm curl zlib1g-dev libssl-dev >/dev/null'
+SETUP='apt-get update -qq >/dev/null && apt-get install -y -qq clang lld llvm curl zlib1g-dev libssl-dev cmake ninja-build git >/dev/null'
 SECCOMP=(--security-opt seccomp=unconfined)
 while [ $# -gt 0 ]; do
   case "$1" in
-    --musl) IMAGE=node:24-alpine; SETUP='apk add --no-cache build-base clang lld llvm curl zlib-dev openssl-dev >/dev/null'; shift ;;
+    --musl) IMAGE=node:24-alpine; SETUP='apk add --no-cache build-base clang lld llvm curl zlib-dev openssl-dev cmake git linux-headers >/dev/null'; shift ;;
     --seccomp-default) SECCOMP=(); shift ;;
     --) shift; break ;;
     *) break ;;
@@ -41,4 +41,5 @@ exec docker run --rm ${TTY[@]+"${TTY[@]}"} ${SECCOMP[@]+"${SECCOMP[@]}"} \
   -e MORO_ENGINE_REQUIRE_TRANSPORT="${MORO_ENGINE_REQUIRE_TRANSPORT:-}" \
   -e MORO_ENGINE_FASTCALL="${MORO_ENGINE_FASTCALL:-}" \
   -e MORO_ENGINE_NOTIFY="${MORO_ENGINE_NOTIFY:-}" \
+  -e MORO_ENGINE_TLS="${MORO_ENGINE_TLS:-}" \
   "$IMAGE" sh -c "$SETUP && uname -r && $CMD"
