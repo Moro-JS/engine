@@ -3,7 +3,7 @@
 One file per release in [`changelog/`](changelog/); the GitHub Release for a
 tag carries the same text. Newest first.
 
-- [1.1.19](changelog/v1.1.19.md) — epoll transport: each ready socket served once per loop turn (a loop with over 1024 ready sockets no longer reads each of them a dozen times).
+- [1.1.19](changelog/v1.1.19.md) — HTTP/2 (ALPN and prior knowledge, the engine's own implementation; h2spec 146/146); TLS replies written straight to the socket, AES-128-GCM preferred by default; request bodies as heap strings or lent buffers (`getBodyType`, `getBodyText`, `getBodyLent`), body buffers pooled per loop; epoll: each ready socket served once per loop turn.
 - [1.1.18](changelog/v1.1.18.md) — request bodies collected straight into the body buffer (one copy, half the peak memory of an upload); `getBody()` hands the bytes over without a copy; one callback scope per WebSocket read.
 - [1.1.17](changelog/v1.1.17.md) — TLS on the engine's own BIOs (one copy in, one append out, no zeroing); bodies over 8 KiB encrypted from the caller's bytes; ciphertext scratch kept up to 1 MiB.
 - [1.1.16](changelog/v1.1.16.md) — `wsSend()` borrows its payload (the backpressure shed is deferred); ASCII text frames as one-byte strings; TLS record buffers released again.
