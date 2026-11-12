@@ -63,6 +63,10 @@ export interface EngineCapabilities {
    *  exist: the engine can perform valid WebSocket upgrades itself, firing
    *  onWsOpen without the request ever reaching onRequest. */
   wsAutoUpgrade: boolean;
+  /** getBodyType() and getBodyText() exist. */
+  bodyText: boolean;
+  /** getBodyLent() exists. */
+  bodyLent: boolean;
 }
 
 export interface FastApiInfo {
@@ -326,6 +330,25 @@ export function getHeader(reqId: number, lowercaseName: string): string | undefi
  *  without a copy and stay valid for as long as JS holds the buffer; a second
  *  call during the same request returns the same storage, not a snapshot. */
 export function getBody(reqId: number): ArrayBuffer | null;
+/** The request's Content-Type: '' when it has a body but no such header,
+ *  null when it has no body (or the request is gone). */
+export function getBodyType(reqId: number): string | null;
+/** The body as a string when every byte of it is ASCII, null otherwise (read
+ *  it with getBody then). The string is the exact bytes received - decoded
+ *  as UTF-8 or as Latin-1 it is the same text - and lives on the JS heap
+ *  like any other string, where getBody's ArrayBuffer counts as external
+ *  memory until a collection frees it. Null once getBody has taken the
+ *  bytes. */
+export function getBodyText(reqId: number): string | null;
+/** The body as an ArrayBuffer that is detached when the response is complete
+ *  or the request is aborted (byteLength 0, every view empty). The bytes are
+ *  moved into it, not copied, and released at that moment instead of at some
+ *  later collection - which is what keeps a server reading bodies at a high
+ *  rate out of back-to-back full collections. For a handler that relays,
+ *  hashes or echoes a body and keeps none of it. Code that keeps the body
+ *  past the response reads it with getBody (a copy, during a loan) or
+ *  transfers the lent buffer. Null when there is no body. */
+export function getBodyLent(reqId: number): ArrayBuffer | null;
 export function getRemoteAddress(reqId: number): string;
 export function isAborted(reqId: number): boolean;
 
@@ -463,6 +486,9 @@ declare const engine: {
   getHeaders: typeof getHeaders;
   getHeader: typeof getHeader;
   getBody: typeof getBody;
+  getBodyType: typeof getBodyType;
+  getBodyText: typeof getBodyText;
+  getBodyLent: typeof getBodyLent;
   getRemoteAddress: typeof getRemoteAddress;
   isAborted: typeof isAborted;
   respond: typeof respond;

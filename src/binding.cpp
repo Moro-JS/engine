@@ -1290,6 +1290,15 @@ static void GetHeader(const FunctionCallbackInfo<Value>& args) {
 // same bytes again - the same storage, not a snapshot.
 static void FreeBodyHolder(void*, size_t, void* hint) { delete static_cast<std::string*>(hint); }
 
+// A body on loan to JS (getBodyLent, below): the ArrayBuffer to detach when
+// the request is done.
+struct LentBody {
+  Isolate* iso;
+  v8::Global<ArrayBuffer> buffer;
+  std::string* holder;  // the bytes; owned by the buffer's backing store
+  Server* server;       // whose body-buffer pool they came from
+};
+
 static void GetBody(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
   Connection* c = connFrom(args);
@@ -1302,6 +1311,21 @@ static void GetBody(const FunctionCallbackInfo<Value>& args) {
         ArrayBuffer::New(iso, std::static_pointer_cast<BackingStore>(c->jsBody)));
     return;
   }
+  if (c->jsLent) {
+    // The bytes are on loan (getBodyLent) and will be taken back with the
+    // request: this caller, who asked for bytes to keep, gets its own copy.
+    // Nothing is left to copy once JS has transferred the loan away.
+    Local<ArrayBuffer> lent = static_cast<LentBody*>(c->jsLent.get())->buffer.Get(iso);
+    const size_t n = lent->ByteLength();
+    if (n == 0) {
+      args.GetReturnValue().SetNull();
+      return;
+    }
+    Local<ArrayBuffer> copy = ArrayBuffer::New(iso, n);
+    memcpy(copy->Data(), lent->Data(), n);
+    args.GetReturnValue().Set(copy);
+    return;
+  }
   if (c->body.empty()) {
     args.GetReturnValue().SetNull();
     return;
@@ -1312,6 +1336,128 @@ static void GetBody(const FunctionCallbackInfo<Value>& args) {
       holder->data(), holder->size(), FreeBodyHolder, holder);
   c->jsBody = std::static_pointer_cast<void>(store);
   args.GetReturnValue().Set(ArrayBuffer::New(iso, std::move(store)));
+}
+
+// getBodyType(reqId) -> the request's Content-Type, '' when it has a body but
+// no such header, null when it has no body at all. What an adapter needs to
+// decide how to read the body, in the one call it made for the header anyway.
+static void GetBodyType(const FunctionCallbackInfo<Value>& args) {
+  Isolate* iso = args.GetIsolate();
+  Connection* c = connFrom(args);
+  if (!c || (c->body.empty() && !c->jsBody && !c->jsLent)) {
+    args.GetReturnValue().SetNull();
+    return;
+  }
+  for (const auto& h : c->headers) {
+    if (h.name.size() == 12 && iequals(h.name, std::string_view("content-type", 12))) {
+      args.GetReturnValue().Set(str(iso, h.value));
+      return;
+    }
+  }
+  args.GetReturnValue().Set(String::Empty(iso));
+}
+
+// getBodyText(reqId) -> the body as a string when every byte of it is ASCII,
+// null otherwise (the caller reads it with getBody). An ASCII body is its own
+// text in UTF-8 and in Latin-1, so the one string serves both as the decoded
+// text and, read back as Latin-1, as the exact bytes received.
+//
+// It is an ordinary heap string: allocated in the young generation and gone
+// at the next scavenge. The ArrayBuffer getBody returns keeps its bytes
+// outside the heap, and V8 counts external bytes against the old-generation
+// limit from the moment they are allocated until a collection frees them; a
+// server reading a few kilobytes of body per request therefore ran a full
+// mark-compact every few thousand requests however short-lived each body
+// was. A JSON or form body, which the adapter turns into a string before
+// anything else, never needed to exist as a buffer at all.
+static void GetBodyText(const FunctionCallbackInfo<Value>& args) {
+  Isolate* iso = args.GetIsolate();
+  Connection* c = connFrom(args);
+  if (!c || c->jsBody || c->jsLent ||
+      c->body.size() > static_cast<size_t>(v8::String::kMaxLength) ||
+      !text::isAscii(reinterpret_cast<const uint8_t*>(c->body.data()), c->body.size())) {
+    args.GetReturnValue().SetNull();
+    return;
+  }
+  Local<String> out;
+  if (!String::NewFromOneByte(iso, reinterpret_cast<const uint8_t*>(c->body.data()),
+                              v8::NewStringType::kNormal, static_cast<int>(c->body.size()))
+           .ToLocal(&out)) {
+    args.GetReturnValue().SetNull();
+    return;
+  }
+  args.GetReturnValue().Set(out);
+}
+
+// getBodyLent(reqId) -> the body as an ArrayBuffer that is detached when the
+// response is complete (or the request is aborted): its length becomes 0 and
+// every view over it is empty. The bytes are the connection's own, moved into
+// the buffer and never copied, and they are released at that moment rather
+// than whenever a collection gets to them.
+//
+// That is the whole difference from getBody, and it is what matters under
+// load. V8 counts an ArrayBuffer's bytes as external memory from the moment
+// it is created until a collection frees it, and counts them against the
+// old-generation limit; a server reading ten kilobytes of body per request
+// ran a full mark-compact every few thousand requests, however short-lived
+// each body was. A body released with its request never accumulates.
+//
+// It is the right read for a handler that relays, hashes or echoes a body
+// and keeps none of it. Code that keeps the body past the response reads it
+// with getBody (which, during a loan, returns a copy), or transfers the lent
+// buffer (ArrayBuffer.prototype.transfer, a transfer list): the bytes then
+// belong to the new owner and the engine's detach finds nothing left to take.
+static void ReleaseLentBody(void* p) {
+  LentBody* lent = static_cast<LentBody*>(p);
+  if (!lent->buffer.IsEmpty()) {
+    Isolate* iso = lent->iso;
+    HandleScope scope(iso);
+    Local<ArrayBuffer> buffer = lent->buffer.Get(iso);
+    // Already detached when JS transferred it away: the bytes are the new
+    // owner's. Otherwise the buffer gives up its reference here, and when
+    // that leaves this one the only reference there is, nothing else can
+    // ever read the bytes again: their storage goes back to the server's
+    // pool for the next body (the holder is freed empty). Anything else
+    // still holding the store - a native operation in flight on another
+    // thread - keeps the bytes for as long as it needs them.
+    if (!buffer->WasDetached()) {
+      std::shared_ptr<BackingStore> store = buffer->GetBackingStore();
+      (void)buffer->Detach(Local<Value>());
+      if (store.use_count() == 1) lent->server->returnBodyBuffer(*lent->holder);
+    }
+    lent->buffer.Reset();
+  }
+  delete lent;
+}
+
+static void GetBodyLent(const FunctionCallbackInfo<Value>& args) {
+  Isolate* iso = args.GetIsolate();
+  Connection* c = connFrom(args);
+  if (!c) {
+    args.GetReturnValue().SetNull();
+    return;
+  }
+  if (c->jsLent) {
+    args.GetReturnValue().Set(static_cast<LentBody*>(c->jsLent.get())->buffer.Get(iso));
+    return;
+  }
+  if (c->jsBody) {
+    // Already handed over for keeps: the same bytes, and nothing to lend.
+    args.GetReturnValue().Set(
+        ArrayBuffer::New(iso, std::static_pointer_cast<BackingStore>(c->jsBody)));
+    return;
+  }
+  if (c->body.empty()) {
+    args.GetReturnValue().SetNull();
+    return;
+  }
+  auto* holder = new std::string(std::move(c->body));
+  c->body.clear();
+  Local<ArrayBuffer> buffer = ArrayBuffer::New(
+      iso, ArrayBuffer::NewBackingStore(holder->data(), holder->size(), FreeBodyHolder, holder));
+  auto* lent = new LentBody{iso, v8::Global<ArrayBuffer>(iso, buffer), holder, c->server};
+  c->jsLent = std::shared_ptr<void>(static_cast<void*>(lent), ReleaseLentBody);
+  args.GetReturnValue().Set(buffer);
 }
 
 static void GetRemoteAddress(const FunctionCallbackInfo<Value>& args) {
@@ -1747,6 +1893,11 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   // the engine itself (onWsOpen, never onRequest), with wsGetHeaders()/
   // wsGetQuery()/wsGetRemoteAddress() reading the handshake afterwards.
   setCap("wsAutoUpgrade", true);
+  // getBodyType()/getBodyText(): the body's media type, and an all-ASCII
+  // body as a heap string.
+  setCap("bodyText", true);
+  // getBodyLent(): the body as an ArrayBuffer released with the request.
+  setCap("bodyLent", true);
   set("capabilities", caps);
   set("notify", str(iso, g_notifyDeferred ? "deferred" : "sync"));
   // I/O transport in use on this host: 'uring' (Linux, io_uring usable) or
@@ -1823,6 +1974,9 @@ static const ExportDef kExports[] = {
     {"getHeaders", GetHeaders, nullptr, nullptr},
     {"getHeader", GetHeader, nullptr, nullptr},
     {"getBody", GetBody, nullptr, nullptr},
+    {"getBodyType", GetBodyType, nullptr, nullptr},
+    {"getBodyText", GetBodyText, nullptr, nullptr},
+    {"getBodyLent", GetBodyLent, nullptr, nullptr},
     {"getRemoteAddress", GetRemoteAddress, nullptr, nullptr},
     {"isAborted", IsAborted, MORO_FAST(IsAborted)},
     {"respond", Respond, nullptr, nullptr},

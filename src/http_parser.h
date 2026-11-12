@@ -128,6 +128,21 @@ class HttpParser {
   // exactly as always, but none are stored: no name lowering into a slot, no
   // value copy, and `headers` is left as it was for the next request JS sees.
   // light() reports the mode of the request being parsed.
+  // Body buffers shared by the parsers of one loop (the server's; optional).
+  // A request's body is collected into a buffer taken from here when this
+  // parser holds none, and the server puts it back when the request is done.
+  // Bodies used to be collected into per-connection strings that kept their
+  // capacity: three of them per connection in rotation (sixteen more with the
+  // staged slots), so a server with many connections wrote every body into
+  // memory it had not touched since that connection's last request, and held
+  // all of it while the connections sat idle. A handful of buffers that every
+  // connection takes its turn with stay in the cache, and an idle connection
+  // holds none.
+  std::vector<std::string>* bodyPool = nullptr;
+  // A string with at least this much room is a buffer in its own right: the
+  // parser keeps using it, and the server takes it for the pool afterwards.
+  static constexpr size_t kOwnBodyCapacity = 64;
+
   using RouteHook = bool (*)(void* user, Method m, const std::string& path);
   RouteHook routeHook = nullptr;
   void* routeHookUser = nullptr;
@@ -177,6 +192,13 @@ class HttpParser {
     Done,
   };
 
+  // Called where a body's first bytes are about to be stored (`body` empty).
+  void takeBody() {
+    if (bodyPool != nullptr && !bodyPool->empty() && body.capacity() < kOwnBodyCapacity) {
+      body.swap(bodyPool->back());
+      bodyPool->pop_back();
+    }
+  }
   bool parseRequestLine(std::string_view line);
   bool parseHeaderLine(std::string_view line);
   bool finalizeHeaders();  // resolve body framing (Content-Length vs chunked)
@@ -791,6 +813,7 @@ inline bool HttpParser::parseDirectStored(const char* data, size_t len, size_t p
   }
   const size_t avail = len - pos;
   const size_t take = avail < contentLength_ ? avail : contentLength_;
+  takeBody();
   body.reserve(contentLength_);
   body.assign(data + pos, take);
   if (take == contentLength_) {
@@ -919,6 +942,7 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
     }
     size_t available = buf_.size() - headEnd_;
     if (available >= contentLength_) {
+      takeBody();
       body.assign(buf_.data() + headEnd_, contentLength_);
       consumed_ = headEnd_ + contentLength_;
       state_ = State::Done;
@@ -928,6 +952,7 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
     // there by later reads (directBody_), so the body is copied once instead
     // of growing buf_ and being copied out of it whole at the end. The head
     // is consumed; buf_ keeps it (dead) until reset() compacts.
+    takeBody();
     body.reserve(contentLength_);
     body.assign(buf_.data() + headEnd_, available);
     buf_.resize(headEnd_);
@@ -979,6 +1004,7 @@ inline ParseStatus HttpParser::parse(const char* data, size_t len) {
         errorStatus = 413;
         return ParseStatus::Error;
       }
+      if (body.empty()) takeBody();
       body.append(buf_.data() + scanPos_, chunkRemaining_);
       scanPos_ += chunkRemaining_;
       // Expect trailing CRLF

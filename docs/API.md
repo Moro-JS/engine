@@ -114,6 +114,12 @@ getHeaders(reqId): string[];              // flat [k1,v1,k2,v2,...], keys lowerc
 getHeader(reqId, lowercaseName: string): string | undefined;
 getBody(reqId): ArrayBuffer | null;       // engine buffers bodies natively; onRequest
                                           // fires AFTER the body is complete (or 413s natively)
+getBodyType(reqId): string | null;        // Content-Type; '' with a body and no header,
+                                          // null with no body
+getBodyText(reqId): string | null;        // an all-ASCII body as a string (its exact bytes,
+                                          // on the JS heap); null otherwise - use getBody
+getBodyLent(reqId): ArrayBuffer | null;   // no copy; detached and freed when the response
+                                          // completes; getBody (or transfer) for bytes to keep
 getRemoteAddress(reqId): string;
 
 // ---- response ----

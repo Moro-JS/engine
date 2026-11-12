@@ -257,6 +257,10 @@ struct Connection {
   // second call hands over the same bytes again. Opaque here; cleared when
   // the next request is surfaced.
   std::shared_ptr<void> jsBody;
+  // The body lent to JS (binding getBodyLent): the ArrayBuffer `body` was
+  // moved into. Opaque here; released - which detaches the ArrayBuffer and
+  // frees the bytes - wherever jsBody is, and before the connection closes.
+  std::shared_ptr<void> jsLent;
   bool isHead = false;
   bool reqKeepAlive = true;
   // Snapshotted with reqKeepAlive (the parser may already be on a later
@@ -501,6 +505,10 @@ class Server {
   // slot has been answered. Owned by the binding (an ArrayBuffer's storage),
   // stable for the server's lifetime.
   void setBatchControl(uint32_t* cell) { batchControl_ = cell; }
+
+  // A body buffer nothing refers to any more, handed back for reuse (the
+  // binding, when a lent body is released; see recycleBodyBuffer).
+  void returnBodyBuffer(std::string& b) { recycleBodyBuffer(b); }
   static constexpr uint32_t kMaxStaged = 16;
 
   // Turn on TLS termination with an already-validated context (the binding builds and validates it BEFORE constructing the Server, so a config error throws from serve() instead of leaving a half-built server behind).
@@ -1108,6 +1116,7 @@ class Server {
     c->reqId = 0;
     c->active = false;
     c->jsBody.reset();
+    c->jsLent.reset();
     writeOut(c, std::move(resp), /*terminal=*/false);
 
     const uint32_t wsId = c->wsId;
@@ -1538,6 +1547,8 @@ class Server {
     globalRequests().erase(oldId);
     c->active = false;
     c->jsBody.reset();  // a body JS kept lives on in JS; nothing pins it to an idle connection
+    c->jsLent.reset();
+    recycleBody(c);
 
     if (!c->reqKeepAlive) {
       if (c->pendingWrites == 0) closeAfterResponse(c);
@@ -1563,6 +1574,8 @@ class Server {
     globalRequests().erase(c->reqId);
     c->active = false;
     c->jsBody.reset();
+    c->jsLent.reset();
+    recycleBody(c);
     if (!c->reqKeepAlive) {
       c->batchClose = true;
       return;
@@ -1725,6 +1738,11 @@ class Server {
   // follows is not HTTP if the upgrade succeeds).
   bool stageRequest(Connection* c) {
     if (c->staged.empty()) c->staged.resize(kMaxStaged);
+    // An empty ring starts over at its first slot: a connection that sends
+    // one request at a time then uses the same slot for every one of them,
+    // where walking the ring spread its header and path strings over sixteen
+    // sets of buffers, each cold by the time its turn came round again.
+    if (c->stagedCount == 0) c->stagedHead = 0;
     StagedRequest& sr = c->staged[(c->stagedHead + c->stagedCount) % kMaxStaged];
     c->stagedCount++;
     const bool upgrade = c->parser.hasUpgrade();
@@ -1761,6 +1779,7 @@ class Server {
     c->headers.swap(sr.headers);
     c->body.swap(sr.body);
     c->jsBody.reset();
+    c->jsLent.reset();
     c->isHead = sr.isHead;
     c->reqKeepAlive = sr.reqKeepAlive;
     c->reqHttp11 = sr.reqHttp11;
@@ -1776,6 +1795,25 @@ class Server {
     }
     if (hasEngineRoutes() && tryStaticRoute(c)) return;
     if (sr.upgrade && wsAutoUpgrade_) upgradeToWebSocket(c);
+  }
+
+  // The finished request's body buffer goes back to the loop's pool (see
+  // HttpParser::bodyPool), most recently used last, which is the one the next
+  // body is collected into. A buffer too large to be worth keeping is freed,
+  // as a large body's always was; one JS took with getBody is JS's and is not
+  // here to give, and neither is one lent with getBodyLent.
+  static constexpr size_t kBodyPoolSize = 8;
+  static constexpr size_t kBodyPoolKeep = 64 * 1024;
+  void recycleBody(Connection* c) { recycleBodyBuffer(c->body); }
+  void recycleBodyBuffer(std::string& b) {
+    if (b.capacity() < HttpParser::kOwnBodyCapacity) return;
+    b.clear();
+    if (b.capacity() <= kBodyPoolKeep && bodyPool_.size() < kBodyPoolSize) {
+      bodyPool_.emplace_back();
+      bodyPool_.back().swap(b);
+    } else {
+      std::string().swap(b);
+    }
   }
 
   uint32_t nextReqId() {
@@ -1866,6 +1904,7 @@ class Server {
     c->parser = HttpParser(limits_);
     c->parser.routeHook = &Server::routeHook;
     c->parser.routeHookUser = c;
+    c->parser.bodyPool = &bodyPool_;
     if (tlsEnabled_) c->tls = new TlsSession(tlsCtx_.ctx());
     conns_.insert(c);
   }
@@ -2182,6 +2221,7 @@ class Server {
     c->headers.swap(c->parser.headers);
     c->body.swap(c->parser.body);
     c->jsBody.reset();
+    c->jsLent.reset();
     c->isHead = (c->method == Method::HEAD);
     c->reqKeepAlive = c->parser.keepAlive;
     c->reqHttp11 = c->parser.minorVersion >= 1;
@@ -2493,6 +2533,7 @@ class Server {
       if (!bye.empty()) tTryWrite(c, bye.data(), bye.size());
     }
     c->closing = true;
+    c->jsLent.reset();  // a lent body ends with the connection, whatever state the request was in
     // An HTTP request that was surfaced to a handler and never answered owes JS exactly one onAborted (server shutdown, timeout sweep, write error), or 'close' listeners and their resources (SSE intervals, monitors) leak. closing is already set, so a re-entrant respond() from JS is a no-op.
     if (c->active && !c->isWebSocket && !c->abortNotified) {
       c->abortNotified = true;
@@ -3455,6 +3496,7 @@ class Server {
     int emfileFd = -1;
     std::vector<Connection*> completions;  // fully-sent queued writes to complete
     std::vector<Connection*> ready;  // sockets the poll phase reported this turn, each once; served by serve()
+    std::vector<Connection*> readySpare;  // empty; the storage serve() hands to `ready` for the next turn
     unsigned groups = 1;       // peer-CPU groups seen so far (max peerCpu + 2, -1 being a group)
     unsigned turn = 0;         // serve() calls; the group that goes first rotates with it
 
@@ -3674,7 +3716,13 @@ class Server {
     // turn to turn, so no peer is always the last to be answered.
     void serve() {
       if (ready.empty()) return;
+      // The turn's list is taken, and `ready` is left with the storage the
+      // previous turn's list gave back: swapped against a fresh vector, it
+      // was grown again from nothing on every turn, a handful of allocations
+      // each. The list stays this call's own, so nothing a handler does can
+      // touch it while it is being walked.
       std::vector<Connection*> list;
+      list.swap(readySpare);
       list.swap(ready);
       tune(list.size());
       if (order == Order::Grouped) {
@@ -3690,6 +3738,9 @@ class Server {
         const int events = takeReady(c);
         if (c->ep.state < 2) c->server->epollOnConn(c, events);
       }
+      // A burst's worth of capacity is not kept on an idle loop.
+      list.clear();
+      if (list.capacity() <= 4 * kPollBatch && list.capacity() > readySpare.capacity()) readySpare.swap(list);
     }
 
     // Clean-stack work: serve this turn's readable sockets, then complete
@@ -4101,6 +4152,7 @@ class Server {
   // Ciphertext of the TLS response being written (tlsWrite): one buffer per
   // loop, reused across responses, so a TLS reply allocates nothing.
   std::string cipherScratch_;
+  std::vector<std::string> bodyPool_;  // empty strings with capacity; see HttpParser::bodyPool
   const std::string& dateLine() {
     refreshHttpDateLine(dateCache_, dateCachedAt_);
     return dateCache_;
