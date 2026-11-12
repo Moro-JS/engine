@@ -38,7 +38,8 @@ export function sslInlineOptions() {
  * connecting to make the capture race-free).
  *
  * opts: { alpnProtocols?, servername = 'localhost', rejectUnauthorized = true,
- *         ca?, session? (a previously captured ticket, to attempt resumption) }
+ *         ca?, session? (a previously captured ticket, to attempt resumption),
+ *         tls? (further tls.connect options: ciphers, minVersion, maxVersion) }
  */
 export async function openRawTls(port, opts = {}) {
   const socket = tls.connect({
@@ -49,6 +50,7 @@ export async function openRawTls(port, opts = {}) {
     rejectUnauthorized: opts.rejectUnauthorized !== false,
     ALPNProtocols: opts.alpnProtocols,
     session: opts.session,
+    ...(opts.tls ?? {}),
   });
   const firstSession = new Promise((resolve) => socket.once('session', resolve));
   const client = await wrapRawSocket(socket, 'secureConnect');

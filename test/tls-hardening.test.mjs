@@ -113,6 +113,128 @@ describe('@morojs/engine TLS hardening', { skip }, () => {
     );
   });
 
+  // -------------------------------------------------------------------------
+  // The default preference, when the app names no ciphers: the linked
+  // OpenSSL's own set, with the 128-bit AES-GCM suite ahead of its 256-bit
+  // twin and ChaCha20 first for a client that asks for it first.
+  // -------------------------------------------------------------------------
+
+  const negotiated = async (server, tlsOptions) => {
+    const client = await openRawTls(server.port, { tls: tlsOptions });
+    try {
+      const out = { protocol: client.socket.getProtocol(), cipher: client.socket.getCipher().name };
+      await client.send(`GET / HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`);
+      assert.equal(parseResponse(await client.read()).status, 200, `a request round-trips on ${out.cipher}`);
+      return out;
+    } finally {
+      client.destroy();
+    }
+  };
+
+  it('default: a TLS 1.3 client offering every suite gets AES-128-GCM', T, async () => {
+    await withTlsServer(ok, { ssl: sslFileOptions() }, async (server) => {
+      // Node's own client order: AES-256 first.
+      assert.deepEqual(await negotiated(server, {}), {
+        protocol: 'TLSv1.3',
+        cipher: 'TLS_AES_128_GCM_SHA256',
+      });
+      assert.deepEqual(
+        await negotiated(server, {
+          ciphers: 'TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256',
+        }),
+        { protocol: 'TLSv1.3', cipher: 'TLS_AES_128_GCM_SHA256' }
+      );
+    });
+  });
+
+  it('default: a client that offers only AES-256-GCM still gets it', T, async () => {
+    await withTlsServer(ok, { ssl: sslFileOptions() }, async (server) => {
+      assert.equal(
+        (await negotiated(server, { ciphers: 'TLS_AES_256_GCM_SHA384' })).cipher,
+        'TLS_AES_256_GCM_SHA384'
+      );
+      assert.equal(
+        (await negotiated(server, { ciphers: 'ECDHE-ECDSA-AES256-GCM-SHA384', maxVersion: 'TLSv1.2' })).cipher,
+        'ECDHE-ECDSA-AES256-GCM-SHA384'
+      );
+    });
+  });
+
+  it('default: a client that lists ChaCha20 first gets ChaCha20', T, async () => {
+    await withTlsServer(ok, { ssl: sslFileOptions() }, async (server) => {
+      assert.equal(
+        (
+          await negotiated(server, {
+            ciphers: 'TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384',
+          })
+        ).cipher,
+        'TLS_CHACHA20_POLY1305_SHA256'
+      );
+      // ...and one that merely includes it, behind AES, gets AES-128.
+      assert.equal(
+        (
+          await negotiated(server, {
+            ciphers: 'TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256',
+          })
+        ).cipher,
+        'TLS_AES_128_GCM_SHA256'
+      );
+    });
+  });
+
+  it('default: a TLS 1.2 client gets the ECDHE AES-128-GCM suite, or ChaCha20 when it leads with it', T, async () => {
+    await withTlsServer(ok, { ssl: sslFileOptions() }, async (server) => {
+      assert.deepEqual(
+        await negotiated(server, {
+          maxVersion: 'TLSv1.2',
+          ciphers:
+            'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305',
+        }),
+        { protocol: 'TLSv1.2', cipher: 'ECDHE-ECDSA-AES128-GCM-SHA256' }
+      );
+      assert.equal(
+        (
+          await negotiated(server, {
+            maxVersion: 'TLSv1.2',
+            ciphers:
+              'ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256',
+          })
+        ).cipher,
+        'ECDHE-ECDSA-CHACHA20-POLY1305'
+      );
+    });
+  });
+
+  it('an explicit ssl.ciphersuites order is the app\'s and is left alone', T, async () => {
+    await withTlsServer(
+      ok,
+      { ssl: { ...sslFileOptions(), ciphersuites: 'TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256' } },
+      async (server) => {
+        assert.equal((await negotiated(server, {})).cipher, 'TLS_AES_256_GCM_SHA384');
+        // no ChaCha20 reprioritisation either: it is not in the app's list
+        await assert.rejects(negotiated(server, { ciphers: 'TLS_CHACHA20_POLY1305_SHA256' }));
+      }
+    );
+  });
+
+  it('an explicit ssl.ciphers list leaves the TLS 1.2 order the app\'s too', T, async () => {
+    await withTlsServer(
+      ok,
+      { ssl: { ...sslFileOptions(), ciphers: 'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256' } },
+      async (server) => {
+        assert.equal(
+          (
+            await negotiated(server, {
+              maxVersion: 'TLSv1.2',
+              ciphers: 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384',
+            })
+          ).cipher,
+          'ECDHE-ECDSA-AES256-GCM-SHA384'
+        );
+      }
+    );
+  });
+
   it('ssl.ecdhCurve pins the key-share group (HelloRetryRequest path included)', T, async () => {
     await withTlsServer(
       ok,

@@ -1281,10 +1281,46 @@ class Server {
   // back into the one ciphertext buffer and handed to the transport as one
   // write: the body is read where it lives, never copied behind the head.
   void tlsWrite(Connection* c, std::string_view head, std::string_view body, bool terminal) {
+    if (c->corked) {
+      // Inside a batch the ciphertext is bound for the cork buffer, so the
+      // records are appended to it as they are produced. Through the scratch
+      // buffer every reply was copied twice on its way to the socket, the
+      // second time a full pass over the body for nothing.
+      //
+      // And when this reply is the batch - nothing in the cork buffer, nothing
+      // queued on the socket, no further request staged behind this one - the
+      // records go to the socket from where OpenSSL wrote them and are not
+      // copied here at all (tlsDirect). Pipelined requests keep the cork: one
+      // send for the batch is worth more than a copy saved per reply.
+      std::string& cork = c->corkBuf;
+      const size_t mark = cork.size();
+      const bool direct = mark == 0 && tlsDirectOk(c) && c->stagedCount == 0 && !c->aheadComplete;
+      if (direct) c->tls->beginDirect(&Server::tlsDirectSend, c);
+      const bool ok =
+          (head.empty() || c->tls->writePlain(head.data(), head.size(), cork, !body.empty())) &&
+          (body.empty() || c->tls->writePlain(body.data(), body.size(), cork));
+      if (direct) c->tls->endDirect();
+      if (!ok) {
+        cork.resize(mark);  // no part of a reply that could not be encrypted goes out
+        doClose(c);
+        return;
+      }
+      if (terminal) completeCorkedResponse(c);
+      if (cork.size() >= limits_.writeHighWaterMark) flushCork(c);
+      return;
+    }
     std::string& cipher = cipherScratch_;
     cipher.clear();
-    if ((!head.empty() && !c->tls->writePlain(head.data(), head.size(), cipher)) ||
-        (!body.empty() && !c->tls->writePlain(body.data(), body.size(), cipher))) {
+    // Outside a batch (a reply sent later, a streamed chunk) the same holds:
+    // with nothing queued ahead the records go straight to the socket, and
+    // the scratch buffer is left with only what the socket did not take.
+    const bool direct = tlsDirectOk(c);
+    if (direct) c->tls->beginDirect(&Server::tlsDirectSend, c);
+    const bool ok =
+        (head.empty() || c->tls->writePlain(head.data(), head.size(), cipher, !body.empty())) &&
+        (body.empty() || c->tls->writePlain(body.data(), body.size(), cipher));
+    if (direct) c->tls->endDirect();
+    if (!ok) {
       // Encrypting failed (session torn down / pre-handshake write): the response can never reach the peer - drop the connection.
       doClose(c);
       return;
@@ -1297,6 +1333,20 @@ class Server {
       cipher.clear();
       cipher.shrink_to_fit();
     }
+  }
+
+  // Whether a TLS reply may be written to the socket record by record as it
+  // is encrypted (TlsSession::beginDirect): an HTTP response with nothing
+  // queued ahead of it. WebSocket frames keep their batch - a read's worth of
+  // small frames is one send.
+  bool tlsDirectOk(const Connection* c) const {
+    return c->pendingWrites == 0 && !c->isWebSocket && !c->closing;
+  }
+
+  static long tlsDirectSend(void* user, const char* held, size_t heldLen,
+                            const char* data, size_t len, bool more) {
+    Connection* c = static_cast<Connection*>(user);
+    return c->server->tTryWrite2(c, held, heldLen, data, len, more);
   }
 
   // Transport-level write: bytes go to the socket verbatim (ciphertext on TLS connections, plaintext otherwise).
@@ -1364,6 +1414,7 @@ class Server {
   // from it, and only a queued or backpressured remainder is copied.
   void transportWriteView(Connection* c, std::string_view data, bool terminal) {
     if (c->closing) return;
+    if (data.empty() && !terminal) return;  // nothing owed (a TLS reply that went out directly)
     if (c->corked) {
       if (!data.empty()) c->corkBuf.append(data);
       if (terminal) completeCorkedResponse(c);
@@ -2622,6 +2673,38 @@ class Server {
 #endif
     uv_buf_t b = uv_buf_init(const_cast<char*>(p), static_cast<unsigned>(n));
     return uv_try_write(reinterpret_cast<uv_stream_t*>(&c->handle), &b, 1);
+  }
+
+  // Two buffers in one synchronous non-blocking write, the first possibly
+  // empty; `more` holds the segment open for bytes that follow at once
+  // (MSG_MORE; ignored where the transport has no such flag). Returns the
+  // bytes written across both, UV_EAGAIN, or a negative errno.
+  long tTryWrite2(Connection* c, const char* a, size_t an, const char* b, size_t bn, bool more) {
+#if defined(__linux__)
+    if (kind_ != TransportKind::Uv) {
+      const int fd = kind_ == TransportKind::Uring ? c->ring.fd : c->ep.fd;
+      const int flags = MSG_DONTWAIT | MSG_NOSIGNAL | (more ? MSG_MORE : 0);
+      ssize_t r;
+      if (an == 0) {
+        r = ::send(fd, b, bn, flags);
+      } else {
+        struct iovec iov[2] = {{const_cast<char*>(a), an}, {const_cast<char*>(b), bn}};
+        struct msghdr msg {};
+        msg.msg_iov = iov;
+        msg.msg_iovlen = 2;
+        r = ::sendmsg(fd, &msg, flags);
+      }
+      if (r >= 0) return static_cast<long>(r);
+      if (errno == EAGAIN || errno == EWOULDBLOCK) return UV_EAGAIN;
+      return -errno;
+    }
+#endif
+    (void)more;
+    uv_buf_t bufs[2];
+    unsigned nb = 0;
+    if (an) bufs[nb++] = uv_buf_init(const_cast<char*>(a), static_cast<unsigned>(an));
+    bufs[nb++] = uv_buf_init(const_cast<char*>(b), static_cast<unsigned>(bn));
+    return uv_try_write(reinterpret_cast<uv_stream_t*>(&c->handle), bufs, nb);
   }
 
   // The last bytes of a Connection: close response (and the whole corked

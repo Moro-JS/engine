@@ -35,6 +35,7 @@
 #include <cstring>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace moro {
 namespace engine {
@@ -71,6 +72,16 @@ struct SslConfig {
   bool complete() const { return !(keyPem.empty() && keyFile.empty()) &&
                                  !(certPem.empty() && certFile.empty()); }
 };
+
+// Empty the thread's OpenSSL error queue ahead of an SSL_* I/O call, which
+// SSL_get_error() needs to tell a real failure from one left behind by
+// something else on the thread. ERR_clear_error() resets all sixteen slots of
+// the queue whether or not any is in use, three frees each - some fifty calls
+// to release nothing, paid before every read and write. The queue is empty
+// here in all but the rare case, and asking is one thread-local load.
+inline void clearErrorQueue() {
+  if (ERR_peek_error() != 0) ERR_clear_error();
+}
 
 // Last OpenSSL error as a human-readable string, prefixed with context.
 inline std::string sslError(const char* what) {
@@ -199,6 +210,8 @@ class TlsContext {
         SSL_CTX_set_ciphersuites(ctx_, cfg.ciphersuites.c_str()) != 1) {
       return sslError(("ssl.ciphersuites '" + cfg.ciphersuites + "' is invalid").c_str());
     }
+    // No explicit policy: the default set, with the 128-bit key first.
+    if (cfg.ciphers.empty() && cfg.ciphersuites.empty()) preferAes128();
     // "auto" = OpenSSL's built-in group preference (Node accepts it too).
     if (!cfg.ecdhCurve.empty() && cfg.ecdhCurve != "auto" &&
         SSL_CTX_set1_groups_list(ctx_, cfg.ecdhCurve.c_str()) != 1) {
@@ -346,6 +359,88 @@ class TlsContext {
     // than alerting - curl/browsers always offer http/1.1, so this only
     // affects exotic clients, which still get a working h1 connection.
     return SSL_TLSEXT_ERR_NOACK;
+  }
+
+  // The default cipher preference, applied when the app names none.
+  //
+  // The server picks the cipher (SSL_OP_CIPHER_SERVER_PREFERENCE), and
+  // OpenSSL's own order puts AES-256-GCM ahead of AES-128-GCM, so every
+  // client that offers both is served with fourteen AES rounds per block
+  // where ten give a security level nothing is expected to reach: 128-bit
+  // AES-GCM is what BoringSSL and Go's crypto/tls choose first, and what
+  // TLS 1.3 makes mandatory to implement. On a reply of a few kilobytes the
+  // difference is a measurable share of the cost of encrypting it.
+  //
+  // The set of ciphers is left exactly as the linked OpenSSL (and whatever
+  // policy configured it: security level, a distribution's crypto policy)
+  // gives it. Only the order changes: each AES-256-GCM suite moves behind the
+  // AES-128-GCM suite with the same key exchange and authentication, when
+  // there is one; everything else keeps its place. A client that offers only
+  // the 256-bit suite still gets it.
+  //
+  // ChaCha20-Poly1305 goes first for a client that lists it first
+  // (SSL_OP_PRIORITIZE_CHACHA): that order is how a client without AES
+  // hardware says so, and for it ChaCha20 is the faster and safer choice.
+  //
+  // An app that wants another order sets ssl.ciphersuites / ssl.ciphers, and
+  // none of this runs.
+  void preferAes128() {
+    STACK_OF(SSL_CIPHER)* all = SSL_CTX_get_ciphers(ctx_);
+    if (!all) return;
+    std::vector<const SSL_CIPHER*> v13, v12;
+    for (int i = 0; i < sk_SSL_CIPHER_num(all); i++) {
+      const SSL_CIPHER* c = sk_SSL_CIPHER_value(all, i);
+      (SSL_CIPHER_get_min_tls_version_compat(c) >= TLS1_3_VERSION ? v13 : v12).push_back(c);
+    }
+    const std::string suites = namesAes128First(v13);
+    const std::string list = namesAes128First(v12);
+    // A list OpenSSL will not take back (it took it from OpenSSL) leaves the
+    // order it had: the preference is an optimisation, never a boot failure.
+    if (!suites.empty() && SSL_CTX_set_ciphersuites(ctx_, suites.c_str()) != 1) ERR_clear_error();
+    if (!list.empty() && SSL_CTX_set_cipher_list(ctx_, list.c_str()) != 1) ERR_clear_error();
+    SSL_CTX_set_options(ctx_, SSL_OP_PRIORITIZE_CHACHA);
+  }
+
+  // SSL_CIPHER_get_min_tls_version is not exported by every OpenSSL the host
+  // Node may carry; the version string is, and is what tells the two lists
+  // apart (TLS 1.3 suites are configured through their own call).
+  static int SSL_CIPHER_get_min_tls_version_compat(const SSL_CIPHER* c) {
+    const char* v = SSL_CIPHER_get_version(c);
+    return (v && strcmp(v, "TLSv1.3") == 0) ? TLS1_3_VERSION : TLS1_2_VERSION;
+  }
+
+  // The colon-separated names of `ciphers` in order, each AES-256-GCM suite
+  // placed directly after its AES-128-GCM counterpart (same key exchange,
+  // same authentication) when the list has one further down.
+  static std::string namesAes128First(const std::vector<const SSL_CIPHER*>& ciphers) {
+    std::vector<const SSL_CIPHER*> order;
+    std::vector<bool> taken(ciphers.size(), false);
+    for (size_t i = 0; i < ciphers.size(); i++) {
+      if (taken[i]) continue;
+      const SSL_CIPHER* c = ciphers[i];
+      if (SSL_CIPHER_get_cipher_nid(c) == NID_aes_256_gcm) {
+        for (size_t j = i + 1; j < ciphers.size(); j++) {
+          const SSL_CIPHER* d = ciphers[j];
+          if (!taken[j] && SSL_CIPHER_get_cipher_nid(d) == NID_aes_128_gcm &&
+              SSL_CIPHER_get_kx_nid(d) == SSL_CIPHER_get_kx_nid(c) &&
+              SSL_CIPHER_get_auth_nid(d) == SSL_CIPHER_get_auth_nid(c)) {
+            order.push_back(d);
+            taken[j] = true;
+            break;
+          }
+        }
+      }
+      order.push_back(c);
+      taken[i] = true;
+    }
+    std::string names;
+    for (const SSL_CIPHER* c : order) {
+      const char* name = SSL_CIPHER_get_name(c);
+      if (!name) continue;
+      if (!names.empty()) names += ':';
+      names += name;
+    }
+    return names;
   }
 
   // Inline PEM: first cert = leaf, remainder = intermediate chain.
@@ -535,7 +630,7 @@ class TlsSession {
 
     bool ok = true;
     if (!handshakeDone_) {
-      ERR_clear_error();
+      clearErrorQueue();
       int r = SSL_accept(ssl_);
       if (r == 1) {
         handshakeDone_ = true;
@@ -556,12 +651,19 @@ class TlsSession {
 
     // Established (possibly just now, with app data in the same flight):
     // drain every complete record.
+    //
+    // The loop ends without a last SSL_read once the view is used up and the
+    // record layer holds nothing, processed or not: that call could only
+    // report WANT_READ, and to find that out it allocated the record buffer
+    // it had just released, asked the BIO, and released it again - once per
+    // request on a connection whose requests arrive one record at a time.
     for (;;) {
       char buf[16 * 1024];
-      ERR_clear_error();
+      clearErrorQueue();
       int n = SSL_read(ssl_, buf, sizeof(buf));
       if (n > 0) {
         plainSink(buf, static_cast<size_t>(n));
+        if (inOff_ >= inLen_ && SSL_has_pending(ssl_) == 0) break;
         continue;
       }
       int err = SSL_get_error(ssl_, n);
@@ -585,7 +687,10 @@ class TlsSession {
   // on error (e.g. called before the handshake completed - the engine only
   // responds to parsed requests, which implies an established session, so
   // this indicates a bug or a torn-down session).
-  bool writePlain(const char* data, size_t len, std::string& cipherOut) {
+  //
+  // `more`: further plaintext of the same reply follows in another call (a
+  // head ahead of its body). It only matters to a direct outlet, below.
+  bool writePlain(const char* data, size_t len, std::string& cipherOut, bool more = false) {
     if (fatal_ || !handshakeDone_) return false;
     // Usually called from inside onCiphertext's plainSink (a request answered
     // synchronously): the outer call's target is put back afterwards.
@@ -594,14 +699,19 @@ class TlsSession {
     flushStash();
     // One record per 16 KiB of plaintext, a few dozen bytes of framing each
     // (TLS 1.3: 5-byte header, inner content type, 16-byte tag): reserved up
-    // front so the appends never regrow the buffer mid-body.
-    cipherOut.reserve(cipherOut.size() + len + 64 + (len / 16384 + 1) * 32);
+    // front so the appends never regrow the buffer mid-body. Not with a
+    // direct outlet, where the buffer only ever holds what could not be sent.
+    if (!direct_) cipherOut.reserve(cipherOut.size() + len + 64 + (len / 16384 + 1) * 32);
     // Cap each SSL_write at 1 MiB: a >= 2 GiB remainder would cast negative
     // (SSL_write takes int) and tear the connection down as a fake error.
     size_t off = 0;
     while (off < len) {
-      ERR_clear_error();
+      clearErrorQueue();
       const int chunk = static_cast<int>(std::min<size_t>(len - off, 1u << 20));
+      // A record carries at most 16 KiB of plaintext and SSL_write returns
+      // after each (SSL_MODE_ENABLE_PARTIAL_WRITE), so this is whether
+      // another record of the reply comes after the one about to be written.
+      directMore_ = more || (len - off) > kMaxRecordPlain;
       int n = SSL_write(ssl_, data + off, chunk);
       if (n <= 0) {
         // The write BIO always accepts, so WANT_WRITE cannot happen; anything
@@ -616,6 +726,38 @@ class TlsSession {
     return true;
   }
 
+  // A direct outlet for the ciphertext of the writePlain calls made until
+  // endDirect(): each record is offered to `send` where OpenSSL produced it,
+  // in its own record buffer, and only what the socket would not take is
+  // appended to the caller's buffer. Without it a record is copied out of
+  // that buffer into the caller's and from there into the kernel; with it,
+  // only into the kernel. The session still does no I/O of its own: `send` is
+  // the caller's, and the caller decides when a direct write is in order
+  // (nothing queued ahead on the socket, the buffer it passes to writePlain
+  // empty).
+  //
+  // send(user, held, heldLen, data, len, more) writes `held` then `data` and
+  // returns the bytes taken (both pieces counted), or a negative value when
+  // none were. `held` is what an earlier, small record of the same reply left
+  // in the caller's buffer to leave together with this one - a response head
+  // ahead of its body is one send, not two. `more` asks for the segment to be
+  // held open for what follows (MSG_MORE where there is such a thing).
+  //
+  // The first short send ends the direct writes of this bracket: everything
+  // after it is appended behind the remainder, in order.
+  using DirectSend = long (*)(void* user, const char* held, size_t heldLen,
+                              const char* data, size_t len, bool more);
+  void beginDirect(DirectSend send, void* user) {
+    direct_ = send;
+    directUser_ = user;
+    directBlocked_ = false;
+  }
+  void endDirect() {
+    direct_ = nullptr;
+    directUser_ = nullptr;
+    directMore_ = false;
+  }
+
   // Best-effort close_notify for a graceful teardown; appends the alert
   // ciphertext to cipherOut (empty when the handshake never completed).
   void shutdown(std::string& cipherOut) {
@@ -623,7 +765,7 @@ class TlsSession {
     std::string* const outer = out_;
     out_ = &cipherOut;
     flushStash();
-    ERR_clear_error();
+    clearErrorQueue();
     SSL_shutdown(ssl_);
     out_ = outer;
   }
@@ -706,7 +848,34 @@ class TlsSession {
     if (!s || len < 0) return -1;
     if (len == 0) return 0;
     std::string* out = s->out_ ? s->out_ : &s->stash_;
-    out->append(in, static_cast<size_t>(len));
+    const size_t n = static_cast<size_t>(len);
+    if (s->direct_ && s->out_ && !s->directBlocked_) {
+      // A small record with more of the reply behind it waits for the next
+      // one, so the two leave in a single send.
+      if (s->directMore_ && n <= kHoldRecord && out->size() + n <= kHoldTotal) {
+        out->append(in, n);
+        return len;
+      }
+      const size_t held = out->size();
+      const long sent = s->direct_(s->directUser_, out->data(), held, in, n, s->directMore_);
+      if (sent >= 0 && static_cast<size_t>(sent) == held + n) {
+        out->clear();
+        return len;
+      }
+      // Short or refused: what is left stays in the caller's buffer, in
+      // order, and the rest of the reply is appended behind it.
+      s->directBlocked_ = true;
+      const size_t took = sent > 0 ? static_cast<size_t>(sent) : 0;
+      if (took >= held) {
+        out->clear();
+        out->append(in + (took - held), n - (took - held));
+      } else {
+        out->erase(0, took);
+        out->append(in, n);
+      }
+      return len;
+    }
+    out->append(in, n);
     return len;
   }
   static int wbioRead(BIO* b, char*, int) {
@@ -755,6 +924,14 @@ class TlsSession {
   std::string* out_ = nullptr;
   std::string stash_;
   std::string carry_;
+  // The direct outlet of the reply being written, if any (beginDirect).
+  static constexpr size_t kMaxRecordPlain = 16384;  // RFC 8446 5.1: a record's plaintext limit
+  static constexpr size_t kHoldRecord = 2048;       // a record this small waits for the next one
+  static constexpr size_t kHoldTotal = 8192;        // ...unless this much is already waiting
+  DirectSend direct_ = nullptr;
+  void* directUser_ = nullptr;
+  bool directMore_ = false;
+  bool directBlocked_ = false;
   bool handshakeDone_ = false;
   bool fatal_ = false;
 };
