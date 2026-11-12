@@ -3,6 +3,8 @@ name: ci
 # One per-commit gate. Everything that decides "is this commit good" lives here:
 # C++ unit tests, the addon driven through the conformance/hardening suites, the
 # full cross-platform build + smoke matrix, ASan/UBSan, and a fuzz-harness smoke.
+# Every build produces two binaries per ABI - BoringSSL inside, or linked to
+# node's OpenSSL - and `npm run test:suites` runs against both.
 # Branch protection should require ONLY the `ci-success` job at the bottom — it
 # goes green iff every job here passed.
 #
@@ -13,10 +15,25 @@ on:
   push:
     branches: [main]
   pull_request:
+  # boringssl-roll.yml runs this whole gate against a candidate BoringSSL
+  # before the pin file is committed: `boringssl_pin` overrides
+  # tools/boringssl.json for every build in the run.
+  workflow_call:
+    inputs:
+      boringssl_pin:
+        description: '<tag>@<commit> to build instead of the pinned BoringSSL'
+        type: string
+        default: ''
 
-# Keep the gate snappy: drop superseded runs on the same ref.
+# Empty unless called with a candidate (tools/boringssl.mjs ignores an empty value).
+env:
+  MORO_BORINGSSL_PIN: ${{ inputs.boringssl_pin }}
+
+# Keep the gate snappy: drop superseded runs on the same ref. (github.workflow
+# is the caller's name when this file is called, so a roll's verification and
+# a push to main never cancel each other.)
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -55,12 +72,17 @@ jobs:
         node-version: [20, 22, 24, 26]
     steps:
       - uses: actions/checkout@v7
+      # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
+      - uses: actions/cache@v6
+        with:
+          path: build/boringssl
+          key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
       - name: Build engine for this Node ABI
         run: node tools/build.mjs
-      # The engine's TLS links the OpenSSL exported by the host node binary;
+      # The OpenSSL binary links the OpenSSL exported by the host node binary;
       # assert those exports exist on this leg before running the TLS suites.
       - name: Assert node exports OpenSSL symbols
         run: nm -D "$(command -v node)" | grep -q SSL_CTX_new
@@ -87,6 +109,11 @@ jobs:
             envvar: MORO_ENGINE_BATCH=0
     steps:
       - uses: actions/checkout@v7
+      # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
+      - uses: actions/cache@v6
+        with:
+          path: build/boringssl
+          key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -111,6 +138,11 @@ jobs:
       MORO_ENGINE_REQUIRE_TRANSPORT: uring
     steps:
       - uses: actions/checkout@v7
+      # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
+      - uses: actions/cache@v6
+        with:
+          path: build/boringssl
+          key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
@@ -135,10 +167,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
+      - uses: actions/cache@v6
+        with:
+          path: build/boringssl
+          key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
       - name: Build engine (host ABI 24) inside the container image
         run: |
-          docker run --rm -v "$PWD:/repo" -w /repo node:24-bookworm \
-            sh -c "apt-get update -qq >/dev/null && apt-get install -y -qq g++ >/dev/null && CXX=g++ node tools/build.mjs"
+          docker run --rm -e MORO_BORINGSSL_PIN -v "$PWD:/repo" -w /repo node:24-bookworm \
+            sh -c "apt-get update -qq >/dev/null && apt-get install -y -qq g++ cmake git >/dev/null && CXX=g++ node tools/build.mjs"
       - name: io_uring blocked by seccomp -> epoll, with the reason
         run: |
           docker run --rm --security-opt seccomp=test/ci/seccomp-block-io_uring.json \
@@ -247,6 +284,11 @@ jobs:
       MORO_ENGINE_REQUIRE_TRANSPORT: ${{ matrix.transport }}
     steps:
       - uses: actions/checkout@v7
+      # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
+      - uses: actions/cache@v6
+        with:
+          path: build/boringssl
+          key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -285,9 +327,15 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
+      # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
+      - uses: actions/cache@v6
+        with:
+          path: build/boringssl
+          key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
       - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
         run: |
           brew list llvm >/dev/null 2>&1 || brew install llvm
+          command -v cmake >/dev/null || brew install cmake
           echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v6
         with:
@@ -310,6 +358,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
+      - uses: actions/cache@v6
+        with:
+          path: build/boringssl
+          key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
       # clang-18 + lld from apt.llvm.org: the toolchain the release binaries
       # are built (and PGO-trained) with; ubuntu-22.04's own clang 14 cannot
       # compile Node 25/26's V8 headers. The glibc floor is unaffected.
@@ -344,10 +397,15 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
+      - uses: actions/cache@v6
+        with:
+          path: build/boringssl
+          key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
       - name: Build in Alpine container (musl)
         run: |
-          docker run --rm -v "$PWD:/repo" -w /repo node:24-alpine \
-            sh -c "apk add --no-cache build-base clang lld llvm && node tools/build.mjs --all"
+          docker run --rm -e MORO_BORINGSSL_PIN -v "$PWD:/repo" -w /repo node:24-alpine \
+            sh -c "apk add --no-cache build-base clang lld llvm cmake git linux-headers && node tools/build.mjs --all"
       - uses: actions/upload-artifact@v7
         with:
           name: binaries-linux-${{ matrix.arch }}-musl
@@ -361,6 +419,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
+      - uses: actions/cache@v6
+        with:
+          path: build/boringssl
+          key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
       - name: Install clang-18 + lld + llvm-profdata
         run: |
           sudo apt-get update && sudo apt-get install -y clang-18 lld-18 llvm-18
@@ -384,6 +447,11 @@ jobs:
       CXX: g++
     steps:
       - uses: actions/checkout@v7
+      # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
+      - uses: actions/cache@v6
+        with:
+          path: build/boringssl
+          key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -397,14 +465,26 @@ jobs:
 
   # Windows (MSVC): build.mjs downloads the per-version node.lib
   # (SHASUMS-verified) and compiles with cl.exe (/DELAYLOAD:node.exe + the
-  # delay-load hook so the addon binds to any host exe name).
+  # delay-load hook so the addon binds to any host exe name). BoringSSL is
+  # built with the same cl.exe (cmake + ninja, NASM for the assembly).
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
+      # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
+      - uses: actions/cache@v6
+        with:
+          path: build/boringssl
+          key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
       # Third-party action pinned to a full commit SHA (supply-chain integrity);
       # Dependabot (.github/dependabot.yml) bumps the SHA + comment on new tags.
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+      # BoringSSL's x64 assembly on Windows is NASM source.
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -535,9 +615,15 @@ jobs:
       MORO_ENGINE_REQUIRE_TRANSPORT: uv
     steps:
       - uses: actions/checkout@v7
+      # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
+      - uses: actions/cache@v6
+        with:
+          path: build/boringssl
+          key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
       - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
         run: |
           brew list llvm >/dev/null 2>&1 || brew install llvm
+          command -v cmake >/dev/null || brew install cmake
           echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v6
         with:

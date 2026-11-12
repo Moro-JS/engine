@@ -1,0 +1,138 @@
+name: boringssl-roll
+
+# Keeps the bundled TLS library current without anyone having to remember.
+#
+# Half of the binaries this repository publishes carry BoringSSL inside them
+# (tools/boringssl.mjs). Whatever upstream fixes reaches the servers running
+# those binaries only through a release from here, so the release is automatic:
+#
+#   plan     once a week: has upstream cut a version tag newer than the pin?
+#   verify   the WHOLE ci.yml gate, on every platform, built against that tag -
+#            before anything is committed.
+#   release  only when verify is green: commit the new pin and its release
+#            note, bump the patch version, tag, create the GitHub Release, and
+#            start release.yml on the tag (which rebuilds, re-tests and
+#            publishes to npm, exactly as for a hand-made release).
+#   report   anything red opens (or updates) an issue instead of releasing.
+#
+# Upstream tags a snapshot every two to three weeks, so that is the cadence of
+# these releases. Run it by hand (workflow_dispatch) when a fix cannot wait for
+# Tuesday; untick `release` to stop after verify.
+#
+# What this needs from the repository settings:
+#   - the workflow may push to main and create tags. If main is protected
+#     against direct pushes, store a token that may bypass that as the secret
+#     ROLL_TOKEN (a fine-grained token with contents:write on this repository).
+#     Without the secret the workflow's own token is used.
+#   - release.yml is a trusted publisher on npm for every @morojs/engine*
+#     package (it already is); the dispatch below runs that same file.
+on:
+  schedule:
+    - cron: '23 5 * * 2' # Tuesdays 05:23 UTC
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Cut a patch release when the new BoringSSL passes the gate'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# One roll at a time; a second trigger waits for the first to finish.
+concurrency:
+  group: boringssl-roll
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.roll.outputs.changed }}
+      from: ${{ steps.roll.outputs.from }}
+      to: ${{ steps.roll.outputs.to }}
+      commit: ${{ steps.roll.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      # Reads upstream's tags; changes nothing. Outputs: changed, from, to, commit.
+      - name: Is there a newer BoringSSL?
+        id: roll
+        run: node tools/boringssl.mjs roll --dry-run
+
+  verify:
+    needs: [plan]
+    if: needs.plan.outputs.changed == 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      boringssl_pin: ${{ needs.plan.outputs.to }}@${{ needs.plan.outputs.commit }}
+
+  release:
+    needs: [plan, verify]
+    if: needs.plan.outputs.changed == 'true' && (github.event_name == 'schedule' || inputs.release)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the pin commit, the release commit, the tag, the GitHub Release
+      actions: write # start release.yml on the new tag
+    env:
+      ROLL_FROM: ${{ needs.plan.outputs.from }}
+      ROLL_TO: ${{ needs.plan.outputs.to }}
+      ROLL_COMMIT: ${{ needs.plan.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          token: ${{ secrets.ROLL_TOKEN || github.token }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Commit the new pin and its release note
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          node tools/boringssl.mjs roll --to="$ROLL_TO" --note
+          # The tag must still name the commit that was verified.
+          test "$(node -p "require('./tools/boringssl.json').commit")" = "$ROLL_COMMIT"
+          git add tools/boringssl.json CHANGELOG.md changelog/
+          git commit -m "BoringSSL $ROLL_FROM -> $ROLL_TO"
+      # Bumps every version, commits, tags, pushes main and the tag. The build
+      # and smoke gate it would run locally is what `verify` just did, on every
+      # platform; its own check of the pin against upstream still runs.
+      - name: Bump, tag, push
+        run: node tools/release.mjs patch --skip-checks
+      # A Release created with the workflow token does not fire `release`
+      # events (GitHub's rule against workflows triggering workflows), so the
+      # publish workflow is started explicitly, on the tag.
+      - name: GitHub Release, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="v$(node -p "require('./packages/engine/package.json').version")"
+          gh release create "$v" --title "$v" --notes-file "changelog/$v.md" --verify-tag
+          gh workflow run release.yml --ref "$v"
+          echo "Released $v with BoringSSL $ROLL_TO; npm publish is running in release.yml" >> "$GITHUB_STEP_SUMMARY"
+
+  report:
+    needs: [plan, verify, release]
+    if: always() && (needs.plan.result == 'failure' || needs.verify.result == 'failure' || needs.release.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ROLL_TO: ${{ needs.plan.outputs.to }}
+      RESULTS: plan=${{ needs.plan.result }} verify=${{ needs.verify.result }} release=${{ needs.release.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open or update the issue
+        run: |
+          title="BoringSSL roll${ROLL_TO:+ to $ROLL_TO} did not go through"
+          body="The scheduled BoringSSL update stopped before a release ($RESULTS). The published binaries stay on the previous snapshot until this is resolved. Run: $RUN_URL"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

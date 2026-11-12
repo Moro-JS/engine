@@ -21,7 +21,8 @@
     "node": ">=20"
   },
   "files": [
-    "*.node"
+    "*.node",
+    "LICENSE-BORINGSSL"
   ],
   "publishConfig": {
     "access": "public",

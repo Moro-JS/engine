@@ -18,9 +18,15 @@ name: release
 # artifacts CI already built for this commit (workflow_run) or gate publish on
 # the tagged commit's `ci-success`. Rebuilding + re-smoking here is simpler and
 # self-contained, at the cost of a second build.
+#
+# The second way in is workflow_dispatch ON A TAG: boringssl-roll.yml cuts a
+# patch release by itself when BoringSSL moves (tag + GitHub Release, both
+# created with the workflow token, which by design does not fire `release`
+# events), then dispatches this workflow on that tag. Same jobs, same gates.
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 # Least privilege at the top; the publish job elevates to contents:write to
 # attach SHA256SUMS to the Release (see its job-level permissions).
@@ -29,8 +35,23 @@ permissions:
   id-token: write # npm provenance + trusted publishing (OIDC)
 
 jobs:
+  # A dispatch has to be on a release tag: everything below reads the version
+  # from GITHUB_REF_NAME.
+  ref-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a vX.Y.Z tag
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v[0-9]*.[0-9]*.[0-9]*) echo "releasing $GITHUB_REF_NAME" ;;
+            *) echo "release.yml must run on a vX.Y.Z tag, got $GITHUB_REF"; exit 1 ;;
+          esac
+
   # ── Build every published binary flavor + its checksum manifest ─────────────
+  # Two binaries per ABI: BoringSSL inside (tools/boringssl.mjs, pinned), and
+  # linked to node's OpenSSL.
   darwin:
+    needs: [ref-check]
     # Node 25/26's V8 headers use braced-init template args (P2308) that need
     # clang 18+; the runner's Apple clang is older, so build with Homebrew LLVM.
     runs-on: macos-15
@@ -39,6 +60,7 @@ jobs:
       - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
         run: |
           brew list llvm >/dev/null 2>&1 || brew install llvm
+          command -v cmake >/dev/null || brew install cmake
           echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v6
         with:
@@ -62,6 +84,7 @@ jobs:
           path: SHA256SUMS.darwin
 
   linux-gnu:
+    needs: [ref-check]
     strategy:
       matrix:
         include:
@@ -97,6 +120,7 @@ jobs:
   # docker-run instead of `container:`: JS actions can't run inside Alpine
   # containers on arm64 runners (no musl Node to inject). See ci.yml.
   linux-musl:
+    needs: [ref-check]
     strategy:
       matrix:
         include:
@@ -110,7 +134,7 @@ jobs:
       - name: Build in Alpine container (musl)
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo node:24-alpine \
-            sh -c "apk add --no-cache build-base clang lld llvm && node tools/pgo.mjs --all"
+            sh -c "apk add --no-cache build-base clang lld llvm cmake git linux-headers && node tools/pgo.mjs --all"
       - name: Checksum manifest
         run: shasum -a 256 build/*.node > SHA256SUMS.linux-${{ matrix.arch }}-musl
       - uses: actions/upload-artifact@v7
@@ -123,12 +147,19 @@ jobs:
           path: SHA256SUMS.linux-${{ matrix.arch }}-musl
 
   windows:
+    needs: [ref-check]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
       # Third-party action pinned to a full commit SHA (supply-chain integrity);
       # Dependabot (.github/dependabot.yml) bumps the SHA + comment on new tags.
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+      # BoringSSL's x64 assembly on Windows is NASM source.
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -335,7 +366,8 @@ jobs:
         run: gh release upload "$GITHUB_REF_NAME" SHA256SUMS --clobber
 
       # Derive the release version from the tag (v1.2.3 -> 1.2.3) and assemble.
-      # --check fails the release if any published platform got zero binaries.
+      # --check fails the release unless every platform package got both
+      # binaries (BoringSSL and OpenSSL) for every ABI, and BoringSSL's licence.
       - name: Assemble packages
         run: |
           VERSION="${GITHUB_REF_NAME#v}"

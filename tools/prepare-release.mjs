@@ -10,13 +10,19 @@
 //      the hand-maintained version strings (meta + every platform package) can
 //      never drift.
 //
-// Binary naming: moro_engine_<platform>_<arch>[_<libc>]_<abi>.node
+//   3. Puts BoringSSL's licence beside the binaries that carry it
+//      (LICENSE-BORINGSSL, from the pinned source tree, commit-verified).
+//
+// Binary naming: moro_engine_<platform>_<arch>[_<libc>]_<abi>[_boringssl].node
 // Package dirs:  engine-<platform>-<arch>[-<libc>]  (so <platform>_<arch>[_<libc>]
 //                is the dir name after 'engine-' with '-' -> '_').
 //
 // Usage: node tools/prepare-release.mjs <version> [--check]
-//   --check verifies every platform package (win32 included) received >=1
-//           binary (a release must not publish an empty binary carrier).
+//   --check verifies every platform package (win32 included) received BOTH
+//           binaries - the one on node's OpenSSL and the one carrying
+//           BoringSSL - for EVERY supported Node ABI. A release must not
+//           publish a package that is missing one: the loader would quietly
+//           serve TLS from the other library, or have nothing to load.
 
 import {
   readdirSync,
@@ -28,6 +34,8 @@ import {
 } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { TARGETS } from './build.mjs';
+import { fetchSource, readPin } from './boringssl.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const buildDir = join(root, 'build');
@@ -63,6 +71,18 @@ const binaries = existsSync(buildDir)
 
 const problems = [];
 
+// The BoringSSL binaries are a redistribution of BoringSSL: its licence text
+// travels with them. Taken from the exact tree the binaries were built from.
+let boringLicense = null;
+if (binaries.some((b) => b.endsWith('_boringssl.node'))) {
+  const pin = readPin();
+  boringLicense = { path: join(fetchSource(pin), 'LICENSE'), tag: pin.tag };
+  if (!existsSync(boringLicense.path)) {
+    console.error(`BoringSSL ${pin.tag} has no LICENSE file at ${boringLicense.path}`);
+    process.exit(1);
+  }
+}
+
 for (const dir of platformDirs) {
   const pkgPath = join(packagesDir, dir, 'package.json');
   const pkg = readJson(pkgPath);
@@ -79,9 +99,19 @@ for (const dir of platformDirs) {
   if (existsSync(licenseSrc)) {
     copyFileSync(licenseSrc, join(destDir, 'LICENSE'));
   }
+  if (boringLicense && matches.some((b) => b.endsWith('_boringssl.node'))) {
+    copyFileSync(boringLicense.path, join(destDir, 'LICENSE-BORINGSSL'));
+  }
   console.log(`${dir}: version ${version}, ${matches.length} binaries`);
-  if (check && matches.length === 0) {
-    problems.push(`${dir}: no binaries matched ${prefix}*.node`);
+  if (check) {
+    for (const { abi } of TARGETS) {
+      for (const name of [`${prefix}${abi}.node`, `${prefix}${abi}_boringssl.node`]) {
+        if (!matches.includes(name)) problems.push(`${dir}: ${name} is missing`);
+      }
+    }
+    if (boringLicense && !existsSync(join(destDir, 'LICENSE-BORINGSSL'))) {
+      problems.push(`${dir}: LICENSE-BORINGSSL is missing`);
+    }
   }
 }
 

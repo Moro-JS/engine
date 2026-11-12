@@ -1,0 +1,13 @@
+#!/bin/sh
+# Optional, warn-only: says so when the pinned BoringSSL has gone stale.
+# Enable once per clone:  git config core.hooksPath .githooks
+#
+# It never blocks a push. The gate that blocks is in tools/release.mjs (no
+# release on a stale pin) and the pin is normally kept fresh by the scheduled
+# workflow (.github/workflows/boringssl-roll.yml); this is the nudge in between.
+command -v node >/dev/null 2>&1 || exit 0
+out=$(node tools/boringssl.mjs check 2>/dev/null)
+if [ $? -eq 3 ]; then
+  printf '\n%s\n\n' "$out" >&2
+fi
+exit 0

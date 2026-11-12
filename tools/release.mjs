@@ -10,11 +10,14 @@
 //   --dry-run       show everything that WOULD happen, change nothing
 //   --no-push       commit + tag locally, but don't push (push later yourself)
 //   --skip-checks   skip the build + smoke gate (not recommended)
+//   --allow-stale-tls   release although the pinned BoringSSL is stale or could
+//                       not be checked (not recommended; say why in the note)
 //
 // What it does, in order:
 //   1. Safety gates: clean working tree, on main, the release note
-//      changelog/vX.Y.Z.md present and indexed in CHANGELOG.md,
-//      --skip-checks-able build+smoke.
+//      changelog/vX.Y.Z.md present and indexed in CHANGELOG.md, the pinned
+//      BoringSSL not stale (tools/boringssl.mjs check), --skip-checks-able
+//      build+smoke.
 //   2. Bumps the version EVERYWHERE it lives: the meta package + its exact
 //      optionalDependencies pins, all 7 platform packages, the monorepo root,
 //      and the kEngineVersion fallback in src/binding.cpp.
@@ -33,12 +36,14 @@ import { execSync } from 'node:child_process';
 import { readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { checkPin } from './boringssl.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const args = process.argv.slice(2);
 const dryRun = args.includes('--dry-run');
 const noPush = args.includes('--no-push');
 const skipChecks = args.includes('--skip-checks');
+const allowStaleTls = args.includes('--allow-stale-tls');
 const bumpArg = args.find(a => !a.startsWith('--'));
 
 function die(msg) {
@@ -85,6 +90,29 @@ const notesPath = join(root, 'changelog', `v${next}.md`);
 if (!existsSync(notesPath)) die(`changelog/v${next}.md is missing - write the release note first`);
 if (!readFileSync(join(root, 'CHANGELOG.md'), 'utf8').includes(`changelog/v${next}.md`))
   die(`CHANGELOG.md has no entry for v${next} - add its line at the top of the list`);
+
+// A release ships BoringSSL inside half its binaries, and that copy is the
+// only one its users get: no release goes out on a pin that upstream has
+// moved past for longer than the roll cadence. This is the gate on a
+// developer's machine; the scheduled workflow (boringssl-roll.yml) is what
+// normally keeps the pin fresh.
+try {
+  const tlsPin = checkPin();
+  if (tlsPin.stale) {
+    const msg =
+      `the pinned BoringSSL ${tlsPin.pin.tag} is ${tlsPin.ageDays} days old and upstream is at ${tlsPin.latest.tag}.\n` +
+      `  node tools/boringssl.mjs roll && node tools/build.mjs && npm test\n` +
+      `then commit tools/boringssl.json and release.`;
+    if (!allowStaleTls) die(msg);
+    console.warn(`WARNING (--allow-stale-tls): ${msg}\n`);
+  } else {
+    console.log(`bundled TLS: BoringSSL ${tlsPin.pin.tag}, ${tlsPin.ageDays} days old` + (tlsPin.behind ? `, upstream is at ${tlsPin.latest.tag} (inside the ${tlsPin.maxAgeDays}-day window)` : ', upstream\'s newest') + '\n');
+  }
+} catch (err) {
+  const msg = `could not check the BoringSSL pin against upstream: ${err.message}`;
+  if (!allowStaleTls) die(`${msg}\n  (needs network access to the upstream repository; --allow-stale-tls releases without the check)`);
+  console.warn(`WARNING (--allow-stale-tls): ${msg}\n`);
+}
 
 if (!skipChecks) {
   console.log('build + smoke gate (skip with --skip-checks):');
