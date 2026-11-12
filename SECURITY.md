@@ -72,7 +72,11 @@ touches untrusted network bytes:
   `src/sha1.h`)
 - The TCP/connection engine and its lifecycle/timeout handling (`src/server.h`)
 - **In-process TLS termination** — the engine's handshake/record pump around
-  OpenSSL, ALPN, mutual TLS, and session/ticket resumption (`src/tls.h`)
+  the TLS library, ALPN, mutual TLS, and session/ticket resumption (`src/tls.h`)
+- **The bundled TLS library's supply chain** — which BoringSSL snapshot the
+  published binaries carry, how it is fetched, verified and built, and how
+  quickly a newer one is released (`tools/boringssl.mjs`,
+  `.github/workflows/boringssl-roll.yml`; see "The bundled TLS library" below)
 - **WebSocket permessage-deflate** (RFC 7692) — the inflate/deflate framing and
   the zip-bomb output cap (`src/ws_deflate.h`)
 - The V8 boundary — request/response and WebSocket bindings (`src/binding.cpp`)
@@ -88,13 +92,44 @@ touches untrusted network bytes:
   Report those to the MoroJS framework repository.
 - **Node.js itself and its bundled libraries** (V8, libuv, OpenSSL). Report
   those upstream to Node.js. The engine's TLS is in scope (see above), but a
-  vulnerability in the **OpenSSL library** it links (the host Node's) is an
-  upstream issue — report the engine's *use* of it here, the library itself to
-  Node.js/OpenSSL.
+  vulnerability in the **OpenSSL library** one of its binaries links (the host
+  Node's) is an upstream issue — report the engine's *use* of it here, the
+  library itself to Node.js/OpenSSL.
+- **A flaw in BoringSSL itself.** Report it upstream
+  ([BoringSSL's process](https://boringssl.googlesource.com/boringssl/+/HEAD/SECURITY.md)).
+  Do tell us as well, privately: the published binaries carry a copy, and a
+  release with the fixed snapshot is ours to make.
 - **Third-party dependencies** pulled in by your app.
 - **Denial of service that the framework/operator is expected to bound** (e.g.
   application-level rate limiting, per-tenant quotas). The engine provides the
   parsing/DoS primitives documented in the threat model, not a full rate limiter.
+
+## The bundled TLS library
+
+From 1.1.20 the default binary on every platform carries
+[BoringSSL](https://boringssl.googlesource.com/boringssl); a second binary
+links the OpenSSL of the running Node.js and is used when that library is
+specially configured (FIPS, providers, an OpenSSL config), when asked for, or
+as the fallback ([docs/TLS.md](docs/TLS.md)). `probe().tls` reports which.
+
+A bundled library is fixed only by a release from this repository, so:
+
+- The snapshot is pinned by tag and commit in one file
+  (`tools/boringssl.json`); a fetch that does not resolve to that commit is
+  not built. BoringSSL's source is not in this repository.
+- A scheduled workflow looks for a newer upstream snapshot every week. When
+  there is one, the entire CI gate runs against it on every platform, and on
+  green a patch release is published to npm with no human step. On red it
+  opens an issue and publishes nothing.
+- The release script refuses to cut any release while the pinned snapshot is
+  more than 21 days old and upstream has a newer one.
+- A server terminating TLS on a snapshot more than 180 days old says so in a
+  process warning (`MORO_ENGINE_TLS_STALE`).
+
+BoringSSL publishes dated snapshots, not advisories. A scheduled release here
+is therefore not a claim that the previous snapshot was vulnerable; staying on
+an old one is a decision to go without whatever upstream fixed since. **Keep
+`@morojs/engine` updated** the way you keep Node.js updated.
 
 For the full attack-surface analysis, trust boundaries, mitigations, and the
 honest list of known limitations, see

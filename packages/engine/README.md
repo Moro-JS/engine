@@ -55,6 +55,21 @@ rich, actionable error (`err.code === 'MORO_ENGINE_BINARY_MISSING'`) that names
 the expected package, the running Node ABI, and the remediation for npm's
 optional-dependency lockfile bug ([npm/cli#4828](https://github.com/npm/cli/issues/4828)).
 
+## TLS
+
+Each platform package carries two builds of the engine per Node version. The
+default terminates TLS with a bundled [BoringSSL](https://boringssl.googlesource.com/boringssl);
+the other uses the OpenSSL of the running Node.js and is selected by itself
+when that library is specially configured (FIPS mode, `--openssl-config`,
+`OPENSSL_CONF`, ...), or with `MORO_ENGINE_TLS=openssl` /
+`engine.selectTls('openssl')`. `engine.probe().tls` reports which is loaded.
+
+The bundled library is updated by a scheduled release every time upstream
+publishes a snapshot (every two to three weeks), so **keep this package
+updated** the way you keep Node.js updated; a TLS server on a build more than
+180 days old says so in a process warning (`MORO_ENGINE_TLS_STALE`). Details:
+[docs/TLS.md](https://github.com/Moro-JS/engine/blob/main/docs/TLS.md).
+
 ## Supported platforms
 
 | Package                          | os     | cpu     | libc  |

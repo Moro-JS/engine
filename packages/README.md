@@ -31,15 +31,19 @@ developer machine (see `CONTRIBUTING.md`). Pushing a `v*` tag runs `release.yml`
 which:
 
 1. Rebuilds every platform (same matrix as `ci.yml`) and collects the
-   `build/*.node` artifacts (`moro_engine_<platform>_<arch>[_<libc>]_<abi>.node`,
-   one per supported ABI — the `libc` segment keeps glibc and musl distinct).
+   `build/*.node` artifacts: two per supported ABI,
+   `moro_engine_<platform>_<arch>[_<libc>]_<abi>_boringssl.node` (BoringSSL
+   inside; what the loader prefers) and
+   `moro_engine_<platform>_<arch>[_<libc>]_<abi>.node` (linked to node's
+   OpenSSL). The `libc` segment keeps glibc and musl distinct.
 2. Runs `node tools/prepare-release.mjs <version> --check`, which for each
    per-platform package directory copies that platform's matching `.node` files
-   in, drops the root `LICENSE` alongside them, and sets `version`; then syncs
+   in, drops the root `LICENSE` and BoringSSL's licence (`LICENSE-BORINGSSL`,
+   from the pinned source tree) alongside them, and sets `version`; then syncs
    the meta package's own `version` **and** every exact-pinned
    `optionalDependencies` entry to the same version (so the eight version
-   strings can never drift). `--check` fails the release if any published
-   platform received zero binaries.
+   strings can never drift). `--check` fails the release unless every platform
+   received both binaries for every ABI.
 3. Publishes each per-platform package, then the meta package (`packages/engine`)
    **last**, so its `optionalDependencies` already resolve on the registry.
 

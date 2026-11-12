@@ -26,7 +26,9 @@ peer sends from, and 1.1.13 makes the order selectable, with a measured `auto` m
 [MoroJS Benchmark repo](https://github.com/Moro-JS/benchmark); release notes in
 [CHANGELOG.md](CHANGELOG.md). 1.1.19 adds HTTP/2
 (ALPN on TLS, prior knowledge on cleartext, HTTP/1.1 beside it on the same
-port). See [docs/DESIGN.md](docs/DESIGN.md) and
+port). 1.1.20 terminates TLS with a bundled BoringSSL, kept current by a
+scheduled release, with node's OpenSSL still one setting away
+([docs/TLS.md](docs/TLS.md)). See [docs/DESIGN.md](docs/DESIGN.md) and
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Why

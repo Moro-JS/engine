@@ -17,7 +17,7 @@ Goal: saturate the hardware (~105k req/s hello-world reference ceiling on the be
 ### L2 — Protocol engine
 - HTTP/1.1: incremental SIMD-friendly parser; strict RFC 9112 (hard-reject conflicting Content-Length/Transfer-Encoding), header count/size limits, keep-alive, chunked bodies.
 - WebSocket: RFC 6455 framing + permessage-deflate (zlib), Autobahn-validated.
-- TLS: BoringSSL as a linked dependency (nobody writes TLS from scratch).
+- TLS: a linked library, never written here. Two binaries per platform and ABI since 1.1.20: BoringSSL carried inside the addon (the default; pinned and built by `tools/boringssl.mjs`), and the OpenSSL exported by the host node (FIPS/provider configurations, by request, and as the fallback). `src/tls.h` is the only file that knows there are two. See `docs/TLS.md`.
 - HTTP/2 (1.1.19): RFC 9113 server + RFC 7541 HPACK in `src/http2.h`, a pure state machine like the HTTP/1 parser (no I/O, no V8). ALPN `h2` on TLS, prior knowledge on cleartext, HTTP/1.1 on the same port. A request on a stream is surfaced exactly as an HTTP/1 request is, so the binding and everything above it are protocol-blind.
 - Out of scope: HTTP/3/QUIC.
 
@@ -146,8 +146,8 @@ esbuild-style: `@morojs/engine` meta package (loader + types) with per-platform 
 @morojs/engine-linux-arm64-musl
 ```
 
-Each platform package carries one binary per supported ABI:
-`moro_engine_<platform>_<arch>_<abi>.node`. ABI policy: 115/127/131/137/141/147 (Node 20/22/23/24/25/26); new Node major = one TARGETS line + CI run + minor release. The loader is libc-aware (glibc vs musl via `process.report`) and exports non-throwing `probe()` diagnostics that MoroJS's preflight consumes.
+Each platform package carries two binaries per supported ABI:
+`moro_engine_<platform>_<arch>_<abi>_boringssl.node` (BoringSSL inside, loaded by default) and `moro_engine_<platform>_<arch>_<abi>.node` (node's OpenSSL), plus `LICENSE-BORINGSSL`. ABI policy: 115/127/131/137/141/147 (Node 20/22/23/24/25/26); new Node major = one TARGETS line + CI run + minor release. The loader is libc-aware (glibc vs musl via `process.report`) and exports non-throwing `probe()` diagnostics that MoroJS's preflight consumes.
 
 ## Versioning
 

@@ -74,8 +74,11 @@ serve(callbacks: {
     requestCert?: boolean;             // mutual TLS
     rejectUnauthorized?: boolean;      // default true
     // Explicit cipher/group policy (capabilities.tlsPolicy) for compliance
-    // baselines; unset = the host Node's OpenSSL defaults. Same semantics as
-    // Node's tls.createSecureContext; invalid values THROW from serve().
+    // baselines. Same semantics as Node's tls.createSecureContext; invalid
+    // values THROW from serve(). Unset = the TLS library's own set, AES-128-GCM
+    // ahead of AES-256-GCM, ChaCha20 for a client that lists it first. On the
+    // bundled BoringSSL (probe().tls.library) `ciphersuites` can name the three
+    // suites it has and `ciphers` has no DHE/CCM; see docs/TLS.md.
     ciphers?: string;                  // TLS <= 1.2 cipher list
     ciphersuites?: string;             // TLS 1.3 suites (colon-separated)
     ecdhCurve?: string;                // key-share groups, e.g. 'X25519:P-256'; 'auto' = default
@@ -230,8 +233,23 @@ probe(): { ok: boolean, version?: string, abi, platform, arch,
            fastApi?: { compiled: boolean, installed: boolean, reason: string, compiledV8: string, runtimeV8: string },
            fastCallStats?: { [fn: string]: { fast: number, slow: number } },
            transport?: 'uv' | 'uring' | 'epoll', transportReason?: string, transportMode?: string,
+           tls?: { library: 'boringssl' | 'openssl', version: string, date?: string,
+                   reason: string, fallbackReason?: string },
            error?: string };
 version: string;
+
+// Which TLS library (1.1.20). Two binaries ship per platform and ABI: one
+// carries BoringSSL (the default), one links the running node's OpenSSL.
+// selectTls() chooses before the binding is loaded on this thread - the first
+// probe() or serve(); for the other library after that it throws
+// (code MORO_ENGINE_TLS_LOADED). 'auto' is BoringSSL unless node's OpenSSL is
+// configured (FIPS, --openssl-config and friends, OPENSSL_CONF). The
+// environment variable MORO_ENGINE_TLS takes the same values. probe().tls
+// reports the library loaded, its version (BoringSSL: the pinned upstream tag
+// and its date) and the reason. docs/TLS.md has the whole story.
+// Passing the ssl options about to be served lets the load check that
+// BoringSSL accepts them and settle on OpenSSL if not (reason 'fallback').
+selectTls(library: 'boringssl' | 'openssl' | 'auto', ssl?: ServeOptions['ssl']): 'boringssl' | 'openssl' | 'auto';
 ```
 
 ## Engine-side guarantees

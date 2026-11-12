@@ -34,6 +34,11 @@ CI build leg (the local build has landed in `tools/build.mjs`).
   lets a prepared response's header block be built once and replayed on every
   connection. h2spec 146/146 over TLS. Still to come there: WebSocket over
   HTTP/2 (RFC 8441), RFC 9218 priorities.
+- **BoringSSL** — shipped in 1.1.20 as the default TLS library, as first
+  planned for M3 (below), but linked from a pinned upstream snapshot rather
+  than vendored, and with the binary on node's OpenSSL kept beside it
+  (`docs/TLS.md`). A scheduled workflow follows upstream's snapshots and
+  releases each one.
 - **Windows (MSVC) CI build leg** — the local build lands in `tools/build.mjs`;
   wiring the CI matrix leg is the remaining packaging work.
 - **SNI multi-identity** — one key/cert per server today; per-SNI dispatch is future.
