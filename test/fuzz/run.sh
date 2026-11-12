@@ -76,6 +76,10 @@ if [ "$TARGET" = all ] || [ "$TARGET" = ws ]; then
   run_target ws fuzz_websocket.cc
   ran=1
 fi
+if [ "$TARGET" = all ] || [ "$TARGET" = http2 ]; then
+  run_target http2 fuzz_http2.cc
+  ran=1
+fi
 if [ "$TARGET" = all ] || [ "$TARGET" = tls ]; then
   # Homebrew OpenSSL on macOS (system LibreSSL ships no headers); plain
   # -lssl -lcrypto on Linux.
@@ -97,7 +101,7 @@ if [ "$TARGET" = all ] || [ "$TARGET" = uring ]; then
 fi
 
 if [ "$ran" = 0 ]; then
-  echo "unknown fuzz target: $TARGET (expected http|ws|tls|pmd|uring|all)" >&2
+  echo "unknown fuzz target: $TARGET (expected http|ws|http2|tls|pmd|uring|all)" >&2
   exit 2
 fi
 

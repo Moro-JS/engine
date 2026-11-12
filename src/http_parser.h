@@ -57,6 +57,19 @@ enum class ParseStatus : uint8_t {
   Error,      // malformed/unsafe - respond with errorStatus and close
 };
 
+// HTTP/2 (serve option `http2`). Off unless asked for: a server that enables
+// it speaks h2 to a TLS client that negotiates it by ALPN and to a cleartext
+// client that opens with the HTTP/2 preface (prior knowledge), and HTTP/1.1
+// to everyone else on the same port. Zero means the engine's default.
+struct Http2Options {
+  bool enabled = false;
+  uint32_t maxConcurrentStreams = 0;  // 256
+  uint32_t initialWindowSize = 0;     // 1 MiB per stream
+  uint32_t maxFrameSize = 0;          // 16,384
+  uint32_t maxHeaderListSize = 0;     // maxHeadSize
+  uint32_t headerTableSize = 0;       // 4,096
+};
+
 struct HttpLimits {
   size_t maxHeadSize = 64 * 1024;  // request line + all headers
   size_t maxHeaders = 100;
@@ -89,6 +102,7 @@ struct HttpLimits {
   int backlog = 512;
   // WebSocket permessage-deflate (RFC 7692), opt-in. Off by default preserves the "compression declined" posture; enabling it is an app decision.
   PmdOptions wsDeflate{};
+  Http2Options http2{};
 };
 
 // Limits for a default-constructed parser. Servers pass their own HttpLimits,

@@ -43,6 +43,10 @@ echo "HTTP parser unit tests ..."
 $CXX -std=c++20 -O2 "$DIR/http-parser-unit.cpp" -o /tmp/moro_hptest
 /tmp/moro_hptest
 
+echo "HTTP/2 unit tests ..."
+$CXX -std=c++20 -O2 "$DIR/http2-unit.cpp" -o /tmp/moro_h2test
+/tmp/moro_h2test "$DIR/fixtures/hpack-vectors.txt"
+
 echo "WebSocket unit tests ..."
 $CXX -std=c++20 -O2 "$DIR/websocket-unit.cpp" -o /tmp/moro_wstest
 /tmp/moro_wstest

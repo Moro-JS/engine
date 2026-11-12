@@ -67,6 +67,7 @@ window to remediate before public disclosure.
 touches untrusted network bytes:
 
 - HTTP/1.1 request parsing and framing (`src/http_parser.h`)
+- HTTP/2 framing, stream state, flow control and HPACK (`src/http2.h`)
 - WebSocket framing, masking, and UTF-8 handling (`src/websocket.h`,
   `src/sha1.h`)
 - The TCP/connection engine and its lifecycle/timeout handling (`src/server.h`)

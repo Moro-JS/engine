@@ -25,7 +25,9 @@ namespace engine {
 template <typename V>
 class FlatMap {
  public:
-  FlatMap() : keys_(kInitialCap, 0), vals_(kInitialCap, V{}) {}
+  // `capacity` must be a power of two. The default suits the per-thread
+  // request registry; a map that lives per connection asks for a small one.
+  explicit FlatMap(size_t capacity = kInitialCap) : keys_(capacity, 0), vals_(capacity, V{}) {}
 
   V find(uint32_t k) const {
     size_t i = probe(k);
@@ -75,6 +77,14 @@ class FlatMap {
   }
 
   size_t size() const { return size_; }
+
+  // Calls fn(key, value) for every entry. The map must not be changed from
+  // inside the call.
+  template <typename Fn>
+  void forEach(Fn&& fn) const {
+    for (size_t i = 0; i < keys_.size(); ++i)
+      if (keys_[i] != 0) fn(keys_[i], vals_[i]);
+  }
 
  private:
   static constexpr size_t kInitialCap = 4096;  // power of two

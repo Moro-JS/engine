@@ -81,6 +81,21 @@ serve(callbacks: {
     ecdhCurve?: string;                // key-share groups, e.g. 'X25519:P-256'; 'auto' = default
   };
 
+  // HTTP/2 (RFC 9113; feature-detect via probe().capabilities.http2). Off by
+  // default. With `ssl`, negotiated by ALPN ("h2" offered ahead of
+  // "http/1.1"); without it, spoken to a client that opens with the HTTP/2
+  // connection preface (prior knowledge). HTTP/1.1 is served beside it on
+  // the same port. A request on a stream reaches onRequest exactly as an
+  // HTTP/1 request does and is answered with the same calls. Not offered:
+  // WebSocket over HTTP/2, server push, CONNECT.
+  http2?: boolean | {
+    maxConcurrentStreams?: number;   // default 256
+    initialWindowSize?: number;      // per-stream receive window, default 1 MiB
+    maxFrameSize?: number;           // default 16384
+    maxHeaderListSize?: number;      // default: maxHeadSize
+    headerTableSize?: number;        // default 4096
+  };
+
   // WebSocket permessage-deflate (RFC 7692; feature-detect via
   // probe().capabilities.wsDeflate). Off by default (preserves the
   // compression-oracle-free posture). boolean to enable with defaults, or an

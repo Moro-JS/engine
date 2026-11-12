@@ -30,6 +30,10 @@ struct ResponseTemplate {
   int status = 200;
   long long customCL = -1;  // app-supplied Content-Length (honoured on HEAD/bodyless only)
   std::string headers;      // app header block; never contains Content-Length
+  // The same status and headers as an HTTP/2 header block (HPACK), built the
+  // first time the template answers an HTTP/2 request. The engine's encoder
+  // keeps no per-connection state, so one block serves every connection.
+  mutable std::string h2Block;
 };
 
 class TemplateStore {

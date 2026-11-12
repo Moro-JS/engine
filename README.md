@@ -24,8 +24,9 @@ request path; 1.1.11 takes that transport down to one `epoll_wait` per
 loop turn, 1.1.12 serves each turn's sockets grouped by the CPU their
 peer sends from, and 1.1.13 makes the order selectable, with a measured `auto` mode. Measured comparisons live in the
 [MoroJS Benchmark repo](https://github.com/Moro-JS/benchmark); release notes in
-[CHANGELOG.md](CHANGELOG.md). In progress:
-ALPN HTTP/2 (vendored nghttp2). See [docs/DESIGN.md](docs/DESIGN.md) and
+[CHANGELOG.md](CHANGELOG.md). 1.1.19 adds HTTP/2
+(ALPN on TLS, prior knowledge on cleartext, HTTP/1.1 beside it on the same
+port). See [docs/DESIGN.md](docs/DESIGN.md) and
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Why

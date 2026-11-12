@@ -37,6 +37,7 @@
 #include "uring.h"
 #endif
 
+#include "http2.h"
 #include "http_parser.h"
 #include "response_template.h"
 #include "tls.h"
@@ -331,6 +332,20 @@ struct Connection {
   // TLS transform when the server terminates TLS; null on plaintext servers (the hot path pays exactly one null check).
   TlsSession* tls = nullptr;
 
+  // HTTP/2 (http2.h, Server "HTTP/2" section). `proto` is settled by a
+  // connection's first bytes or by ALPN: 0 undecided, 1 HTTP/1, 2 HTTP/2. A
+  // connection speaking HTTP/2 owns a session, and each request on it is
+  // surfaced on a Connection of its own - h2Parent set, no socket, no parser
+  // in use - that carries the request snapshot and the response state, so
+  // everything that answers a request by reqId works on it unchanged.
+  uint8_t proto = 0;
+  bool h2Feeding = false;            // (the connection) inside Server::h2Feed
+  h2::Session* h2 = nullptr;         // (the connection) its session
+  Connection* h2Parent = nullptr;    // (a request) the connection it arrived on
+  h2::Stream* h2s = nullptr;         // (a request) its stream, while it has one
+  uint32_t h2Gen = 0;                // (a request) the batch call it was delivered in
+  bool h2Bye = false;                // (the connection) the closing frames were sent, or are pointless
+
   // Idle-sweep bookkeeping: reset to 0 on every read, incremented each sweep while not actively running a handler; closed when it exceeds the limit.
   uint32_t idleTicks = 0;
   // Request-timeout bookkeeping: incremented each sweep while a request is partially received; NOT reset by activity (slow-drip defense), only when the request completes or the connection goes back to idle keep-alive.
@@ -343,6 +358,7 @@ struct Connection {
     delete wsParser;
     delete tls;
     delete pmd;
+    delete h2;
   }
 };
 
@@ -645,6 +661,16 @@ class Server {
     listenerClosed_ = true;
     uv_close(reinterpret_cast<uv_handle_t*>(&tcp_), onServerHandleClosed);
     tCloseListener();
+    // HTTP/2 connections are told to open no more streams (GOAWAY); what is
+    // in flight on them completes. HTTP/1 connections learn it from the
+    // Connection: close of their next response, as before.
+    std::vector<Connection*> live(conns_.begin(), conns_.end());
+    for (Connection* c : live) {
+      if (c->h2 && !c->closing && !c->h2->goawaySent()) {
+        c->h2->goaway();
+        h2Flush(c);
+      }
+    }
   }
 
   void close(void (*onClosed)(void*) = nullptr, void* user = nullptr) {
@@ -685,6 +711,7 @@ class Server {
   }
 
   std::string remoteAddress(Connection* c) {
+    if (c->h2Parent) c = c->h2Parent;  // an HTTP/2 request: its connection's peer
     struct sockaddr_storage addr;
     int len = sizeof(addr);
     if (!tPeerName(c, &addr, &len)) return "";
@@ -715,7 +742,7 @@ class Server {
       respond(c, 500, emptyHeaders(), -1, nullptr, 0);
       return;
     }
-    respond(c, t->status, t->headers, t->customCL, body, bodyLen);
+    respond(c, t->status, t->headers, t->customCL, body, bodyLen, t);
   }
   void writeHeadTemplate(Connection* c, uint32_t tplId) {
     const ResponseTemplate* t = templates_.get(tplId);
@@ -723,7 +750,7 @@ class Server {
       writeHead(c, 500, emptyHeaders(), -1);
       return;
     }
-    writeHead(c, t->status, t->headers, t->customCL);
+    writeHead(c, t->status, t->headers, t->customCL, t);
   }
 
   // ---- static routes (capabilities.staticRoutes) ----
@@ -779,9 +806,16 @@ class Server {
   }
 
   // Single-shot terminal response (the fast path). customCL is an app-supplied Content-Length value, or -1 when none was given; the header block itself never contains Content-Length (the binding strips it).
+  // `tpl`: the template the status and headers came from, when there is one
+  // (its cached HTTP/2 header block is used on an HTTP/2 request).
   void respond(Connection* c, int status, const std::string& headersBlock,
-               long long customCL, const char* body, size_t bodyLen) {
+               long long customCL, const char* body, size_t bodyLen,
+               const ResponseTemplate* tpl = nullptr) {
     if (!c || c->responseEnded || c->closing) return;
+    if (c->h2Parent) {
+      h2Respond(c, status, headersBlock, customCL, body, bodyLen, tpl);
+      return;
+    }
 
     const bool bodyless = isBodyless(status);
     if (bodyless) bodyLen = 0;  // never emit a body for these statuses
@@ -876,8 +910,12 @@ class Server {
   }
 
   void writeHead(Connection* c, int status, const std::string& headersBlock,
-                 long long customCL) {
+                 long long customCL, const ResponseTemplate* tpl = nullptr) {
     if (!c || c->responseStarted || c->closing) return;
+    if (c->h2Parent) {
+      h2WriteHead(c, status, headersBlock, customCL, tpl);
+      return;
+    }
     c->responseStarted = true;
     c->bodylessStatus = isBodyless(status);
     c->bodyBytesSent = 0;
@@ -917,6 +955,7 @@ class Server {
   // Streaming chunk. Returns false on backpressure (wait for onWritable).
   bool write(Connection* c, const char* data, size_t len) {
     if (!c || c->responseEnded || c->closing) return false;
+    if (c->h2Parent) return h2Write(c, data, len);
     // write() without writeHead(): synthesize an implicit 200 chunked head (Node behavior). Raw body bytes with no status line would corrupt this response and desync every follow-up response on a keep-alive socket.
     if (!c->responseStarted) writeHead(c, 200, std::string(), -1);
     // HEAD / 1xx / 204 / 304: suppress body bytes
@@ -949,6 +988,10 @@ class Server {
 
   void end(Connection* c, const char* data, size_t len) {
     if (!c || c->responseEnded || c->closing) return;
+    if (c->h2Parent) {
+      h2End(c, data, len);
+      return;
+    }
 
     std::string& out = c->scratch;
     out.clear();
@@ -1005,6 +1048,7 @@ class Server {
   // Upgrade the request's connection to a WebSocket (RFC 6455 §4.2.2). Returns the new wsId, or 0 if the request is not a valid upgrade.
   uint32_t upgradeToWebSocket(Connection* c) {
     if (!c || c->responseStarted || c->closing) return 0;
+    if (c->h2Parent) return 0;  // no WebSockets over HTTP/2 (RFC 8441 is not implemented)
     // Validate the upgrade (RFC 6455 §4.2.1): Upgrade: websocket, Connection: Upgrade, a Sec-WebSocket-Key, Version 13.
     const std::string* key = nullptr;
     const std::string* extensions = nullptr;
@@ -1534,7 +1578,8 @@ class Server {
     } else if (c->wantDrain) {
       if (tPendingBytes(c) < limits_.writeHighWaterMark) {
         c->wantDrain = false;
-        queueNotify(c->reqId, kNotifyWritable);
+        if (c->h2) h2Drained(c);
+        else queueNotify(c->reqId, kNotifyWritable);
       }
     }
     if (c->closeAfterFlush && c->pendingWrites == 0) closeAfterResponse(c);
@@ -1871,6 +1916,536 @@ class Server {
     }
   }
 
+  // ---- HTTP/2 ----
+  //
+  // http2.h is the protocol; this is where it meets the rest of the server.
+  // A request arriving on an HTTP/2 stream is put on a Connection of its own
+  // (h2Parent set) and from there on is a request like any other: the same
+  // registry, the same accessors, the same respond()/writeHead()/write()/
+  // end(), whose first act on such a Connection is to come here instead of
+  // framing HTTP/1. What is different is all below: how the bytes are framed,
+  // and that many requests are in flight on one socket at once.
+
+ public:
+  // The request at slot `k` of the batch call in progress (the binding reads
+  // their ids, methods and paths; an HTTP/1 batch reads Connection::staged).
+  const Connection* h2BatchAt(uint32_t k) const { return h2Batch_[h2BatchBase_ + k]; }
+
+ private:
+  static constexpr size_t kH2FreeMax = 1024;
+
+  // Which protocol a connection speaks, decided once: ALPN on TLS, the
+  // client preface on cleartext ("prior knowledge", RFC 9113 3.3). Returns
+  // true for HTTP/1 - the caller goes on with the same bytes - and false when
+  // HTTP/2 consumed them or the preface is not complete yet.
+  bool h2Decide(Connection* c, const char* data, size_t len) {
+    if (!limits_.http2.enabled) {
+      c->proto = 1;
+      return true;
+    }
+    if (c->tls) {
+      if (!c->tls->alpnIsH2()) {
+        c->proto = 1;
+        return true;
+      }
+      h2Start(c);
+      h2Feed(c, data, len);
+      return false;
+    }
+    // Cleartext. The preface is 24 bytes that no HTTP/1 request begins with
+    // ("PRI * HTTP/2.0"); it usually arrives whole, and `pending` - unused
+    // until a request is in flight - holds a partial one.
+    const std::string_view magic = h2::kPreface;
+    const size_t have = c->pending.size();
+    const size_t cmp = std::min(len, magic.size() - have);
+    if (memcmp(data, magic.data() + have, cmp) != 0) {
+      c->proto = 1;
+      if (have == 0) return true;
+      // What looked like the start of a preface was not: it is HTTP/1 input.
+      std::string all;
+      all.swap(c->pending);
+      all.append(data, len);
+      dispatchPlaintext(c, all.data(), all.size());
+      return false;
+    }
+    if (have + cmp < magic.size()) {
+      c->pending.append(data, len);
+      return false;
+    }
+    h2Start(c);
+    if (have != 0) {
+      std::string all;
+      all.swap(c->pending);
+      all.append(data, len);
+      h2Feed(c, all.data(), all.size());
+    } else {
+      h2Feed(c, data, len);
+    }
+    return false;
+  }
+
+  void h2Start(Connection* c) {
+    const Http2Options& o = limits_.http2;
+    h2::Settings s;
+    if (o.maxConcurrentStreams) s.maxConcurrentStreams = o.maxConcurrentStreams;
+    if (o.initialWindowSize) s.initialWindowSize = std::min<uint32_t>(o.initialWindowSize, h2::kMaxWindow);
+    if (o.maxFrameSize)
+      s.maxFrameSize = std::max<uint32_t>(h2::kMinFrameSize, std::min<uint32_t>(o.maxFrameSize, h2::kMaxFrameSizeLimit));
+    if (o.headerTableSize) s.headerTableSize = o.headerTableSize;
+    s.maxHeaderListSize = o.maxHeaderListSize
+                              ? o.maxHeaderListSize
+                              : static_cast<uint32_t>(std::min<size_t>(limits_.maxHeadSize, 0x7fffffffu));
+    s.connectionWindow = std::max<uint32_t>(s.connectionWindow, s.initialWindowSize);
+    s.maxBodySize = limits_.maxBodySize;
+    s.maxHeaders = limits_.maxHeaders;
+    s.maxUriSize = limits_.maxUriSize;
+    h2::Host host;
+    host.user = c;
+    host.dispatch = [](void* user, h2::Stream& st) {
+      Connection* conn = static_cast<Connection*>(user);
+      conn->server->h2OnRequest(conn, st);
+    };
+    host.aborted = [](void* user, void* held) {
+      Connection* conn = static_cast<Connection*>(user);
+      conn->server->h2OnAborted(static_cast<Connection*>(held));
+    };
+    host.writable = [](void* user, void* held) {
+      Connection* conn = static_cast<Connection*>(user);
+      conn->server->h2OnWritable(static_cast<Connection*>(held));
+    };
+    c->proto = 2;
+    c->h2 = new h2::Session(s, host);
+    c->h2->start();
+  }
+
+  // Bytes for an HTTP/2 connection. Requests completed by them are handed to
+  // JS in batches, and every frame the session and the handlers produced
+  // meanwhile goes out in one write afterwards - the cork of the HTTP/1
+  // batch, for free: nothing is written while the read is being processed.
+  void h2Feed(Connection* c, const char* data, size_t len) {
+    if (c->closing) return;
+    c->h2Feeding = true;
+    c->h2->feed(data, len, uv_now(loop_));
+    h2DispatchBatch(c);
+    c->h2Feeding = false;
+    if (c->closing) return;
+    h2Flush(c);
+    if (c->h2->dead()) {  // a connection error: the GOAWAY is on its way, then close
+      if (c->pendingWrites == 0) closeAfterResponse(c);
+      else c->closeAfterFlush = true;
+    }
+  }
+
+  // Put the session's frames on the wire.
+  void h2Flush(Connection* c) {
+    std::string& out = c->h2->out();
+    if (out.empty()) return;
+    if (!c->closing) writeOutView(c, out, /*terminal=*/false);
+    out.clear();
+    if (out.capacity() > 262144) out.shrink_to_fit();
+    if (limits_.responseBackpressureLimit && !c->closing &&
+        tPendingBytes(c) > limits_.responseBackpressureLimit) {
+      doClose(c);
+    }
+  }
+
+  // After a response call made outside a read (a handler answering later).
+  void h2Written(Connection* p) {
+    if (!p->h2Feeding && !p->closing) h2Flush(p);
+  }
+
+  Connection* h2Acquire() {
+    Connection* sc;
+    if (!h2Free_.empty()) {
+      sc = h2Free_.back();
+      h2Free_.pop_back();
+    } else {
+      sc = new Connection();
+    }
+    sc->server = this;
+    return sc;
+  }
+
+  // A complete request on stream `st` of connection `c` (from the session,
+  // inside its feed).
+  void h2OnRequest(Connection* c, h2::Stream& st) {
+    if (c->closing) return;
+    Connection* sc = h2Acquire();
+    sc->h2Parent = c;
+    sc->h2s = &st;
+    sc->proto = 2;
+    sc->method = st.method;
+    // Swapped, as a staged HTTP/1 request is: the stream gets this
+    // Connection's previous buffers for the next request it assembles.
+    sc->methodStr.swap(st.methodStr);
+    sc->path.swap(st.path);
+    sc->query.swap(st.query);
+    sc->headers.swap(st.headers);
+    sc->body.swap(st.body);
+    st.headerCount = 0;
+    sc->isHead = (sc->method == Method::HEAD);
+    sc->reqKeepAlive = true;
+    sc->reqHttp11 = true;
+    sc->requestTicks = 0;
+    sc->reqId = nextReqId();
+    sc->active = true;
+    globalRequests().insert(sc->reqId, sc);
+    c->h2->hold(st, sc);
+
+    if (hasEngineRoutes() && tryStaticRoute(sc)) return;
+    if (!batchOn_) {
+      if (cb_.onRequest) cb_.onRequest(cb_.user, sc);
+      return;
+    }
+    h2Batch_.push_back(sc);
+    if (h2Batch_.size() >= kMaxStaged) h2DispatchBatch(c);
+  }
+
+  // Hand the gathered requests to JS: one call for up to kMaxStaged of them.
+  // JS answers slot after slot and reads the control cell between them, which
+  // h2Done advances when the slot it names completes synchronously; a handler
+  // that goes asynchronous leaves the cell where it was and JS returns. On
+  // HTTP/1 the rest of the batch then waits for that response. Here nothing
+  // has to wait - streams are independent - so the rest is simply delivered
+  // in another call.
+  void h2DispatchBatch(Connection* c) {
+    size_t pos = 0;
+    while (pos < h2Batch_.size() && !c->closing) {
+      const uint32_t count = static_cast<uint32_t>(h2Batch_.size() - pos);
+      h2BatchBase_ = pos;
+      if (++h2BatchGen_ == 0) h2BatchGen_ = 1;
+      for (uint32_t k = 0; k < count; k++) {
+        h2Batch_[pos + k]->h2Gen = h2BatchGen_;
+        h2Batch_[pos + k]->batchPos = k;
+      }
+      if (batchControl_) *batchControl_ = 0;
+      h2InBatchCall_ = true;
+      cb_.onRequestBatch(cb_.user, h2Batch_[pos], count);
+      h2InBatchCall_ = false;
+      // Where JS stopped: the slot whose handler did not finish, or the count.
+      const uint32_t at = batchControl_ ? *batchControl_ : count;
+      pos += at >= count ? count : at + 1;
+    }
+    h2Batch_.clear();
+    h2BatchBase_ = 0;
+  }
+
+  // The handler's last word on `sc` is about to be sent: its stream is no
+  // longer held for it (and must not be touched through `sc` again).
+  void h2Detach(Connection* sc) {
+    if (sc->h2s != nullptr && sc->h2Parent != nullptr && sc->h2Parent->h2 != nullptr)
+      sc->h2Parent->h2->release(*sc->h2s);
+    sc->h2s = nullptr;
+  }
+
+  // The request on `sc` is finished from the handler's side: off the
+  // registry, its buffers released, the Connection ready for another request.
+  // The stream, if it still has bytes to send, lives on in the session.
+  void h2Done(Connection* sc) {
+    Connection* p = sc->h2Parent;
+    globalRequests().erase(sc->reqId);
+    if (h2InBatchCall_ && batchControl_ && sc->h2Gen == h2BatchGen_ &&
+        *batchControl_ == sc->batchPos) {
+      *batchControl_ = sc->batchPos + 1;  // the next slot, or the count when it was the last
+    }
+    sc->active = false;
+    sc->jsBody.reset();
+    sc->jsLent.reset();
+    recycleBody(sc);
+    if (sc->h2s != nullptr && p != nullptr && p->h2 != nullptr) p->h2->release(*sc->h2s);
+    if (sc->wantDrain) h2ForgetWaiter(sc->reqId);
+    sc->reqId = 0;
+    sc->h2Parent = nullptr;
+    sc->h2s = nullptr;
+    sc->h2Gen = 0;
+    sc->proto = 0;
+    sc->isHead = false;
+    sc->responseStarted = false;
+    sc->responseEnded = false;
+    sc->bodylessStatus = false;
+    sc->declaredLen = -1;
+    sc->bodyBytesSent = 0;
+    sc->wantDrain = false;
+    sc->abortNotified = false;
+    sc->methodStr.clear();
+    sc->path.clear();
+    sc->query.clear();
+    // Reused when there is room, deleted at the next sweep otherwise - never
+    // here, where a caller further up the stack may still be reading it.
+    (h2Free_.size() < kH2FreeMax ? h2Free_ : h2Dead_).push_back(sc);
+  }
+
+  void h2Reap() {
+    for (Connection* sc : h2Dead_) delete sc;
+    h2Dead_.clear();
+  }
+
+  // The peer reset the stream of a request a handler holds (or its
+  // connection is going away): JS is told once, unless it never heard of the
+  // request - one still waiting in the batch is simply dropped.
+  void h2OnAborted(Connection* sc) {
+    sc->h2s = nullptr;  // the stream is gone; nothing more can be sent on it
+    for (size_t i = h2BatchBase_; i < h2Batch_.size(); i++) {
+      if (h2Batch_[i] != sc) continue;
+      if (h2InBatchCall_ && sc->h2Gen == h2BatchGen_) break;  // already handed to JS
+      h2Batch_.erase(h2Batch_.begin() + static_cast<std::ptrdiff_t>(i));
+      sc->abortNotified = true;
+      break;
+    }
+    if (sc->active && !sc->abortNotified) {
+      sc->abortNotified = true;
+      queueNotify(sc->reqId, kNotifyAborted);
+    }
+    h2Done(sc);
+  }
+
+  void h2OnWritable(Connection* sc) {
+    if (!sc->wantDrain || !sc->active) return;
+    sc->wantDrain = false;
+    h2ForgetWaiter(sc->reqId);
+    queueNotify(sc->reqId, kNotifyWritable);
+  }
+
+  // The connection's socket drained: every request on it that was told to
+  // wait may write again.
+  void h2Drained(Connection* p) {
+    for (size_t i = 0; i < h2Waiters_.size();) {
+      if (h2Waiters_[i].second != p) {
+        i++;
+        continue;
+      }
+      const uint32_t reqId = h2Waiters_[i].first;
+      h2Waiters_[i] = h2Waiters_.back();
+      h2Waiters_.pop_back();
+      Connection* sc = lookup(reqId);
+      if (sc != nullptr && sc->h2Parent == p && sc->wantDrain) {
+        sc->wantDrain = false;
+        queueNotify(reqId, kNotifyWritable);
+      }
+    }
+  }
+
+  void h2ForgetWaiter(uint32_t reqId) {
+    for (size_t i = 0; i < h2Waiters_.size(); i++) {
+      if (h2Waiters_[i].first == reqId) {
+        h2Waiters_[i] = h2Waiters_.back();
+        h2Waiters_.pop_back();
+        return;
+      }
+    }
+  }
+
+  // The frames an HTTP/2 connection is closed with (see doClose).
+  void h2Goodbye(Connection* p) {
+    if (p->h2->dead()) return;  // a connection error already said GOAWAY
+    p->h2->shutdown();
+    h2Flush(p);
+  }
+
+  // The connection is closing: every request in flight on it is over.
+  void h2Teardown(Connection* p) {
+    std::vector<Connection*> held;
+    p->h2->forEachHeld([&held](void* user) { held.push_back(static_cast<Connection*>(user)); });
+    for (Connection* sc : held) h2OnAborted(sc);
+    for (size_t i = 0; i < h2Waiters_.size();) {
+      if (h2Waiters_[i].second == p) {
+        h2Waiters_[i] = h2Waiters_.back();
+        h2Waiters_.pop_back();
+      } else {
+        i++;
+      }
+    }
+    p->h2->abandon();
+  }
+
+  // The header block of a response: the status and the application's headers
+  // (from the template's cache when there is one), then the Date field.
+  // `headersBlock` is the HTTP/1 form the binding builds - "Name: value\r\n"
+  // lines - so one representation serves both protocols; names are lowercased
+  // here, and the headers that describe an HTTP/1 connection are dropped.
+  void h2Head(std::string& out, int status, const std::string& headersBlock,
+              const ResponseTemplate* tpl) {
+    if (tpl != nullptr) {
+      if (tpl->h2Block.empty()) h2EncodeHead(tpl->h2Block, status, headersBlock);
+      out.append(tpl->h2Block);
+    } else {
+      h2EncodeHead(out, status, headersBlock);
+    }
+    const std::string& line = dateLine();  // "Date: <29 bytes>\r\n"
+    if (h2DateAt_ != dateCachedAt_ || h2Date_.empty()) {
+      h2Date_.clear();
+      h2::encodeField(h2Date_, "date", std::string_view(line).substr(6, line.size() - 8));
+      h2DateAt_ = dateCachedAt_;
+    }
+    out.append(h2Date_);
+  }
+
+  static void h2EncodeHead(std::string& out, int status, const std::string& headersBlock) {
+    h2::encodeStatus(out, status);
+    char lower[128];
+    size_t pos = 0;
+    const size_t n = headersBlock.size();
+    while (pos < n) {
+      size_t eol = headersBlock.find("\r\n", pos);
+      if (eol == std::string::npos) eol = n;
+      const size_t colon = headersBlock.find(':', pos);
+      if (colon != std::string::npos && colon < eol && colon > pos) {
+        const size_t nameLen = colon - pos;
+        std::string_view value = trimOWS(std::string_view(headersBlock).substr(colon + 1, eol - colon - 1));
+        std::string big;
+        char* name = lower;
+        if (nameLen > sizeof(lower)) {
+          big.resize(nameLen);
+          name = &big[0];
+        }
+        for (size_t i = 0; i < nameLen; i++) {
+          const char ch = headersBlock[pos + i];
+          name[i] = (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch + 32) : ch;
+        }
+        const std::string_view lname(name, nameLen);
+        if (!h2::isConnectionSpecific(lname) && lname != "content-length")
+          h2::encodeField(out, lname, value, /*sensitive=*/lname == "set-cookie");
+      }
+      pos = eol + 2;
+    }
+  }
+
+  static void h2ContentLength(std::string& out, unsigned long long v) {
+    char buf[20];
+    char* p = buf + sizeof(buf);
+    do {
+      *--p = static_cast<char>('0' + (v % 10));
+      v /= 10;
+    } while (v != 0);
+    h2::encodeField(out, "content-length", std::string_view(p, static_cast<size_t>(buf + sizeof(buf) - p)));
+  }
+
+  // respond() for an HTTP/2 request: HEADERS, then the body as DATA.
+  void h2Respond(Connection* sc, int status, const std::string& headersBlock, long long customCL,
+                 const char* body, size_t bodyLen, const ResponseTemplate* tpl) {
+    Connection* p = sc->h2Parent;
+    h2::Stream* st = sc->h2s;
+    if (st == nullptr || p->closing) {
+      h2Done(sc);
+      return;
+    }
+    const bool bodyless = isBodyless(status);
+    if (bodyless) bodyLen = 0;
+    std::string& block = h2Block_;
+    block.clear();
+    h2Head(block, status, headersBlock, tpl);
+    // Content-Length exactly as the HTTP/1 path declares it.
+    if (!bodyless) {
+      h2ContentLength(block, (sc->isHead && customCL >= 0) ? static_cast<unsigned long long>(customCL)
+                                                          : static_cast<unsigned long long>(bodyLen));
+    } else if (customCL >= 0) {
+      h2ContentLength(block, static_cast<unsigned long long>(customCL));
+    }
+    const bool noBody = sc->isHead || bodyLen == 0;
+    h2::Session* session = p->h2;
+    // The stream is let go of first - once END_STREAM is out it no longer
+    // exists - and the request's own buffers last: `body` may be one of
+    // them (a lent body sent straight back).
+    h2Detach(sc);
+    session->sendHeaders(*st, block, noBody);
+    if (!noBody) session->sendData(*st, body, bodyLen, /*endStream=*/true);
+    h2Done(sc);
+    h2Written(p);
+  }
+
+  void h2WriteHead(Connection* sc, int status, const std::string& headersBlock, long long customCL,
+                   const ResponseTemplate* tpl) {
+    Connection* p = sc->h2Parent;
+    h2::Stream* st = sc->h2s;
+    sc->responseStarted = true;
+    sc->bodylessStatus = isBodyless(status);
+    sc->bodyBytesSent = 0;
+    sc->declaredLen = sc->bodylessStatus ? 0 : customCL;
+    if (st == nullptr || p->closing) return;
+    std::string& block = h2Block_;
+    block.clear();
+    h2Head(block, status, headersBlock, tpl);
+    if (customCL >= 0) h2ContentLength(block, static_cast<unsigned long long>(customCL));
+    p->h2->sendHeaders(*st, block, /*endStream=*/false);
+    h2Written(p);
+  }
+
+  bool h2Write(Connection* sc, const char* data, size_t len) {
+    if (!sc->responseStarted) h2WriteHead(sc, 200, std::string(), -1, nullptr);
+    Connection* p = sc->h2Parent;
+    h2::Stream* st = sc->h2s;
+    if (st == nullptr || p->closing) return false;
+    if (sc->isHead || sc->bodylessStatus || len == 0) return true;
+    if (sc->declaredLen >= 0) {  // never past a declared Content-Length (8.1.1 makes that malformed)
+      const unsigned long long declared = static_cast<unsigned long long>(sc->declaredLen);
+      if (sc->bodyBytesSent >= declared) return true;
+      if (sc->bodyBytesSent + len > declared) len = static_cast<size_t>(declared - sc->bodyBytesSent);
+    }
+    sc->bodyBytesSent += len;
+    const size_t heldBack = p->h2->sendData(*st, data, len, /*endStream=*/false);
+    h2Written(p);
+    if (p->closing) return false;
+    // Two things can be full: the stream's flow-control window (the session
+    // tells us when it opens) and the socket (completeWrite does).
+    if (heldBack >= limits_.writeHighWaterMark) {
+      sc->wantDrain = true;
+      st->wantDrain = true;
+      return false;
+    }
+    if (tPendingBytes(p) >= limits_.writeHighWaterMark) {
+      sc->wantDrain = true;
+      p->wantDrain = true;
+      h2Waiters_.emplace_back(sc->reqId, p);
+      return false;
+    }
+    return true;
+  }
+
+  void h2End(Connection* sc, const char* data, size_t len) {
+    Connection* p = sc->h2Parent;
+    h2::Stream* st = sc->h2s;
+    if (st == nullptr || p->closing) {
+      h2Done(sc);
+      return;
+    }
+    h2::Session* session = p->h2;
+    if (!sc->responseStarted) {  // end() without writeHead(): a 200 with this as the whole body
+      std::string& block = h2Block_;
+      block.clear();
+      h2Head(block, 200, std::string(), nullptr);
+      const bool noBody = sc->isHead || len == 0;
+      h2ContentLength(block, sc->isHead ? 0 : len);
+      h2Detach(sc);
+      session->sendHeaders(*st, block, noBody);
+      if (!noBody) session->sendData(*st, data, len, /*endStream=*/true);
+      h2Done(sc);
+      h2Written(p);
+      return;
+    }
+    if (sc->isHead || sc->bodylessStatus) {
+      len = 0;
+    } else if (sc->declaredLen >= 0) {
+      const unsigned long long declared = static_cast<unsigned long long>(sc->declaredLen);
+      if (sc->bodyBytesSent >= declared) len = 0;
+      else if (sc->bodyBytesSent + len > declared) len = static_cast<size_t>(declared - sc->bodyBytesSent);
+    }
+    const bool shortOfDeclared =
+        !sc->isHead && !sc->bodylessStatus && sc->declaredLen >= 0 &&
+        sc->bodyBytesSent + len < static_cast<unsigned long long>(sc->declaredLen);
+    h2Detach(sc);
+    if (shortOfDeclared) {
+      // Fewer bytes than the Content-Length promised: the response is
+      // malformed if it ends normally, so it is cut off instead - what
+      // closing the connection says on HTTP/1.
+      if (len) session->sendData(*st, data, len, /*endStream=*/false);
+      session->reset(*st, h2::kInternalError);
+    } else {
+      session->sendData(*st, data, len, /*endStream=*/true);
+    }
+    h2Done(sc);
+    h2Written(p);
+  }
+
   // ---- read path ----
 
   static void onConnection(uv_stream_t* serverHandle, int status) {
@@ -2017,6 +2592,13 @@ class Server {
 
   // Plaintext ingestion - identical for direct TCP reads and decrypted TLS records. May tear the connection down (doClose sets c->closing; the Connection object itself stays alive until uv's close callback).
   void dispatchPlaintext(Connection* c, const char* data, size_t len) {
+    if (c->proto != 1) {
+      if (c->proto == 2) {
+        h2Feed(c, data, len);
+        return;
+      }
+      if (!h2Decide(c, data, len)) return;  // HTTP/2 took the bytes, or more are needed to tell
+    }
     if (c->isWebSocket) {
       // Zero-copy WS receive: the parser unmasks complete frames IN PLACE in
       // this buffer, so feedWebSocket takes mutable bytes. The const here is
@@ -2520,12 +3102,22 @@ class Server {
   }
 
   void abortConnection(Connection* c) {
+    c->h2Bye = true;  // nobody is there to tell
     // Hard teardown (read error/EOF/write error): drop the socket now. Any in-flight writes reference WriteReq buffers, not the connection body, and their completion callbacks tolerate a closing handle.
     doClose(c);
   }
 
   void doClose(Connection* c) {
     if (tIsClosing(c)) return;
+    // An HTTP/2 client is told what became of its streams before the socket
+    // goes (best effort, like the close_notify below): the requests still in
+    // flight are reset and GOAWAY names the last stream that was acted on.
+    // A bare close would leave it to guess which requests are safe to retry.
+    if (c->h2 && !c->closing && !c->h2Bye) {
+      c->h2Bye = true;
+      h2Goodbye(c);
+      if (tIsClosing(c)) return;  // the write failed and closed it from underneath
+    }
     // Best-effort close_notify on an established TLS session (truncation detection for the peer). uv_try_write: synchronous, non-blocking, no bookkeeping - if the kernel buffer is full the alert is simply lost, which is exactly the semantics "best effort" means here.
     if (c->tls && !c->closing) {
       std::string bye;
@@ -2534,6 +3126,7 @@ class Server {
     }
     c->closing = true;
     c->jsLent.reset();  // a lent body ends with the connection, whatever state the request was in
+    if (c->h2) h2Teardown(c);  // every request in flight on it is aborted
     // An HTTP request that was surfaced to a handler and never answered owes JS exactly one onAborted (server shutdown, timeout sweep, write error), or 'close' listeners and their resources (SSE intervals, monitors) leak. closing is already set, so a re-entrant respond() from JS is a no-op.
     if (c->active && !c->isWebSocket && !c->abortNotified) {
       c->abortNotified = true;
@@ -2623,6 +3216,7 @@ class Server {
     std::vector<Connection*> stale;
     std::vector<Connection*> overdue;
     std::vector<Connection*> stalled;
+    s->h2Reap();
     for (Connection* c : s->conns_) {
       if (c->closing) continue;
       // Lingering close (closeAfterResponse): the peer has our FIN and owes
@@ -2663,7 +3257,10 @@ class Server {
         }
         c->lastWriteQueue = q;
       }
-      if (c->isWebSocket || c->active) continue;
+      // An HTTP/2 connection is busy while a handler holds one of its
+      // requests; streams still waiting for the rest of a request are not
+      // work in progress, and the idle timeout covers a peer that stalls them.
+      if (c->isWebSocket || c->active || (c->h2 && c->h2->held() > 0)) continue;
       if (s->limits_.idleTimeoutMs && ++c->idleTicks >= idleLimit) {
         stale.push_back(c);
         continue;
@@ -4153,6 +4750,18 @@ class Server {
   // loop, reused across responses, so a TLS reply allocates nothing.
   std::string cipherScratch_;
   std::vector<std::string> bodyPool_;  // empty strings with capacity; see HttpParser::bodyPool
+
+  // HTTP/2 (see the "HTTP/2" section).
+  std::vector<Connection*> h2Free_;      // request Connections ready for reuse
+  std::vector<Connection*> h2Dead_;      // ...and ones to delete at the next sweep
+  std::vector<Connection*> h2Batch_;     // requests gathered during a read, not yet handed to JS
+  size_t h2BatchBase_ = 0;               // where the batch call in progress starts in h2Batch_
+  uint32_t h2BatchGen_ = 0;              // identifies the latest batch call
+  bool h2InBatchCall_ = false;           // onRequestBatch is on the stack for an HTTP/2 batch
+  std::vector<std::pair<uint32_t, Connection*>> h2Waiters_;  // (reqId, connection) waiting for the socket to drain
+  std::string h2Block_;                  // header block under construction
+  std::string h2Date_;                   // the Date field, encoded; rebuilt with the Date cache
+  time_t h2DateAt_ = 0;
   const std::string& dateLine() {
     refreshHttpDateLine(dateCache_, dateCachedAt_);
     return dateCache_;

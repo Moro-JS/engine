@@ -3,8 +3,9 @@
 Status snapshot (see `docs/DESIGN.md` for the full milestone definitions).
 **Shipped in 1.0.0** — HTTP/1.1 + WebSocket (+ permessage-deflate) +
 in-process TLS/HTTPS/WSS + full runtime limit configurability, hardened with
-fuzzing and sanitizers. In progress: ALPN HTTP/2 (vendored nghttp2) and the
-Windows (MSVC) CI build leg (the local build has landed in `tools/build.mjs`).
+fuzzing and sanitizers. **Shipped in 1.1.19** — HTTP/2 (ALPN and prior
+knowledge), the engine's own implementation. In progress: the Windows (MSVC)
+CI build leg (the local build has landed in `tools/build.mjs`).
 
 | Milestone | Status | Notes |
 |-----------|--------|-------|
@@ -27,7 +28,12 @@ Windows (MSVC) CI build leg (the local build has landed in `tools/build.mjs`).
 
 1.0.0 is a complete HTTP/1.1 + WebSocket + TLS engine. On the list next:
 
-- **ALPN HTTP/2** (vendored nghttp2) — in progress.
+- **HTTP/2** — shipped in 1.1.19 (`src/http2.h`, serve option `http2`). It was
+  planned as a vendored nghttp2; it is the engine's own instead, in one
+  header: no third-party code to track, and a stateless HPACK encoder that
+  lets a prepared response's header block be built once and replayed on every
+  connection. h2spec 146/146 over TLS. Still to come there: WebSocket over
+  HTTP/2 (RFC 8441), RFC 9218 priorities.
 - **Windows (MSVC) CI build leg** — the local build lands in `tools/build.mjs`;
   wiring the CI matrix leg is the remaining packaging work.
 - **SNI multi-identity** — one key/cert per server today; per-SNI dispatch is future.

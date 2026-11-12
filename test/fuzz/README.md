@@ -17,6 +17,7 @@ FUZZ_MODE=merge sh test/fuzz/run.sh pmd   # minimize a target's corpus in place
 | ------ | ----------------------- | ------------------------------- |
 | `http` | `fuzz_http_parser.cc`   | HTTP/1.1 request parsing/framing |
 | `ws`   | `fuzz_websocket.cc`     | WebSocket framing/masking/UTF-8  |
+| `http2` | `fuzz_http2.cc`        | HTTP/2 session and HPACK (`src/http2.h`), with a host that answers at once, later, or never |
 | `tls`  | `fuzz_tls_transport.cc` | TLS pump state machine (`src/tls.h`) |
 | `pmd`  | `fuzz_ws_deflate.cc`    | permessage-deflate inflate path (`src/ws_deflate.h`) |
 

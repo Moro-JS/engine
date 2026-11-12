@@ -715,11 +715,21 @@ static void cbOnRequestBatch(void* user, Connection* c, uint32_t count) {
   d[0] = c->reqId;
   d[1] = static_cast<uint32_t>(c->method);
   d[2] = pathIndexFor(js, iso, ctx, c->path);
-  for (uint32_t k = 1; k < count; k++) {
-    const StagedRequest& sr = c->staged[(c->stagedHead + k - 1) % Server::kMaxStaged];
-    d[3 * k] = sr.reqId;
-    d[3 * k + 1] = static_cast<uint32_t>(sr.method);
-    d[3 * k + 2] = pathIndexFor(js, iso, ctx, sr.path);
+  if (c->h2Parent != nullptr) {
+    // An HTTP/2 batch: independent requests, each on its own Connection.
+    for (uint32_t k = 1; k < count; k++) {
+      const Connection* r = js->server->h2BatchAt(k);
+      d[3 * k] = r->reqId;
+      d[3 * k + 1] = static_cast<uint32_t>(r->method);
+      d[3 * k + 2] = pathIndexFor(js, iso, ctx, r->path);
+    }
+  } else {
+    for (uint32_t k = 1; k < count; k++) {
+      const StagedRequest& sr = c->staged[(c->stagedHead + k - 1) % Server::kMaxStaged];
+      d[3 * k] = sr.reqId;
+      d[3 * k + 1] = static_cast<uint32_t>(sr.method);
+      d[3 * k + 2] = pathIndexFor(js, iso, ctx, sr.path);
+    }
   }
   TryCatch tryCatch(iso);
   Local<Value> argv[1] = {Integer::NewFromUnsigned(iso, count)};
@@ -1047,6 +1057,33 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
     }
   }
 
+  // options.http2: true, or an object of HTTP/2 settings (camelCase, the
+  // names Node's http2 uses). Unknown keys are ignored.
+  if (args.Length() >= 2 && args[1]->IsObject()) {
+    Local<Object> opts = args[1].As<Object>();
+    Local<Value> h2v;
+    if (opts->Get(ctx, str(iso, "http2")).ToLocal(&h2v)) {
+      if (h2v->IsBoolean()) {
+        limits.http2.enabled = h2v->BooleanValue(iso);
+      } else if (h2v->IsObject()) {
+        limits.http2.enabled = true;
+        Local<Object> h2o = h2v.As<Object>();
+        auto getU32 = [&](const char* name, uint32_t& out) {
+          Local<Value> v;
+          if (h2o->Get(ctx, str(iso, name)).ToLocal(&v) && v->IsNumber()) {
+            const double d = v->NumberValue(ctx).FromMaybe(-1);
+            if (d >= 1 && d <= 2147483647.0) out = static_cast<uint32_t>(d);
+          }
+        };
+        getU32("maxConcurrentStreams", limits.http2.maxConcurrentStreams);
+        getU32("initialWindowSize", limits.http2.initialWindowSize);
+        getU32("maxFrameSize", limits.http2.maxFrameSize);
+        getU32("maxHeaderListSize", limits.http2.maxHeaderListSize);
+        getU32("headerTableSize", limits.http2.headerTableSize);
+      }
+    }
+  }
+
   // options.ssl -> in-process TLS termination. Both MoroJS shapes are accepted: file paths (key_file_name/cert_file_name/ca_file_name) and inline PEM (key/cert/ca as string|Buffer|ArrayBuffer); inline wins when both are present. Config errors THROW from serve() - a misconfigured TLS server must never silently boot as plaintext.
   SslConfig ssl;
   bool sslRequested = false;
@@ -1059,6 +1096,7 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
         delete js;
         return;
       }
+      ssl.alpnH2 = limits.http2.enabled;  // offer "h2" ahead of "http/1.1"
     }
   }
 
@@ -1854,7 +1892,9 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   };
   setCap("limits", true);
   setCap("tls", true);
-  setCap("http2", false);
+  // serve() option `http2`: HTTP/2 by ALPN on a TLS listener and by prior
+  // knowledge on a cleartext one, HTTP/1.1 beside it on the same port.
+  setCap("http2", true);
   setCap("wsDeflate", true);
   // Hardening surface: responseTimeoutMs / responseBackpressureLimit /
   // maxUriSize serve options are parsed.

@@ -14,8 +14,9 @@ export interface EngineCapabilities {
   limits: boolean;
   /** In-process TLS termination via ServeOptions.ssl. */
   tls: boolean;
-  /** ALPN-negotiated HTTP/2 alongside HTTP/1.1 — reserved for a future
-   *  release; not yet configurable (no ServeOptions field). */
+  /** HTTP/2 via ServeOptions.http2 (engine >= 1.1.19): negotiated by ALPN on
+   *  a TLS listener, by prior knowledge on a cleartext one, with HTTP/1.1
+   *  served beside it on the same port. */
   http2: boolean;
   /** WebSocket permessage-deflate (RFC 7692) via ServeOptions.wsDeflate. */
   wsDeflate: boolean;
@@ -260,6 +261,28 @@ export interface ServeOptions {
     ciphersuites?: string; // TLS 1.3 suites (colon-separated)
     ecdhCurve?: string; // key-share groups, e.g. 'X25519:P-256'; 'auto' = default
   };
+  /** HTTP/2 (RFC 9113). Off by default. `true`, or an object of settings to
+   *  advertise. With `ssl` the listener offers "h2" ahead of "http/1.1" in
+   *  ALPN; without it a client speaks HTTP/2 by opening with the connection
+   *  preface (prior knowledge, e.g. `curl --http2-prior-knowledge`). Every
+   *  other client is served HTTP/1.1 on the same port. A request arriving on
+   *  an HTTP/2 stream is delivered exactly as an HTTP/1 request is - the same
+   *  callbacks, the same accessors, the same response calls. Not served over
+   *  HTTP/2: WebSocket upgrades (RFC 8441), server push, CONNECT. */
+  http2?:
+    | boolean
+    | {
+        /** Streams a client may have open at once. Default 256. */
+        maxConcurrentStreams?: number;
+        /** Per-stream receive window, in bytes. Default 1 MiB. */
+        initialWindowSize?: number;
+        /** Largest frame payload accepted. Default (and minimum) 16,384. */
+        maxFrameSize?: number;
+        /** Largest decoded request header list. Default: maxHeadSize. */
+        maxHeaderListSize?: number;
+        /** HPACK dynamic table size offered to the client. Default 4,096. */
+        headerTableSize?: number;
+      };
   /** WebSocket permessage-deflate (RFC 7692). Off by default.
    *  boolean to enable with defaults, or an options object. */
   wsDeflate?:

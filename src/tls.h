@@ -580,6 +580,15 @@ class TlsSession {
 
   bool handshakeDone() const { return handshakeDone_; }
 
+  // Whether ALPN settled on HTTP/2 (meaningful once the handshake is done).
+  bool alpnIsH2() const {
+    if (!ssl_) return false;
+    const unsigned char* proto = nullptr;
+    unsigned int len = 0;
+    SSL_get0_alpn_selected(ssl_, &proto, &len);
+    return proto != nullptr && len == 2 && proto[0] == 'h' && proto[1] == '2';
+  }
+
   // Negotiated ALPN protocol ("h2" / "http/1.1"), or "" when none.
   std::string alpn() const {
     if (!ssl_) return std::string();

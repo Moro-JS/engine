@@ -18,7 +18,8 @@ Goal: saturate the hardware (~105k req/s hello-world reference ceiling on the be
 - HTTP/1.1: incremental SIMD-friendly parser; strict RFC 9112 (hard-reject conflicting Content-Length/Transfer-Encoding), header count/size limits, keep-alive, chunked bodies.
 - WebSocket: RFC 6455 framing + permessage-deflate (zlib), Autobahn-validated.
 - TLS: BoringSSL as a linked dependency (nobody writes TLS from scratch).
-- Out of scope: HTTP/3/QUIC; HTTP/2 (MoroJS has a separate http2 server).
+- HTTP/2 (1.1.19): RFC 9113 server + RFC 7541 HPACK in `src/http2.h`, a pure state machine like the HTTP/1 parser (no I/O, no V8). ALPN `h2` on TLS, prior knowledge on cleartext, HTTP/1.1 on the same port. A request on a stream is surfaced exactly as an HTTP/1 request is, so the binding and everything above it are protocol-blind.
+- Out of scope: HTTP/3/QUIC.
 
 ### L3 — Raw-V8 binding layer (per-ABI, Moro-shaped)
 - **Batched request snapshot**: one crossing delivers method/URL/query/headers as offsets into a single external ArrayBuffer. No per-header calls; no "request dies after the callback returns" hazard.
