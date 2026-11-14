@@ -447,8 +447,8 @@ export function clearStaticRoutes(serverId: number): void;
  *  `/user/:id` is prefix "/user/" and suffix ""; `/files/:name.json` is
  *  prefix "/files/" and suffix ".json". The segment must be non-empty and
  *  contain no '/', so `/user/` and `/user/1/2` still reach onRequest. It is
- *  written as it is on the wire, undecoded (uWS's writeParameterValue does
- *  the same); a route that needs decoding stays a JS route. The header block
+ *  written as it is on the wire, undecoded; a route that needs decoding
+ *  stays a JS route. The header block
  *  is materialised once, so the reply is byte-identical to
  *  respond(status, headersFlat, segment). Only an exact method match
  *  short-circuits; re-registering (method, prefix, suffix) replaces it.

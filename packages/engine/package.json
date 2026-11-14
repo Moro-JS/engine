@@ -49,6 +49,9 @@
   "keywords": [
     "morojs",
     "http",
+    "http2",
+    "websocket",
+    "tls",
     "server",
     "native",
     "performance"

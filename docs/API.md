@@ -168,8 +168,8 @@ clearStaticRoutes(serverId): void;
 // A route with ONE variable path segment whose body is that segment, answered inside the
 // engine like a static route: `/user/:id` is prefix "/user/" and suffix ""; `/files/:name.json`
 // is prefix "/files/", suffix ".json". The segment must be non-empty and contain no '/'
-// (`/user/` and `/user/1/2` still reach onRequest) and goes out undecoded, as uWS's
-// writeParameterValue does. Header block materialised once; bytes identical to
+// (`/user/` and `/user/1/2` still reach onRequest) and goes out undecoded.
+// Header block materialised once; bytes identical to
 // respond(status, headersFlat, segment). Method policy stays in JS, as for static routes.
 setParamRoute(serverId, method: number, prefix: string, suffix: string, status?: number,
               headersFlat?: string[] | null): void;

@@ -3,6 +3,7 @@
 One file per release in [`changelog/`](changelog/); the GitHub Release for a
 tag carries the same text. Newest first.
 
+- [1.1.21](changelog/v1.1.21.md) — documentation release: README and roadmap brought up to date; no source change.
 - [1.1.20](changelog/v1.1.20.md) — TLS on a bundled BoringSSL (two binaries per ABI; Node's OpenSSL selected by itself under FIPS or an OpenSSL config, or with `MORO_ENGINE_TLS` / `selectTls()`); the bundled copy follows upstream by a scheduled release; `probe().tls`.
 - [1.1.19](changelog/v1.1.19.md) — HTTP/2 (ALPN and prior knowledge, the engine's own implementation; h2spec 146/146); TLS replies written straight to the socket, AES-128-GCM preferred by default; request bodies as heap strings or lent buffers (`getBodyType`, `getBodyText`, `getBodyLent`), body buffers pooled per loop; epoll: each ready socket served once per loop turn.
 - [1.1.18](changelog/v1.1.18.md) — request bodies collected straight into the body buffer (one copy, half the peak memory of an upload); `getBody()` hands the bytes over without a copy; one callback scope per WebSocket read.

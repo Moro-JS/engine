@@ -4,8 +4,7 @@ Status snapshot (see `docs/DESIGN.md` for the full milestone definitions).
 **Shipped in 1.0.0** — HTTP/1.1 + WebSocket (+ permessage-deflate) +
 in-process TLS/HTTPS/WSS + full runtime limit configurability, hardened with
 fuzzing and sanitizers. **Shipped in 1.1.19** — HTTP/2 (ALPN and prior
-knowledge), the engine's own implementation. In progress: the Windows (MSVC)
-CI build leg (the local build has landed in `tools/build.mjs`).
+knowledge), the engine's own implementation.
 
 | Milestone | Status | Notes |
 |-----------|--------|-------|
@@ -39,13 +38,9 @@ CI build leg (the local build has landed in `tools/build.mjs`).
   than vendored, and with the binary on node's OpenSSL kept beside it
   (`docs/TLS.md`). A scheduled workflow follows upstream's snapshots and
   releases each one.
-- **Windows (MSVC) CI build leg** — the local build lands in `tools/build.mjs`;
-  wiring the CI matrix leg is the remaining packaging work.
 - **SNI multi-identity** — one key/cert per server today; per-SNI dispatch is future.
 - **Formal independent security audit** — recommended, as with any TLS-terminating
   software, before the highest-assurance untrusted-facing deployments.
-- **max-connections cap + per-request total-time / min-throughput timeouts** —
-  the idle sweep reaps silent connections but not a steady byte-trickle.
 
 ## How the 1.0 features landed
 
@@ -108,8 +103,6 @@ Completed for 1.0:
 Ongoing / recommended:
 - **Formal independent security audit** — recommended, as with any TLS-terminating
   software, before the highest-assurance untrusted-facing deployments.
-- max-connections cap and per-request total-time / min-throughput timeouts (the
-  idle sweep reaps silent connections but not steady byte-trickle).
 
 ## Platform coverage
 
