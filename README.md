@@ -2,42 +2,15 @@
 
 MoroJS's native HTTP engine: a Moro-authored C++ core with raw-V8 bindings,
 built for maximum throughput with an API shaped exactly for how MoroJS serves
-requests. MIT licensed.
-
-**Status: GA (1.1.x).** HTTP/1.1 + WebSocket cores (with permessage-deflate),
-in-process TLS/HTTPS/WSS, fully configurable limits, hardening, sanitizers,
-fuzzing, and the release pipeline are all shipped (M0–M6 complete). 1.1.0 added
-pipelined response corking and a zero-allocation hot path (~3.7× pipelined
-throughput vs 1.0.0). 1.1.6 takes on the JS boundary itself: prepared response
-templates and static routes, V8 fast API calls on the hot entry points,
-deferred `onAborted`/`onWritable` delivery, zero-copy string bodies, a
-teardown hook that makes the engine safe inside `worker_threads` (MoroJS
-clusters with threads on it), and PGO-trained release binaries - with every
-response path proven byte-identical on the wire. 1.1.9 adds parameter routes:
-a route whose reply is one path segment (`/user/:id`) is answered inside the
-engine as well, so a static-plus-echo route table never enters JS. 1.1.10
-answers those routes straight from the parser - scanned in place in the
-receive buffer, no request id, no header materialisation, one cached frame
-append - and puts the engine's own socket path under Linux by default
-(plain sockets on libuv's epoll), taking libuv's stream layer off the
-request path; 1.1.11 takes that transport down to one `epoll_wait` per
-loop turn, 1.1.12 serves each turn's sockets grouped by the CPU their
-peer sends from, and 1.1.13 makes the order selectable, with a measured `auto` mode. Measured comparisons live in the
-[MoroJS Benchmark repo](https://github.com/Moro-JS/benchmark); release notes in
-[CHANGELOG.md](CHANGELOG.md). 1.1.19 adds HTTP/2
-(ALPN on TLS, prior knowledge on cleartext, HTTP/1.1 beside it on the same
-port). 1.1.20 terminates TLS with a bundled BoringSSL, kept current by a
-scheduled release, with node's OpenSSL still one setting away
-([docs/TLS.md](docs/TLS.md)). See [docs/DESIGN.md](docs/DESIGN.md) and
-[docs/ROADMAP.md](docs/ROADMAP.md).
+requests. It serves HTTP/1.1, HTTP/2 and WebSocket (with permessage-deflate)
+and terminates TLS in-process. MIT licensed.
 
 ## Why
 
 - MoroJS's framework overhead is already ~zero; the remaining performance
   ceiling **is** the engine. Owning it is the only lever left.
 - Owning the binaries means day-one support for every Node release —
-  off-the-shelf native bindings routinely lag (no prebuilt binary for the
-  Node 25 / ABI 141 line for months).
+  off-the-shelf native bindings routinely lag.
 - The Moro-shaped boundary (batched request snapshot, single corked response
   write) needs 2–4 JS crossings per request vs ~10–20 for a general-purpose
   binding.
@@ -60,7 +33,6 @@ server automatically wherever a prebuilt binary isn't available:
 server: {
   engine: 'moro',   // default - native engine when loadable, Node http otherwise
   // engine: 'node' - always use Node http
-  // engine: 'uws'  - opt in to uWebSockets.js
 }
 ```
 
@@ -86,8 +58,8 @@ tools/dev-linux.sh       # the same build + tests inside a Linux container (io_u
 Prebuilt binaries ship only from tagged CI runs with npm provenance — never
 from developer machines, never committed to git.
 
-## Acknowledgments
+## Docs
 
-Hats off to [uWebSockets](https://github.com/uNetworking/uWebSockets) for years
-of showing what high-performance networking on Node and V8 can look like. Moro's
-engine is its own implementation, but that's prior art worth acknowledging.
+[API](docs/API.md) · [Design](docs/DESIGN.md) · [TLS](docs/TLS.md) ·
+[Threat model](docs/THREAT_MODEL.md) · [Roadmap](docs/ROADMAP.md) ·
+[Changelog](CHANGELOG.md) · [Benchmarks](https://github.com/Moro-JS/benchmark)

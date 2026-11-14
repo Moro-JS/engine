@@ -1,7 +1,9 @@
 # @morojs/engine
 
 MoroJS's native HTTP engine: a Moro-authored C++ core with raw-V8 bindings,
-shipped as **prebuilt binaries per platform x Node ABI**. MIT licensed.
+shipped as **prebuilt binaries per platform x Node ABI**. It serves HTTP/1.1,
+HTTP/2 and WebSocket (with permessage-deflate) and terminates TLS in-process.
+MIT licensed.
 
 This is the meta package. It contains only a small JavaScript loader plus the
 TypeScript types; the actual `.node` binaries are delivered by per-platform
@@ -24,7 +26,6 @@ prebuilt binary is not available:
 server: {
   engine: 'moro',   // default - native engine when loadable, Node http otherwise
   // engine: 'node' - always use Node http
-  // engine: 'uws'  - opt in to uWebSockets.js
 }
 ```
 
