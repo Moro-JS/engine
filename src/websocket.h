@@ -154,15 +154,49 @@ inline bool isValidUtf8(std::string_view s) {
 // the offending chunk instead of after buffering the whole message.
 class Utf8Validator {
  public:
-  // Feed the next chunk. Returns false when a byte makes the stream
-  // irrecoverably invalid (no suffix could make it valid UTF-8); the
+  // Feed the next chunk. Returns false at the first byte that makes the
+  // stream irrecoverably invalid (no suffix could make it valid UTF-8); the
   // validator is then in an undefined state — reset() before reuse.
   bool accept(std::string_view s) {
-    for (const char ch : s) {
-      const uint8_t b = uint8_t(ch);
+    const char* p = s.data();
+    const char* const end = p + s.size();
+    while (p != end) {
+      if (need_ == 0) {
+        // Between sequences, ASCII goes by eight bytes at a time: a word with
+        // no high bit set is eight one-byte characters. Most text is nothing
+        // else, and a byte at a time it cost seven instructions each. A long
+        // run goes by thirty-two first, four words tested at once; the word
+        // with the high bit, when there is one, is then found eight at a time.
+        while (end - p >= 32) {
+          uint64_t a, b, c, d;
+          std::memcpy(&a, p, 8);
+          std::memcpy(&b, p + 8, 8);
+          std::memcpy(&c, p + 16, 8);
+          std::memcpy(&d, p + 24, 8);
+          if ((a | b | c | d) & 0x8080808080808080ull) break;
+          p += 32;
+        }
+        while (end - p >= 8) {
+          uint64_t w;
+          std::memcpy(&w, p, 8);
+          if (w & 0x8080808080808080ull) break;
+          p += 8;
+        }
+        if (p == end) break;
+      }
+      const uint8_t b = uint8_t(*p++);
       if (need_ == 0) {
         if (b < 0x80) continue;               // one byte: U+0000..U+007F
+        // The first continuation byte of a sequence has a narrower range
+        // after four lead bytes (RFC 3629 §4): E0 A0..BF (below that is an
+        // overlong form), ED 80..9F (above it is a surrogate), F0 90..BF
+        // (overlong), F4 80..8F (above it is past U+10FFFF). Checking it
+        // there rejects the sequence at the byte that makes it invalid, not
+        // when its last byte arrives.
+        lo_ = 0x80;
+        hi_ = 0xBF;
         if ((b & 0xE0) == 0xC0) {             // two bytes: U+0080..U+07FF
+          if (b < 0xC2) return false;         // C0/C1 can only start an overlong form
           need_ = 1;
           cp_ = b & 0x1F;
           min_ = 0x80;
@@ -170,15 +204,22 @@ class Utf8Validator {
           need_ = 2;
           cp_ = b & 0x0F;
           min_ = 0x800;
+          if (b == 0xE0) lo_ = 0xA0;
+          else if (b == 0xED) hi_ = 0x9F;
         } else if ((b & 0xF8) == 0xF0) {      // four bytes: U+10000..U+10FFFF
+          if (b > 0xF4) return false;         // F5..F7 start nothing at or below U+10FFFF
           need_ = 3;
           cp_ = b & 0x07;
           min_ = 0x10000;
+          if (b == 0xF0) lo_ = 0x90;
+          else if (b == 0xF4) hi_ = 0x8F;
         } else {
           return false;  // 0x80..0xBF stray continuation, or 0xF8..0xFF
         }
       } else {
-        if ((b & 0xC0) != 0x80) return false;  // not a continuation byte
+        if (b < lo_ || b > hi_) return false;  // not a continuation byte, or out of range for its lead
+        lo_ = 0x80;
+        hi_ = 0xBF;
         cp_ = (cp_ << 6) | (b & 0x3F);
         if (--need_ == 0) {
           if (cp_ < min_) return false;                      // overlong
@@ -202,7 +243,31 @@ class Utf8Validator {
   uint32_t need_ = 0;  // continuation bytes still required
   uint32_t cp_ = 0;    // code point accumulated so far
   uint32_t min_ = 0;   // smallest code point this sequence length may encode
+  uint8_t lo_ = 0x80;  // range the next continuation byte must fall in
+  uint8_t hi_ = 0xBF;
 };
+
+// §7.4.1 / §7.4.2: the status codes a Close frame may carry. 1004, 1005,
+// 1006 and 1015 are reserved and MUST NOT be set by an endpoint; 0-999 are
+// not used; 1016-2999 are reserved for future revisions of the protocol;
+// nothing above 4999 is defined. One rule for both directions: what a peer
+// may send (WsParser) and what the server itself sends (closeFramePayload).
+inline bool isWireCloseCode(int code) {
+  return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) ||
+         (code >= 3000 && code <= 4999);
+}
+
+// §5.5: a control frame's payload is at most 125 bytes, so a Close reason
+// has 123 after the two-byte status code. A longer one is cut at the last
+// character boundary that fits (§5.5.1: the reason MUST be valid UTF-8, so a
+// character is never split).
+inline std::string_view truncateCloseReason(std::string_view reason) {
+  static constexpr size_t kMax = 123;
+  if (reason.size() <= kMax) return reason;
+  size_t n = kMax;
+  while (n > 0 && (uint8_t(reason[n]) & 0xC0) == 0x80) --n;
+  return reason.substr(0, n);
+}
 
 // Incremental server-side frame decoder (RFC 6455 §5.2). Feed bytes as they
 // arrive off the wire — any byte of a header or payload may arrive in a
@@ -265,6 +330,21 @@ class WsParser {
   template <typename OnMessage, typename OnControl>
   bool consume(uint8_t* data, size_t len, OnMessage&& onMessage,
                OnControl&& onControl) {
+    return consume(data, len, onMessage, onControl, LeaveBuffer{});
+  }
+
+  // The same, with a say for the caller in how a message that had to be
+  // buffered - reassembled from fragments, or one frame over several reads -
+  // is handed over. onBuffer(std::string& message, isBinary, compressed) is
+  // called first, with the parser's own buffer holding exactly the message:
+  // the callee may take the string (swap or move it out; the parser carries
+  // on with whatever it is left) and return true, and onMessage is then not
+  // called for that message. Returning false leaves the buffer as it is and
+  // the message goes to onMessage as a view, as always. A message delivered
+  // in place from `data` never comes this way.
+  template <typename OnMessage, typename OnControl, typename OnBuffer>
+  bool consume(uint8_t* data, size_t len, OnMessage&& onMessage,
+               OnControl&& onControl, OnBuffer&& onBuffer) {
     if (failed_) return false;
     size_t i = 0;
     while (i < len) {
@@ -286,7 +366,8 @@ class WsParser {
           mask_[maskHave_++] = data[i++];
           if (maskHave_ == 4) {
             if (payloadRemaining_ == 0) {
-              if (!finishFrame(onMessage, onControl)) return fail();
+              readLeft_ = len - i;
+              if (!finishFrame(onMessage, onControl, onBuffer)) return fail();
             } else {
               state_ = State::Payload;
             }
@@ -332,19 +413,28 @@ class WsParser {
             const bool isBinary = messageIsBinary_;
             const bool compressed = messageCompressed_;
             messageCompressed_ = false;
+            readLeft_ = avail - take;
             onMessage(std::string_view(p, take), isBinary, compressed);
             break;
           }
           const size_t take = size_t(std::min<uint64_t>(payloadRemaining_, avail));
           std::string& sink = isControl_ ? control_ : message_;
-          // Large declared payloads: reserve once at the first buffered
-          // chunk (bounded by commitLength's limit check) so chunked appends
-          // don't re-copy the buffer geometrically. Deferred to here — after
-          // the fast path above — so frames it consumes never allocate.
-          // Small frames keep amortized growth: a per-frame exact reserve
-          // would make many-small-fragment messages quadratic.
+          // Large declared payloads: reserve once (bounded by commitLength's
+          // limit check) so chunked appends don't re-copy the buffer
+          // geometrically. Deferred to here — after the fast path above — so
+          // frames it consumes never allocate. Small frames keep amortized
+          // growth: a per-frame exact reserve would make many-small-fragment
+          // messages quadratic.
+          // The reserve waits until a sixteenth of the message has arrived
+          // (the first read, for a frame up to sixteen read buffers long).
+          // Until then the length is only a claim: a peer that sent a frame
+          // header and one byte had the whole declared size set aside for
+          // it - address space, and committed memory on a platform that
+          // commits at allocation - for as long as it kept the connection
+          // open, and WebSockets have no receive timeout.
           if (!isControl_ && payloadRemaining_ > 65536 &&
-              sink.size() + size_t(payloadRemaining_) > sink.capacity()) {
+              sink.size() + size_t(payloadRemaining_) > sink.capacity() &&
+              sink.size() + take >= (sink.size() + size_t(payloadRemaining_)) / kReserveShare) {
             sink.reserve(sink.size() + size_t(payloadRemaining_));
           }
           const size_t base = sink.size();
@@ -368,8 +458,9 @@ class WsParser {
             failCode_ = 1007;  // §7.4.1: Invalid frame payload data
             return fail();
           }
-          if (payloadRemaining_ == 0 && !finishFrame(onMessage, onControl)) {
-            return fail();
+          if (payloadRemaining_ == 0) {
+            readLeft_ = len - i;
+            if (!finishFrame(onMessage, onControl, onBuffer)) return fail();
           }
           break;
         }
@@ -380,12 +471,27 @@ class WsParser {
 
   const Limits& limits() const { return limits_; }
 
+  // Inside a callback: whether the buffer being consumed holds more bytes
+  // behind the frame that is being delivered - another frame, or the start
+  // of one. (What a reply to this frame may share a write, or on TLS a
+  // record, with.) Outside a callback it is what the last one left.
+  bool moreInRead() const { return readLeft_ != 0; }
+
   // Close code the caller should fail the connection with; meaningful only
   // after consume() has returned false.
   uint16_t failCode() const { return failCode_; }
 
  private:
   enum class State : uint8_t { Header, ExtLen, MaskKey, Payload };
+
+  // consume() without an onBuffer: every buffered message goes to onMessage.
+  struct LeaveBuffer {
+    bool operator()(std::string&, bool, bool) const { return false; }
+  };
+
+  // A message's buffer is reserved in full once this fraction of it has
+  // been received (see the buffering path in consume()).
+  static constexpr size_t kReserveShare = 16;
 
   bool fail() {
     failed_ = true;
@@ -527,8 +633,8 @@ class WsParser {
   }
 
   // The frame's payload (possibly empty) is fully buffered and unmasked.
-  template <typename OnMessage, typename OnControl>
-  bool finishFrame(OnMessage& onMessage, OnControl& onControl) {
+  template <typename OnMessage, typename OnControl, typename OnBuffer>
+  bool finishFrame(OnMessage& onMessage, OnControl& onControl, OnBuffer& onBuffer) {
     // Next bytes begin a new frame header.
     state_ = State::Header;
     hdrHave_ = 0;
@@ -543,9 +649,7 @@ class WsParser {
           // (1004/1005/1006/1015), 0-999, 1016-2999, and >4999 MUST NOT appear
           // on the wire — a peer sending one is a protocol error (fail, 1002).
           uint16_t code = uint16_t((uint16_t(uint8_t(control_[0])) << 8) | uint8_t(control_[1]));
-          bool valid = (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) ||
-                       (code >= 3000 && code <= 4999);
-          if (!valid) return false;
+          if (!isWireCloseCode(code)) return false;
           // §5.5.1: the reason data following the code MUST be valid UTF-8.
           if (control_.size() > 2 &&
               !isValidUtf8(std::string_view(control_).substr(2))) {
@@ -577,7 +681,8 @@ class WsParser {
       return false;
     }
 
-    onMessage(std::string_view(message_), messageIsBinary_, messageCompressed_);
+    if (!onBuffer(message_, messageIsBinary_, messageCompressed_))
+      onMessage(std::string_view(message_), messageIsBinary_, messageCompressed_);
     message_.clear();
     // One huge message must not pin its capacity to an idle connection (same
     // 16 KiB watermark as server.h's releaseScratch).
@@ -605,6 +710,7 @@ class WsParser {
   uint8_t mask_[4] = {};
   size_t maskHave_ = 0;
   size_t maskPos_ = 0;
+  size_t readLeft_ = 0;  // see moreInRead()
 
   // Current frame.
   uint64_t payloadLen_ = 0;
@@ -637,6 +743,27 @@ class WsParser {
 // required by §5.2 (7-bit, 16-bit, or 64-bit).
 // rsv1 sets the RSV1 bit (permessage-deflate "compressed" marker, RFC 7692
 // §6) - valid only on the first frame of a data message.
+// The header of that frame alone, for a payload of `n` bytes that is written
+// from where it is: at most ten bytes into `out`, returns how many.
+inline size_t encodeFrameHeader(char out[10], WsOpcode opcode, uint64_t n,
+                                bool fin = true, bool rsv1 = false) {
+  out[0] = char(uint8_t(fin ? 0x80 : 0x00) | uint8_t(rsv1 ? 0x40 : 0x00) |
+                uint8_t(opcode));
+  if (n <= 125) {
+    out[1] = char(uint8_t(n));
+    return 2;
+  }
+  if (n <= 0xFFFF) {
+    out[1] = char(126);
+    out[2] = char(uint8_t(n >> 8));
+    out[3] = char(uint8_t(n));
+    return 4;
+  }
+  out[1] = char(127);
+  for (int i = 0; i < 8; ++i) out[2 + i] = char(uint8_t(n >> (56 - 8 * i)));
+  return 10;
+}
+
 inline void encodeFrame(std::string& out, WsOpcode opcode,
                         std::string_view payload, bool fin = true,
                         bool rsv1 = false) {
@@ -665,6 +792,22 @@ inline void encodeClosePayload(std::string& out, uint16_t code,
   out += char(uint8_t(code >> 8));
   out += char(uint8_t(code));
   out.append(reason);
+}
+
+// The body of a Close frame the application asked for with `code` and
+// `reason`, made legal for the wire whatever it passed:
+//   - a code that may be sent (isWireCloseCode) goes out as given;
+//   - 1005 means "no status code was present" (§7.4.1), and that is exactly
+//     what is sent: a Close frame with an empty body (a reason cannot be
+//     carried without a code, so it is dropped);
+//   - any other value - the reserved 1004/1006/1015, anything below 1000,
+//     1016-2999, 5000 and above - is not expressible and goes out as 1011
+//     (the server met a condition it did not expect);
+//   - the reason is cut to the 123 bytes a control frame leaves for it.
+inline void closeFramePayload(std::string& out, int code, std::string_view reason) {
+  if (code == 1005) return;
+  encodeClosePayload(out, isWireCloseCode(code) ? uint16_t(code) : uint16_t(1011),
+                     truncateCloseReason(reason));
 }
 
 // Parse the status code out of a close frame body. §7.1.5: if the close

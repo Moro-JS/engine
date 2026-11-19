@@ -27,7 +27,8 @@ or unsupported optional dependency never fails `npm install`).
 ## Release assembly (CI, `.github/workflows/release.yml`)
 
 Binaries ship **only** from a tagged CI run with npm provenance, never from a
-developer machine (see `CONTRIBUTING.md`). Pushing a `v*` tag runs `release.yml`,
+developer machine (see `CONTRIBUTING.md`). Publishing the GitHub Release of a
+`vX.Y.Z` tag runs `release.yml` (pushing the tag alone publishes nothing),
 which:
 
 1. Rebuilds every platform (same matrix as `ci.yml`) and collects the
@@ -47,6 +48,11 @@ which:
 3. Publishes each per-platform package, then the meta package (`packages/engine`)
    **last**, so its `optionalDependencies` already resolve on the registry.
 
+A tag with a prerelease identifier (`v1.2.0-rc.1`; see `tools/version.mjs`) is
+a release candidate: the same steps, with every package published under the
+dist-tag `next`, so `latest` - what a plain install resolves to - stays on the
+last release.
+
 `publishConfig` in every package already pins `access: public` (required for
 first publish of a scoped package) and `provenance: true`.
 
@@ -56,7 +62,8 @@ committed scaffold contains no `.node` files and would publish an empty package.
 ## Adding a new Node ABI
 
 Add one line to `TARGETS` in `tools/build.mjs`, add the Node version to the
-smoke matrix in `.github/workflows/ci.yml`, and ship a minor release. No
+smoke matrices in `.github/workflows/ci.yml` and `release.yml`, and ship a
+minor release. No
 package-layout change is needed - each per-platform package simply carries the
 additional `.node`.
 

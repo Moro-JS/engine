@@ -216,3 +216,86 @@ describe('transport parity', { skip }, () => {
     }
   });
 });
+
+// What a peer sent before it reset its connection has been received, and is
+// delivered before the reset is acted on, whichever transport reads the
+// socket: the last request of a client that then went away, the last
+// messages of a WebSocket. The server runs in this process, so the bytes
+// and the reset behind them have both arrived by the time its loop looks at
+// the socket - the order in which a transport must not lose them.
+describe('input received ahead of a reset', { skip }, () => {
+  const connect = (port) =>
+    new Promise((resolve, reject) => {
+      const s = net.connect(port, '127.0.0.1', () => resolve(s));
+      s.on('error', reject);
+    });
+  const until = async (cond, what) => {
+    for (let i = 0; i < 300 && !cond(); i++) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(cond(), what);
+  };
+
+  it('a request is dispatched, body and all', T, async () => {
+    const seen = [];
+    let aborted = 0;
+    const sid = engine.serve(
+      {
+        onRequest(reqId, method, path) { seen.push(`${path} ${Buffer.from(engine.getBody(reqId) ?? '').toString('latin1')}`); },
+        onAborted() { aborted++; },
+        onWritable() {},
+      },
+      {}
+    );
+    try {
+      const port = engine.listen(sid, '127.0.0.1', 0);
+      const s = await connect(port);
+      s.removeAllListeners('error');
+      s.on('error', () => {});
+      s.write('POST /last HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello');
+      s.resetAndDestroy();
+      await until(() => seen.length === 1, 'the request sent ahead of the reset reached the handler');
+      assert.deepEqual(seen, ['/last hello']);
+      await until(() => aborted === 1, 'and the reset then aborted it, once');
+    } finally {
+      engine.close(sid);
+    }
+  });
+
+  it('WebSocket messages are delivered, then the socket is reported gone', T, async () => {
+    const events = [];
+    const sid = engine.serve(
+      {
+        onRequest(reqId) { if (engine.upgradeToWebSocket(reqId) === -1) engine.respond(reqId, 400, null, ''); },
+        onAborted() {},
+        onWritable() {},
+        onWsOpen() {},
+        onWsMessage(wsId, data) { events.push(Buffer.from(data).toString('latin1')); },
+        onWsClose(wsId, code) { events.push(code); },
+      },
+      {}
+    );
+    const frame = (text) => {
+      const payload = Buffer.from(text, 'latin1');
+      const out = Buffer.alloc(6 + payload.length);
+      out[0] = 0x81;
+      out[1] = 0x80 | payload.length;
+      out.writeUInt32BE(0x01020304, 2);
+      for (let i = 0; i < payload.length; i++) out[6 + i] = payload[i] ^ out[2 + (i & 3)];
+      return out;
+    };
+    try {
+      const port = engine.listen(sid, '127.0.0.1', 0);
+      const s = await connect(port);
+      s.removeAllListeners('error');
+      s.on('error', () => {});
+      s.write(`GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n`);
+      await new Promise((resolve) => s.once('data', resolve));
+      const texts = Array.from({ length: 200 }, (_, i) => `message-${i}`);
+      s.write(Buffer.concat(texts.map(frame)));
+      s.resetAndDestroy();
+      await until(() => events.includes(1006), 'the reset closed the WebSocket');
+      assert.deepEqual(events, [...texts, 1006]);
+    } finally {
+      engine.close(sid);
+    }
+  });
+});

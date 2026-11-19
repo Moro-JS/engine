@@ -182,6 +182,47 @@ describe('worker_threads', { skip }, () => {
     }
   });
 
+  // io_uring is the process's transport, but a thread that cannot have a ring
+  // of its own runs its servers on the epoll transport (here: the process is
+  // one descriptor short of a ring at the moment the worker listens). That
+  // thread's epoll state owns a libuv handle like any other and has to be
+  // closed when the thread ends, or Node aborts the process over a loop with
+  // an open handle.
+  it('a worker whose server could not have a ring ends without taking the process down',
+    { ...T, skip: engine?.probe().transport !== 'uring' && 'needs the io_uring transport (MORO_ENGINE_TRANSPORT=uring)' }, () => {
+    const script = `
+      import { Worker } from 'node:worker_threads';
+      const src = \`
+        import fs from 'node:fs';
+        import { parentPort } from 'node:worker_threads';
+        const { default: engine } = await import(${JSON.stringify(ENGINE_ENTRY)});
+        const sid = engine.serve({ onRequest(reqId) { engine.respond(reqId, 200, null, 'ok'); }, onAborted() {} }, {});
+        const taken = [];
+        try { for (;;) taken.push(fs.openSync('/dev/null', 'r')); } catch {}
+        fs.closeSync(taken.pop());  // one descriptor: the ring gets it, its eventfd gets none
+        let first = 'listening';
+        try { engine.listen(sid, '127.0.0.1', 0); } catch (e) { first = e.code; }
+        for (const fd of taken) fs.closeSync(fd);
+        let port = 0;
+        try { port = engine.listen(sid, '127.0.0.1', 0); } catch {}
+        const status = port ? await fetch('http://127.0.0.1:' + port + '/', { headers: { connection: 'close' } }).then((r) => r.status, () => 0) : 0;
+        parentPort.postMessage({ first, status });
+      \`;
+      const worker = new Worker(new URL('data:text/javascript,' + encodeURIComponent(src)));
+      const msg = await new Promise((resolve) => worker.once('message', resolve));
+      await worker.terminate();
+      console.log(JSON.stringify(msg));
+    `;
+    const r = spawnSync('sh', ['-c', 'ulimit -n 256; exec "$0" --input-type=module -e "$SUBJECT"', process.execPath], {
+      env: { ...process.env, SUBJECT: script },
+      encoding: 'utf8',
+      timeout: 30000,
+    });
+    assert.equal(r.status, 0, `the process outlives its worker (signal ${r.signal})\n${r.stderr}`);
+    assert.ok(!/open handles|uv_loop_close/.test(r.stderr), r.stderr);
+    assert.equal(JSON.parse(r.stdout.trim()).status, 200, 'the worker served a request once descriptors were back');
+  });
+
   it('a process that process.exit()s with the server open exits 0 (no uv_loop_close abort)', T, () => {
     const script = `
       const { default: engine } = await import(${JSON.stringify(ENGINE_ENTRY)});
@@ -192,5 +233,95 @@ describe('worker_threads', { skip }, () => {
     const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.ok(!/uv_loop_close|Assertion failed/.test(r.stderr), r.stderr);
+  });
+
+  // The delivery mode, batch dispatch and fast calls are switches of the
+  // whole process, read from the environment. Every thread that loads the
+  // engine runs its initialisation, and it used to read them again each
+  // time: with the environment changed in between (process.env on the main
+  // thread writes through), a worker's load rewrote what every other thread
+  // was already running on - a thread with fast calls installed found
+  // itself in the mode they must never be combined with.
+  it('a worker that loads the engine later does not change the mode the process started in', T, () => {
+    const script = `
+      import { Worker } from 'node:worker_threads';
+      const { default: engine } = await import(${JSON.stringify(ENGINE_ENTRY)});
+      const view = (p) => ({ notify: p.notify, asyncNotify: p.capabilities.asyncNotify, batch: p.capabilities.batchDispatch, fast: p.fastApi.reason });
+      const before = view(engine.probe());
+      process.env.MORO_ENGINE_NOTIFY = 'sync';
+      process.env.MORO_ENGINE_BATCH = '0';
+      process.env.MORO_ENGINE_FASTCALL = '0';
+      const src = 'import { parentPort } from "node:worker_threads";' +
+        'const { default: engine } = await import(' + JSON.stringify(${JSON.stringify(ENGINE_ENTRY)}) + ');' +
+        'const p = engine.probe(); parentPort.postMessage({ notify: p.notify, asyncNotify: p.capabilities.asyncNotify, batch: p.capabilities.batchDispatch, fast: p.fastApi.reason });';
+      const w = new Worker(new URL('data:text/javascript,' + encodeURIComponent(src)));
+      const inWorker = await new Promise((resolve, reject) => { w.once('message', resolve); w.once('error', reject); });
+      await w.terminate();
+      console.log(JSON.stringify({ before, after: view(engine.probe()), inWorker }));
+    `;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      env: { ...process.env, MORO_ENGINE_NOTIFY: '', MORO_ENGINE_BATCH: '', MORO_ENGINE_FASTCALL: '' },
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const { before, after, inWorker } = JSON.parse(r.stdout.trim());
+    assert.equal(before.notify, 'deferred');
+    assert.equal(before.batch, true);
+    assert.deepEqual(after, before, 'the main thread is where it was');
+    assert.deepEqual(inWorker, before, 'and the worker runs in the same mode');
+  });
+
+  // A supervisor that runs the engine only in worker threads and replaces a
+  // worker that ended. Once the last thread holding the binary has gone the
+  // platform may keep the library mapped (macOS does), and loading it again
+  // then runs no static registration: the second worker was moved to the
+  // other TLS binary, and the third could not load the engine at all
+  // ("Module did not self-register"). The main thread here never loads it.
+  it('a worker started after the last one ended loads the same binary again', T, () => {
+    const script = `
+      import { Worker } from 'node:worker_threads';
+      const src = 'import { parentPort } from "node:worker_threads";' +
+        'const { default: engine } = await import(' + JSON.stringify(${JSON.stringify(ENGINE_ENTRY)}) + ');' +
+        'const p = engine.probe(); let port = 0;' +
+        'if (p.ok) { const sid = engine.serve({ onRequest() {} }); port = engine.listen(sid, "127.0.0.1", 0); }' +
+        'parentPort.postMessage({ ok: p.ok, listening: port > 0, tls: p.tls && p.tls.library, reason: p.tls && p.tls.reason });';
+      const seen = [];
+      for (let i = 0; i < 4; i++) {
+        const w = new Worker(new URL('data:text/javascript,' + encodeURIComponent(src)));
+        seen.push(await new Promise((resolve, reject) => { w.once('message', resolve); w.once('error', reject); }));
+        await w.terminate();
+      }
+      console.log(JSON.stringify(seen));
+    `;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const seen = JSON.parse(r.stdout.trim());
+    assert.equal(seen.length, 4);
+    for (const w of seen) assert.deepEqual(w, { ...seen[0], ok: true, listening: true }, JSON.stringify(seen));
+  });
+
+  // worker.terminate() ends the isolate under whatever handler is running.
+  // That is not a handler that threw, and is not reported as one.
+  it('a handler cut short by terminate() is not reported as having thrown', T, async () => {
+    const script = `
+      import net from 'node:net';
+      import { Worker } from 'node:worker_threads';
+      const src = 'import { parentPort } from "node:worker_threads";' +
+        'const { default: engine } = await import(' + JSON.stringify(${JSON.stringify(ENGINE_ENTRY)}) + ');' +
+        'const sid = engine.serve({ onRequest() { parentPort.postMessage("spinning"); for (;;) {} }, onAborted() {} });' +
+        'parentPort.postMessage({ port: engine.listen(sid, "127.0.0.1", 0) });';
+      const w = new Worker(new URL('data:text/javascript,' + encodeURIComponent(src)));
+      const { port } = await new Promise((resolve) => w.once('message', resolve));
+      const s = net.connect(port, '127.0.0.1', () => s.write('GET / HTTP/1.1\\r\\nHost: t\\r\\n\\r\\n'));
+      s.on('error', () => {});
+      await new Promise((resolve) => w.once('message', resolve));
+      await w.terminate();
+      s.destroy();
+      console.log('terminated');
+    `;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 20000 });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(r.stdout.trim(), 'terminated');
+    assert.ok(!/threw/.test(r.stderr), r.stderr);
   });
 });

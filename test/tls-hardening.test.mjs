@@ -8,7 +8,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { loadEngine, startFixtureServer, parseResponse } from './helpers.mjs';
-import { sslFileOptions, rawTlsRequest, openRawTls } from './tls-helpers.mjs';
+import { sslFileOptions, rawTlsRequest, openRawTls, openTakenOverTls } from './tls-helpers.mjs';
 
 const engine = await loadEngine();
 const tlsCapable = engine?.probe?.().capabilities?.tls === true;
@@ -263,6 +263,79 @@ describe('@morojs/engine TLS hardening', { skip }, () => {
       () => engine.serve({ onRequest() {} }, { ssl: { ...sslFileOptions(), ecdhCurve: 'not-a-group' } }),
       /ecdhCurve/
     );
+  });
+
+  // Records a peer can send after the handshake that the TLS library answers
+  // by itself, one answer each: a TLS 1.3 KeyUpdate that asks for one back, a
+  // TLS 1.2 renegotiation request (refused with a warning alert, or by ending
+  // the connection). A peer that sends them without reading must not get an
+  // answer queued for every one of them.
+  async function floodWithoutReading(server, version, nextRecord) {
+    const { raw, writer } = await openTakenOverTls(server.port, version);
+    let closed = false;
+    raw.setMaxListeners(0);
+    raw.on('close', () => { closed = true; });
+    const settle = () => Promise.race([
+      new Promise((resolve) => raw.once('drain', resolve)),
+      new Promise((resolve) => raw.once('close', resolve)),
+      new Promise((resolve) => setTimeout(resolve, 2000)),
+    ]);
+    // Far more than the socket buffers of either end can absorb (the answers
+    // the kernel takes are not the server's to hold), and four times what
+    // the server stops at beyond that.
+    const limit = 24 * 1024 * 1024;
+    let sent = 0;
+    while (!closed && sent < limit) {
+      const records = [];
+      for (let i = 0; i < 1000; i++) records.push(nextRecord(writer));
+      const batch = Buffer.concat(records);
+      sent += batch.length;
+      if (!raw.write(batch)) await settle();
+    }
+    if (!closed) await new Promise((resolve) => { raw.once('close', resolve); setTimeout(resolve, 1500); });
+    raw.destroy();
+    return { closed, sent };
+  }
+
+  // Megabytes of hand-encrypted records, each a key derivation on both
+  // sides: given longer than the other cases for slow and instrumented builds.
+  const FLOOD = { timeout: 180000 };
+
+  it('a TLS 1.3 peer that floods KeyUpdate requests and reads nothing is closed', FLOOD, async () => {
+    await withTlsServer(ok, {}, async (server) => {
+      const { closed, sent } = await floodWithoutReading(server, 'TLSv1.3', (w) => w.keyUpdate());
+      assert.ok(closed, `the server was still answering after ${sent} bytes of KeyUpdate from a peer that reads nothing`);
+      const res = parseResponse(await rawTlsRequest(server.port, `GET / HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`));
+      assert.equal(res.status, 200);
+    });
+  });
+
+  it('a TLS 1.2 peer that floods renegotiation requests and reads nothing is closed', FLOOD, async () => {
+    await withTlsServer(ok, {}, async (server) => {
+      const { closed, sent } = await floodWithoutReading(server, 'TLSv1.2', (w) => w.renegotiationRequest());
+      assert.ok(closed, `the server was still answering after ${sent} bytes of renegotiation requests from a peer that reads nothing`);
+      const res = parseResponse(await rawTlsRequest(server.port, `GET / HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`));
+      assert.equal(res.status, 200);
+    });
+  });
+
+  it('a peer that reads the answers to its KeyUpdates is served', T, async () => {
+    await withTlsServer(ok, {}, async (server) => {
+      const { raw, writer } = await openTakenOverTls(server.port, 'TLSv1.3');
+      let received = 0;
+      let closed = false;
+      raw.on('data', (d) => { received += d.length; });
+      raw.on('close', () => { closed = true; });
+      raw.resume();
+      // Fewer in a row than BoringSSL allows a peer that sends nothing else (32).
+      for (let i = 0; i < 20; i++) raw.write(writer.keyUpdate());
+      raw.write(writer.applicationData(`GET / HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`));
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(closed, false, 'a client that rotates its keys and reads is not a flood');
+      assert.equal(server.requests.length, 1, 'the request sent under the twentieth key is served');
+      assert.ok(received > 0);
+      raw.destroy();
+    });
   });
 
   it('a burst of failed handshakes leaves the server fully healthy', T, async () => {

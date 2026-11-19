@@ -140,7 +140,92 @@ describe('TLS library selection', { skip }, () => {
     const named = probeTls({ env: { OPENSSL_CONF: cnf, MORO_ENGINE_TLS: 'boringssl' } });
     assert.equal(named.tls.library, 'boringssl');
     assert.equal(named.tls.reason, 'MORO_ENGINE_TLS');
+
+    // The same options given through node's configuration file take effect
+    // like the flags and show in neither execArgv nor NODE_OPTIONS.
+    const nodeConfig = join(confDir, 'node.config.json');
+    writeFileSync(nodeConfig, JSON.stringify({ nodeOptions: { 'openssl-config': cnf } }));
+    const probeWithFile = spawnSync(process.execPath, ['--experimental-config-file=' + nodeConfig, '-e', '0'], { env: cleanEnv(), encoding: 'utf8' });
+    if (probeWithFile.status !== 0) return t.diagnostic('this node has no --experimental-config-file');
+    const viaFile = probeTls({ args: ['--experimental-config-file=' + nodeConfig] });
+    assert.equal(viaFile.tls.library, 'openssl');
+    assert.match(viaFile.tls.reason, /--openssl-config in .*node\.config\.json/);
+    // A configuration file that says nothing about OpenSSL changes nothing.
+    writeFileSync(nodeConfig, JSON.stringify({ nodeOptions: { 'max-http-header-size': 16384 } }));
+    assert.equal(probeTls({ args: ['--experimental-config-file=' + nodeConfig] }).tls.library, 'boringssl');
   });
+
+  // What the operator told node about every TLS server of the process holds
+  // for a server here whose own ssl options do not say otherwise.
+  for (const library of ['boringssl', 'openssl']) {
+    const handshakes = `
+      const tls = await import('node:tls');
+      const { readFileSync } = await import('node:fs');
+      const fx = (n) => readFileSync(${JSON.stringify(FIXTURES)} + n);
+      const identity = { key: fx('localhost.key'), cert: fx('localhost.pem') };
+      const start = (ssl) => {
+        const sid = engine.serve({ onRequest(id) { engine.respond(id, 200, null, 'ok'); }, onAborted() {} }, { ssl });
+        return { sid, port: engine.listen(sid, '127.0.0.1', 0) };
+      };
+      const connect = (port, version) => new Promise((resolve) => {
+        // The client names its own list: the flags under test would otherwise shape it too.
+        const offered = 'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384';
+        const s = tls.connect({ host: '127.0.0.1', port, ca: fx('ca.pem'), servername: 'localhost', minVersion: version, maxVersion: version, ciphers: offered }, () => {
+          resolve(s.getCipher().name);
+          s.destroy();
+        });
+        s.on('error', () => resolve(null));
+      });
+    `;
+
+    it(`${library}: node --tls-min-v1.3 is the floor of a server that names none`, { ...T, skip: needBoth }, () => {
+      const body = `${handshakes}
+        const plain = start(identity);
+        const own = start({ ...identity, minVersion: 'TLSv1.2' });
+        const out = {
+          default12: await connect(plain.port, 'TLSv1.2'), default13: await connect(plain.port, 'TLSv1.3'),
+          own12: await connect(own.port, 'TLSv1.2'),
+        };
+        // updateSsl() builds a new context: the floor goes into that one too.
+        engine.updateSsl(plain.sid, { key: fx('rsa.key'), cert: fx('rsa.pem') });
+        out.updated12 = await connect(plain.port, 'TLSv1.2');
+        out.updated13 = await connect(plain.port, 'TLSv1.3');
+        engine.close(plain.sid); engine.close(own.sid);
+        return out;
+      `;
+      const withFlag = child(body, { args: ['--tls-min-v1.3'], env: { MORO_ENGINE_TLS: library } }).value;
+      assert.equal(withFlag.default12, null, 'TLS 1.2 refused under --tls-min-v1.3');
+      assert.ok(withFlag.default13);
+      assert.ok(withFlag.own12, "the app's own minVersion wins, as it does for node's servers");
+      assert.equal(withFlag.updated12, null, 'still refused after updateSsl()');
+      assert.ok(withFlag.updated13);
+      const without = child(body, { env: { MORO_ENGINE_TLS: library } }).value;
+      assert.ok(without.default12, 'no flag: the default floor is TLS 1.2');
+      // And the ceiling: --tls-max-v1.2.
+      const capped = child(body, { args: ['--tls-max-v1.2'], env: { MORO_ENGINE_TLS: library } }).value;
+      assert.ok(capped.default12);
+      assert.equal(capped.default13, null, 'TLS 1.3 refused under --tls-max-v1.2');
+      assert.equal(capped.updated13, null, 'still refused after updateSsl()');
+    });
+
+    it(`${library}: node --tls-cipher-list is the cipher list of a server that names none`, { ...T, skip: needBoth }, () => {
+      const body = `${handshakes}
+        const plain = start(identity);
+        const own = start({ ...identity, ciphers: 'ECDHE-ECDSA-AES128-GCM-SHA256' });
+        const out = { default12: await connect(plain.port, 'TLSv1.2'), default13: await connect(plain.port, 'TLSv1.3'), own12: await connect(own.port, 'TLSv1.2') };
+        engine.close(plain.sid); engine.close(own.sid);
+        return out;
+      `;
+      const list = 'TLS_AES_256_GCM_SHA384:ECDHE-ECDSA-AES256-GCM-SHA384';
+      const withFlag = child(body, { args: ['--tls-cipher-list=' + list], env: { MORO_ENGINE_TLS: library } }).value;
+      assert.equal(withFlag.default12, 'ECDHE-ECDSA-AES256-GCM-SHA384');
+      assert.equal(withFlag.default13, 'TLS_AES_256_GCM_SHA384');
+      assert.equal(withFlag.own12, 'ECDHE-ECDSA-AES128-GCM-SHA256', "the app's own list wins");
+      const without = child(body, { env: { MORO_ENGINE_TLS: library } }).value;
+      assert.equal(without.default12, 'ECDHE-ECDSA-AES128-GCM-SHA256');
+      assert.equal(without.default13, 'TLS_AES_128_GCM_SHA256');
+    });
+  }
 
   it('selectTls() chooses before the load and cannot swap after it', { ...T, skip: needBoth }, () => {
     const { value } = child(`
@@ -185,6 +270,8 @@ describe('TLS library selection', { skip }, () => {
     try {
       mkdirSync(join(dir, 'packages', 'engine'), { recursive: true });
       mkdirSync(join(dir, 'build'));
+      // A stand-in for the repository: the loader reads build/ only there.
+      cpSync(join(root, 'package.json'), join(dir, 'package.json'));
       for (const f of ['index.js', 'index.mjs', 'package.json']) {
         cpSync(join(root, 'packages', 'engine', f), join(dir, 'packages', 'engine', f));
       }
@@ -250,6 +337,125 @@ describe('TLS library selection', { skip }, () => {
 // it was served; an update must not turn it into a server that will not start.
 // (A TLS 1.3 CCM suite stands in for the family: Ed448 and DSA keys, brainpool
 // groups, DHE-only cipher lists.)
+describe('where the binary is loaded from', { skip }, () => {
+  // An install has no platform package here, and something called "build"
+  // sitting next to @morojs in node_modules: the loader must not take a
+  // binary from it. In the repository the same relative path is build/.
+  it('an installed copy does not load a binary from node_modules/build', T, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'moro-engine-install-'));
+    try {
+      const pkg = join(dir, 'node_modules', '@morojs', 'engine');
+      mkdirSync(pkg, { recursive: true });
+      for (const f of ['index.js', 'index.mjs', 'package.json']) cpSync(join(root, 'packages', 'engine', f), join(pkg, f));
+      mkdirSync(join(dir, 'node_modules', 'build'));
+      for (const f of readdirSync(join(root, 'build'))) {
+        if (f.endsWith(`_${process.versions.modules}.node`) || f.endsWith(`_${process.versions.modules}_boringssl.node`)) {
+          cpSync(join(root, 'build', f), join(dir, 'node_modules', 'build', f));
+        }
+      }
+      const entry = pathToFileURL(join(pkg, 'index.mjs')).href;
+      const installed = child('const p = engine.probe(); return { ok: p.ok, error: p.error ?? null };', { entry }).value;
+      assert.equal(installed.ok, false, 'no platform package: there is nothing to load');
+      assert.doesNotMatch(String(installed.error), /node_modules[\\/]build/);
+
+      // The checkout itself still finds its local build.
+      assert.equal(probeTls().ok, true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // An install as npm lays it out: the meta package and, beside it, the
+  // platform package stamped `version`, carrying this build's binaries.
+  function install(dir, version) {
+    const scope = join(dir, 'node_modules', '@morojs');
+    const pkg = join(scope, 'engine');
+    mkdirSync(pkg, { recursive: true });
+    for (const f of ['index.js', 'index.mjs', 'package.json']) cpSync(join(root, 'packages', 'engine', f), join(pkg, f));
+    const libc = process.platform === 'linux' ? (existsSync('/etc/alpine-release') ? '-musl' : '-gnu') : '';
+    const name = `engine-${process.platform}-${process.arch}${libc}`;
+    mkdirSync(join(scope, name));
+    writeFileSync(join(scope, name, 'package.json'), JSON.stringify({ name: `@morojs/${name}`, version }));
+    for (const f of readdirSync(join(root, 'build'))) {
+      if (f.endsWith(`_${process.versions.modules}.node`) || f.endsWith(`_${process.versions.modules}_boringssl.node`)) {
+        cpSync(join(root, 'build', f), join(scope, name, f));
+      }
+    }
+    return { entry: pathToFileURL(join(pkg, 'index.mjs')).href };
+  }
+  const probeBinary = (entry) =>
+    child(
+      `const seen = []; process.on('warning', (w) => seen.push(w.code));
+       const p = engine.probe(); engine.probe();
+       await new Promise((r) => setImmediate(r));
+       return { ok: p.ok, version: p.version, binary: p.binary ?? null, warnings: seen };`,
+      { entry }
+    ).value;
+
+  it('probe().binary names the file that was loaded', T, () => {
+    const p = engine.probe();
+    assert.equal(typeof p.binary?.path, 'string');
+    assert.ok(existsSync(p.binary.path), p.binary.path);
+    assert.match(p.binary.path, /\.node$/);
+  });
+
+  it('a platform package of this release is reported with its version, and nothing is said', T, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'moro-engine-same-'));
+    try {
+      const { entry } = install(dir, engine.version);
+      const p = probeBinary(entry);
+      assert.equal(p.ok, true);
+      assert.equal(p.binary.version, engine.version);
+      assert.match(p.binary.path, /@morojs[\\/]engine-[a-z0-9-]+[\\/]moro_engine_/);
+      assert.deepEqual(p.warnings, []);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a platform package of another release is not loaded', T, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'moro-engine-other-'));
+    try {
+      const { entry } = install(dir, '1.1.5');
+      const p = child('const p = engine.probe(); return { ok: p.ok, error: p.error ?? null };', { entry }).value;
+      assert.equal(p.ok, false);
+      assert.match(p.error, /1\.1\.5, not /);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The platform package is absent from the application, and a package of
+  // that name sits where plain module resolution would still find it: above
+  // the application, on NODE_PATH, in the home directory's module folder.
+  it('a platform package outside the installation is not loaded', T, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'moro-engine-outside-'));
+    try {
+      const app = join(dir, 'srv', 'app');
+      const { entry } = install(app, engine.version);
+      const scope = join(app, 'node_modules', '@morojs');
+      const name = readdirSync(scope).find((d) => d !== 'engine');
+      const probeOk = (env) => child('const p = engine.probe(); return { ok: p.ok };', { entry, env }).value.ok;
+      assert.equal(probeOk({}), true, 'installed beside the meta package: loaded');
+
+      for (const [where, env] of [
+        [join(dir, 'node_modules', '@morojs'), {}],
+        [join(dir, 'elsewhere', '@morojs'), { NODE_PATH: join(dir, 'elsewhere') }],
+        [join(dir, 'home', '.node_modules', '@morojs'), { HOME: join(dir, 'home'), USERPROFILE: join(dir, 'home') }],
+      ]) {
+        mkdirSync(where, { recursive: true });
+        cpSync(join(scope, name), join(where, name), { recursive: true });
+      }
+      rmSync(join(scope, name), { recursive: true, force: true });
+      assert.equal(probeOk({}), false, 'a node_modules above the application');
+      assert.equal(probeOk({ NODE_PATH: join(dir, 'elsewhere') }), false, 'NODE_PATH');
+      assert.equal(probeOk({ HOME: join(dir, 'home'), USERPROFILE: join(dir, 'home') }), false, 'the home directory');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('a TLS configuration BoringSSL does not support', { skip }, () => {
   const CCM = 'TLS_AES_128_CCM_SHA256';
   const PRELUDE = `

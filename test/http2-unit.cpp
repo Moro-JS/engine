@@ -13,15 +13,41 @@
 // request can be malformed, the limits that stop a peer from making the
 // server work for nothing, and that none of it depends on how the bytes were
 // split across reads.
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "../src/http2.h"
+
+// The largest single allocation, and how many of 64 KiB or more, since the
+// counters were last cleared (sessionDeclaredLength).
+static size_t gLargestAlloc = 0;
+static size_t gLargeAllocs = 0;
+static size_t gLiveBytes = 0;  // allocated and not freed (sessionReservedBodies)
+void* operator new(size_t n) {
+  if (n > gLargestAlloc) gLargestAlloc = n;
+  if (n >= 65536) ++gLargeAllocs;
+  // The size is kept in front of the block, so that a free can be counted.
+  size_t* p = static_cast<size_t*>(std::malloc(n + 16));
+  if (p == nullptr) std::abort();
+  p[0] = n;
+  gLiveBytes += n;
+  return p + 2;
+}
+void operator delete(void* p) noexcept {
+  if (p == nullptr) return;
+  size_t* q = static_cast<size_t*>(p) - 2;
+  gLiveBytes -= q[0];
+  std::free(q);
+}
+void operator delete(void* p, size_t) noexcept { operator delete(p); }
 
 static int checks = 0;
 static int failures = 0;
@@ -191,6 +217,85 @@ static void hpackUnits() {
     CHECK(HuffmanDecoder::decode(www, sizeof(www), out) && out == "www.example.com");
   }
 
+  // The table-driven decoder against the code read one bit at a time: every
+  // byte value in strings of every short length, and arbitrary bytes, where
+  // both must agree on whether the input decodes and on what to.
+  {
+    auto refDecode = [](const uint8_t* p, size_t n, std::string& out) {
+      out.clear();
+      uint32_t acc = 0;
+      int len = 0;
+      for (size_t i = 0; i < n; i++) {
+        for (int b = 7; b >= 0; b--) {
+          acc = (acc << 1) | ((p[i] >> b) & 1u);
+          len++;
+          for (int sym = 0; sym <= 256; sym++) {
+            if (kHuffman[sym].bits == len && kHuffman[sym].code == acc) {
+              if (sym == 256) return false;
+              out.push_back(static_cast<char>(sym));
+              acc = 0;
+              len = 0;
+              break;
+            }
+          }
+        }
+      }
+      return len < 8 && acc == (1u << len) - 1;
+    };
+    auto encode = [](const std::string& text) {
+      std::string bytes;
+      uint64_t acc = 0;
+      int have = 0;
+      for (const char ch : text) {
+        const auto& code = kHuffman[static_cast<uint8_t>(ch)];
+        acc = (acc << code.bits) | code.code;
+        have += code.bits;
+        while (have >= 8) {
+          bytes.push_back(static_cast<char>((acc >> (have - 8)) & 0xff));
+          have -= 8;
+        }
+      }
+      if (have > 0) bytes.push_back(static_cast<char>(((acc << (8 - have)) | ((1u << (8 - have)) - 1)) & 0xff));
+      return bytes;
+    };
+    uint32_t seed = 0x2545F491u;
+    auto next = [&seed]() {
+      seed = seed * 1664525u + 1013904223u;
+      return static_cast<uint8_t>(seed >> 24);
+    };
+    std::string out, ref;
+    for (int iter = 0; iter < 6000; iter++) {
+      std::string text(next() % 48, '\0');
+      for (char& ch : text) ch = static_cast<char>(iter % 3 == 0 ? next() : 0x20 + next() % 0x5f);
+      const std::string bytes = encode(text);
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(bytes.data());
+      CHECK(HuffmanDecoder::decode(p, bytes.size(), out) && out == text);
+      CHECK(refDecode(p, bytes.size(), ref) && ref == text);
+    }
+    for (int iter = 0; iter < 20000; iter++) {
+      std::string bytes(next() % 24, '\0');
+      for (char& ch : bytes) ch = static_cast<char>(iter % 4 == 0 ? next() | 0xf0 : next());
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(bytes.data());
+      const bool ok = HuffmanDecoder::decode(p, bytes.size(), out);
+      const bool refOk = refDecode(p, bytes.size(), ref);
+      CHECK(ok == refOk);
+      if (ok && refOk) CHECK(out == ref);
+    }
+  }
+
+  // A name one byte away from an indexed one, or one byte longer, is not it.
+  for (uint32_t i = 1; i <= kStaticCount; i++) {
+    const std::string name(kStaticTable[i].name);
+    if (staticNameIndex(name) == 0) continue;
+    CHECK(staticNameIndex(name + "x") == 0);
+    CHECK(staticNameIndex(name.substr(1)) == 0);
+    for (size_t at = 0; at < name.size(); at++) {
+      std::string other = name;
+      other[at] = other[at] == 'q' ? 'z' : 'q';
+      CHECK(staticNameIndex(other) == 0);
+    }
+  }
+
   // Decoder errors: index 0, an index past the tables, a string longer than
   // the block, a size update after a field or above the setting.
   {
@@ -300,6 +405,12 @@ struct Harness {
   // When set, a dispatched stream is kept (hold) with this tag + its id.
   bool hold = false;
   std::vector<Stream*> heldStreams;
+  // When not zero, the host pauses the session at every request once this
+  // many have been dispatched (as a server whose answers are not being read).
+  size_t pauseFrom = 0;
+  // When set, the host ends the response from inside writable(), as a
+  // handler does that is told in place.
+  bool endOnWritable = false;
 
   explicit Harness(Settings s = Settings()) : settings(s) {
     Host host;
@@ -313,9 +424,18 @@ struct Harness {
         h->session->hold(st, &st);
         h->heldStreams.push_back(&st);
       }
+      if (h->pauseFrom != 0 && h->requests.size() >= h->pauseFrom) h->session->pause();
     };
     host.aborted = [](void* u, void* held) { static_cast<Harness*>(u)->aborted.push_back(held); };
-    host.writable = [](void* u, void* held) { static_cast<Harness*>(u)->writable.push_back(held); };
+    host.writable = [](void* u, void* held) {
+      Harness* h = static_cast<Harness*>(u);
+      h->writable.push_back(held);
+      if (h->endOnWritable) {
+        Stream& st = *static_cast<Stream*>(held);
+        h->session->release(st);
+        h->session->sendData(st, "tail", 4, true);
+      }
+    };
     session = new Session(settings, host);
     session->start();
   }
@@ -334,6 +454,13 @@ struct Harness {
   // The client preface and an empty SETTINGS; discards the server's side.
   void open() {
     feed(std::string(kPreface) + frame(kSettings, 0, 0, ""));
+  }
+  // Answer a held request with a status and nothing else.
+  void answer(Stream& st, int status = 200) {
+    std::string block;
+    encodeStatus(block, status);
+    session->release(st);
+    session->sendHeaders(st, block, true);
   }
 };
 
@@ -355,6 +482,27 @@ static uint32_t rstCode(const std::vector<Frame>& frames, uint32_t stream) {
     if (f.type == kRstStream && f.stream == stream && f.payload.size() == 4)
       return readU32(reinterpret_cast<const uint8_t*>(f.payload.data()));
   return 0xffffffff;
+}
+
+// The status of the response the session wrote on `stream` ("" when none).
+static std::string statusOn(const std::vector<Frame>& out, uint32_t stream) {
+  for (const Frame& f : out) {
+    if (f.type != kHeaders || f.stream != stream) continue;
+    HpackDecoder d;
+    Fields got;
+    if (d.decode(reinterpret_cast<const uint8_t*>(f.payload.data()), f.payload.size(),
+                 [&](std::string_view n, std::string_view v) { got.emplace_back(std::string(n), std::string(v)); }) &&
+        !got.empty())
+      return got[0].second;
+  }
+  return std::string();
+}
+
+static std::string times(const std::string& one, int n) {
+  std::string out;
+  out.reserve(one.size() * static_cast<size_t>(n));
+  for (int i = 0; i < n; i++) out += one;
+  return out;
 }
 
 static void sessionBasics() {
@@ -398,7 +546,7 @@ static void sessionBasics() {
     CHECK(h.requests.size() == 1);
     const Seen& r = h.requests[0];
     CHECK(r.id == 1 && r.method == Method::GET && r.path == "/hello/world" && r.query == "a=1&b=two");
-    const Fields want = {{"accept", "*/*"}, {"cookie", "a=1"}, {"cookie", "b=2"}, {"host", "example.test"}};
+    const Fields want = {{"accept", "*/*"}, {"cookie", "a=1; b=2"}, {"host", "example.test"}};
     CHECK(r.headers == want);
     CHECK(h.session->held() == 1 && h.session->streamCount() == 1);
 
@@ -417,13 +565,14 @@ static void sessionBasics() {
     CHECK(!has(out, kRstStream));  // the request was complete: nothing to cancel
   }
 
-  // A POST with a body in two DATA frames; the host header the client sent
-  // wins over :authority; an unknown method keeps its name.
+  // A POST with a body in two DATA frames; :authority wins over the host
+  // header the client sent (RFC 9113 8.3.1), which keeps its place in the
+  // list; an unknown method keeps its name.
   {
     Harness h;
     h.open();
     Fields f = {{":method", "POST"}, {":scheme", "http"}, {":path", "/upload"},
-                {":authority", "ignored"}, {"host", "real.test"}, {"content-length", "11"}};
+                {":authority", "real.test"}, {"host", "ignored"}, {"content-length", "11"}};
     h.feed(frame(kHeaders, kFlagEndHeaders, 1, head(f)));
     CHECK(h.requests.empty());
     h.feed(frame(kData, 0, 1, "hello "));
@@ -432,13 +581,16 @@ static void sessionBasics() {
     CHECK(h.requests.size() == 1 && h.requests[0].body == "hello world");
     CHECK(h.requests[0].method == Method::POST);
     bool sawReal = false, sawIgnored = false;
+    int hosts = 0;
     for (const auto& kv : h.requests[0].headers) {
       if (kv.first == "host" && kv.second == "real.test") sawReal = true;
+      if (kv.first == "host") hosts++;
       if (kv.second == "ignored") sawIgnored = true;
     }
-    CHECK(sawReal && !sawIgnored);
+    CHECK(sawReal && !sawIgnored && hosts == 1);
+    CHECK(h.requests[0].headers.size() == 2 && h.requests[0].headers[0].first == "host");
 
-    Fields p = {{":method", "PROPFIND"}, {":scheme", "http"}, {":path", "/dav"}};
+    Fields p = {{":method", "PROPFIND"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/dav"}};
     h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 3, head(p)));
     CHECK(h.requests.size() == 2 && h.requests[1].method == Method::OTHER &&
           h.requests[1].methodStr == "PROPFIND");
@@ -448,7 +600,7 @@ static void sessionBasics() {
   {
     Harness h;
     h.open();
-    std::string block = head({{":method", "POST"}, {":scheme", "http"}, {":path", "/p"}});
+    std::string block = head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/p"}});
     std::string payload;
     payload.push_back(4);          // pad length
     payload += u32(0);             // stream dependency
@@ -472,7 +624,7 @@ static void sessionBasics() {
     h.open();
     std::vector<Frame> out = h.feed(frame(
         kHeaders, kFlagEndHeaders, 1,
-        head({{":method", "PUT"}, {":scheme", "http"}, {":path", "/x"}, {"expect", "100-continue"}})));
+        head({{":method", "PUT"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/x"}, {"expect", "100-continue"}})));
     CHECK(out.size() == 1 && out[0].type == kHeaders && out[0].flags == kFlagEndHeaders);
     HpackDecoder d;
     Fields got;
@@ -557,6 +709,61 @@ static void sessionFlowControl() {
     CHECK(h.session->streamCount() == 0);
   }
 
+  // SETTINGS_INITIAL_WINDOW_SIZE many times in one frame: the last value
+  // stays, a value on the way that takes a window past 2^31-1 is still an
+  // error, and the streams are not walked once per entry.
+  {
+    Harness h;
+    h.open();
+    h.hold = true;
+    h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1, head(get())));
+    Stream& st = *h.heldStreams[0];
+    std::string block;
+    encodeStatus(block, 200);
+    h.session->sendHeaders(st, block, false);
+    const std::string body(10000, 'z');
+    CHECK(h.session->sendData(st, body.data(), body.size(), false) == 0);  // window 65535 - 10000
+    h.take();
+    std::string s;
+    s += std::string("\x00\x04", 2) + u32(70000);
+    s += std::string("\x00\x04", 2) + u32(0);
+    s += std::string("\x00\x04", 2) + u32(10000);  // 10000 - 10000: nothing may be sent
+    h.feed(frame(kSettings, 0, 0, s));
+    CHECK(h.session->sendData(st, "a", 1, false) == 1);
+    h.take();
+    CHECK(!has(h.feed(frame(kSettings, 0, 0, std::string("\x00\x04", 2) + u32(10001))), kGoaway));
+    h.feed(frame(kWindowUpdate, 0, 1, u32(20000)));  // the stream's window: 20000, initial 10001
+    s = std::string("\x00\x04", 2) + u32(kMaxWindow);  // past 2^31-1 on the way...
+    s += std::string("\x00\x04", 2) + u32(100);        // ...and back
+    CHECK(goawayCode(h.feed(frame(kSettings, 0, 0, s))) == kFlowControlError);
+
+    auto timeSettings = [](int streams) {
+      Settings big;
+      big.maxFrameSize = 1 << 20;
+      Harness t(big);
+      t.open();
+      std::string bytes;
+      for (int i = 0; i < streams; i++)
+        bytes += frame(kHeaders, kFlagEndHeaders, 1 + 2 * i,
+                       head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}}));
+      t.feed(bytes);
+      std::string payload;
+      for (int i = 0; i < (1 << 20) / 6; i++)
+        payload += std::string("\x00\x04", 2) + u32((i & 1) ? 65535 : 100000);
+      bytes.clear();
+      for (int i = 0; i < 20; i++) bytes += frame(kSettings, 0, 0, payload);
+      const auto t0 = std::chrono::steady_clock::now();
+      t.feed(bytes);
+      const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - t0).count();
+      CHECK(!t.session->dead() && t.session->streamCount() == static_cast<size_t>(streams));
+      return static_cast<double>(us);
+    };
+    const double one = timeSettings(1);
+    const double many = timeSettings(256);
+    CHECK(many < one * 8 + 20000);  // walked once per entry, it is ~100 times more
+  }
+
   // The request side: the peer is given its window back as it is used, and
   // exceeding a window is an error.
   {
@@ -566,7 +773,7 @@ static void sessionFlowControl() {
     Harness h(s);
     h.open();
     h.feed(frame(kHeaders, kFlagEndHeaders, 1,
-                 head({{":method", "POST"}, {":scheme", "http"}, {":path", "/big"}})));
+                 head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/big"}})));
     std::vector<Frame> all;
     for (int i = 0; i < 10; i++) {
       std::vector<Frame> out = h.feed(frame(kData, 0, 1, std::string(16384, 'd')));
@@ -585,7 +792,7 @@ static void sessionFlowControl() {
     Harness t(tiny);
     t.open();
     t.feed(frame(kHeaders, kFlagEndHeaders, 1,
-                 head({{":method", "POST"}, {":scheme", "http"}, {":path", "/big"}})));
+                 head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/big"}})));
     std::vector<Frame> out = t.feed(frame(kData, 0, 1, std::string(16384, 'd')));
     CHECK(rstCode(out, 1) == kFlowControlError && !t.session->dead());
 
@@ -597,7 +804,7 @@ static void sessionFlowControl() {
     std::string bytes;
     for (uint32_t id = 1; id <= 9; id += 2) {
       bytes += frame(kHeaders, kFlagEndHeaders, id,
-                     head({{":method", "POST"}, {":scheme", "http"}, {":path", "/big"}}));
+                     head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/big"}}));
       bytes += frame(kData, 0, id, std::string(16384, 'd'));
     }
     c.feed(bytes);
@@ -631,31 +838,31 @@ static void sessionErrors() {
     return rstCode(out, 1);
   };
   // Malformed requests (RFC 9113 8.2, 8.3): each is a stream error.
-  CHECK(streamCode({{":scheme", "http"}, {":path", "/"}}) == kProtocolError);                       // no :method
+  CHECK(streamCode({{":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}}) == kProtocolError);                       // no :method
   CHECK(streamCode({{":method", "GET"}, {":path", "/"}}) == kProtocolError);                        // no :scheme
-  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}}) == kProtocolError);                   // no :path
-  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":path", ""}}) == kProtocolError);    // empty :path
-  CHECK(streamCode({{":method", "GET"}, {":method", "GET"}, {":scheme", "http"}, {":path", "/"}}) == kProtocolError);
-  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {":status", "200"}}) == kProtocolError);
-  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {":unknown", "x"}}) == kProtocolError);
-  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {"accept", "x"}, {":path", "/"}}) == kProtocolError);  // pseudo after regular
-  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {"Accept", "x"}}) == kProtocolError);  // uppercase
-  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {"connection", "close"}}) == kProtocolError);
-  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {"transfer-encoding", "chunked"}}) == kProtocolError);
-  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {"te", "gzip"}}) == kProtocolError);
-  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {"x", "a\r\nb"}}) == kProtocolError);
-  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {"x", " lead"}}) == kProtocolError);
-  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":path", "/a b"}}) == kProtocolError);
-  CHECK(streamCode({{":method", "G ET"}, {":scheme", "http"}, {":path", "/"}}) == kProtocolError);
+  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}}) == kProtocolError);                   // no :path
+  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", ""}}) == kProtocolError);    // empty :path
+  CHECK(streamCode({{":method", "GET"}, {":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}}) == kProtocolError);
+  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {":status", "200"}}) == kProtocolError);
+  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {":unknown", "x"}}) == kProtocolError);
+  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {"accept", "x"}, {":path", "/"}}) == kProtocolError);  // pseudo after regular
+  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {"Accept", "x"}}) == kProtocolError);  // uppercase
+  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {"connection", "close"}}) == kProtocolError);
+  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {"transfer-encoding", "chunked"}}) == kProtocolError);
+  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {"te", "gzip"}}) == kProtocolError);
+  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {"x", "a\r\nb"}}) == kProtocolError);
+  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {"x", " lead"}}) == kProtocolError);
+  CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/a b"}}) == kProtocolError);
+  CHECK(streamCode({{":method", "G ET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}}) == kProtocolError);
   CHECK(streamCode({{":method", "CONNECT"}, {":authority", "x:443"}}) == kProtocolError);
-  CHECK(streamCode({{":method", "POST"}, {":scheme", "http"}, {":path", "/"}, {"content-length", "x"}}) == kProtocolError);
-  CHECK(streamCode({{":method", "POST"}, {":scheme", "http"}, {":path", "/"}, {"content-length", "1"}, {"content-length", "2"}}) == kProtocolError);
+  CHECK(streamCode({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {"content-length", "x"}}) == kProtocolError);
+  CHECK(streamCode({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {"content-length", "1"}, {"content-length", "2"}}) == kProtocolError);
   // te: trailers is the one allowed value.
   {
     Harness h;
     h.open();
     h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1,
-                 head({{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {"te", "trailers"}})));
+                 head({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {"te", "trailers"}})));
     CHECK(h.requests.size() == 1);
   }
   // A body that disagrees with its Content-Length, short or long.
@@ -663,11 +870,11 @@ static void sessionErrors() {
     Harness h;
     h.open();
     h.feed(frame(kHeaders, kFlagEndHeaders, 1,
-                 head({{":method", "POST"}, {":scheme", "http"}, {":path", "/"}, {"content-length", "5"}})));
+                 head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {"content-length", "5"}})));
     CHECK(rstCode(h.feed(frame(kData, kFlagEndStream, 1, "abc")), 1) == kProtocolError);
     CHECK(h.requests.empty());
     h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 3,
-                 head({{":method", "POST"}, {":scheme", "http"}, {":path", "/"}, {"content-length", "5"}})));
+                 head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {"content-length", "5"}})));
     CHECK(h.requests.empty());
   }
 
@@ -811,12 +1018,12 @@ static void sessionLimits() {
     CHECK(statusOf(out, 5) == "414");
 
     out = h.feed(frame(kHeaders, kFlagEndHeaders, 7,
-                       head({{":method", "POST"}, {":scheme", "http"}, {":path", "/"}, {"content-length", "11"}})));
+                       head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {"content-length", "11"}})));
     CHECK(statusOf(out, 7) == "413" && rstCode(out, 7) == kNoError);
     CHECK(h.feed(frame(kData, kFlagEndStream, 7, "hello world")).empty());  // already in flight: read past
 
     out = h.feed(frame(kHeaders, kFlagEndHeaders, 9,
-                       head({{":method", "POST"}, {":scheme", "http"}, {":path", "/"}})));
+                       head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}})));
     CHECK(out.empty());
     out = h.feed(frame(kData, 0, 9, "0123456789A"));
     CHECK(statusOf(out, 9) == "413" && rstCode(out, 9) == kNoError);
@@ -849,6 +1056,29 @@ static void sessionLimits() {
     std::vector<Frame> out = h.feed(bytes);
     CHECK(h.session->dead() && goawayCode(out) == kEnhanceYourCalm);
     CHECK(h.requests.size() < 600);
+
+    // The same when the reset is ours, answering a frame the peer sent on a
+    // stream whose request the host holds: the slot is freed while the
+    // handler works on, so it costs what the peer's RST_STREAM costs.
+    for (int kind = 0; kind < 5; kind++) {
+      Harness held;
+      held.open();
+      held.hold = true;
+      bytes.clear();
+      for (uint32_t id = 1; id < 4001; id += 2) {
+        bytes += frame(kHeaders, kFlagEndHeaders | kFlagEndStream, id, head(get()));
+        switch (kind) {
+          case 0: bytes += frame(kData, 0, id, ""); break;  // DATA after END_STREAM
+          case 1: bytes += frame(kWindowUpdate, 0, id, u32(0)); break;  // an increment of zero
+          case 2: bytes += frame(kWindowUpdate, 0, id, u32(0x7fffffff)); break;  // past 2^31-1
+          case 3: bytes += frame(kPriority, 0, id, u32(id) + std::string(1, 16)); break;  // on itself
+          default: bytes += frame(kHeaders, kFlagEndHeaders | kFlagEndStream, id, ""); break;
+        }
+      }
+      out = held.feed(bytes);
+      CHECK(held.session->dead() && goawayCode(out) == kEnhanceYourCalm);
+      CHECK(held.requests.size() < 600);
+    }
 
     Harness pings;
     pings.open();
@@ -885,7 +1115,7 @@ static void sessionLimits() {
     Harness h;
     h.open();
     h.feed(frame(kHeaders, kFlagEndHeaders, 1,
-                 head({{":method", "POST"}, {":scheme", "http"}, {":path", "/"}})));
+                 head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}})));
     // No request has been dispatched (the body is not complete); a server
     // that sheds the stream resets it.
     CHECK(h.session->streamCount() == 1);
@@ -914,7 +1144,7 @@ static void sessionSplitting() {
   bytes += frame(kHeaders, kFlagEndStream, 1, head(f).substr(0, 7));
   bytes += frame(kContinuation, kFlagEndHeaders, 1, head(f).substr(7));
   bytes += frame(kHeaders, kFlagEndHeaders, 3,
-                 head({{":method", "POST"}, {":scheme", "http"}, {":path", "/body"}}));
+                 head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/body"}}));
   bytes += frame(kData, 0, 3, std::string(3000, 'q'));
   bytes += frame(kPing, 0, 0, "abcdefgh");
   bytes += frame(kData, kFlagEndStream, 3, std::string(5000, 'r'));
@@ -941,6 +1171,1187 @@ static void sessionSplitting() {
     CHECK(run(piece) == whole);
 }
 
+// The budget for frames that cost the peer nothing and the server work: 2000
+// units at once, 200 more a second, RST_STREAM four units and PING, SETTINGS,
+// PRIORITY and an empty DATA frame one. Each at the last unit and one past it.
+static void sessionBudget() {
+  const std::string ping = frame(kPing, 0, 0, "12345678");
+  const std::string okHead = head(get());
+  auto request = [&](uint32_t id) { return frame(kHeaders, kFlagEndHeaders | kFlagEndStream, id, okHead); };
+  // What 2000 units buy of each kind, and that one more ends the connection.
+  struct Kind {
+    const char* name;
+    int afford;
+    std::string (*one)(uint32_t id);
+    std::string setup;
+  };
+  const Kind kinds[] = {
+      {"PING", 2000, [](uint32_t) { return frame(kPing, 0, 0, "12345678"); }, ""},
+      {"SETTINGS", 2000, [](uint32_t) { return frame(kSettings, 0, 0, ""); }, ""},
+      {"PRIORITY", 2000, [](uint32_t) { return frame(kPriority, 0, 3, u32(0) + std::string(1, 'w')); }, ""},
+      {"empty DATA", 2000, [](uint32_t) { return frame(kData, 0, 1, ""); },
+       frame(kHeaders, kFlagEndHeaders, 1, head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}}))},
+      {"padding-only DATA", 2000, [](uint32_t) { return frame(kData, kFlagPadded, 1, std::string("\x02\0\0", 3)); },
+       frame(kHeaders, kFlagEndHeaders, 1, head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}}))},
+      {"RST_STREAM", 500,
+       [](uint32_t id) {
+         return frame(kHeaders, kFlagEndHeaders | kFlagEndStream, id, head(get())) + frame(kRstStream, 0, id, u32(kCancel));
+       },
+       ""},
+  };
+  for (const Kind& k : kinds) {
+    Harness h;
+    h.open();
+    h.feed(k.setup);
+    std::string bytes;
+    for (int i = 0; i < k.afford; i++) bytes += k.one(101 + 2 * static_cast<uint32_t>(i));
+    h.feed(bytes);
+    if (h.session->dead()) std::fprintf(stderr, "budget: %d of %s ended the connection\n", k.afford, k.name);
+    CHECK(!h.session->dead());
+    const std::vector<Frame> out = h.feed(k.one(101 + 2 * static_cast<uint32_t>(k.afford)));
+    if (!h.session->dead()) std::fprintf(stderr, "budget: %d of %s did not end the connection\n", k.afford + 1, k.name);
+    CHECK(h.session->dead() && goawayCode(out) == kEnhanceYourCalm);
+  }
+  // The kinds draw on one budget: 499 resets and four PINGs are all of it.
+  {
+    Harness h;
+    h.open();
+    std::string bytes;
+    for (uint32_t i = 0; i < 499; i++) bytes += request(1 + 2 * i) + frame(kRstStream, 0, 1 + 2 * i, u32(kCancel));
+    h.feed(bytes + times(ping, 4));
+    CHECK(!h.session->dead());
+    CHECK(goawayCode(h.feed(ping)) == kEnhanceYourCalm);
+  }
+  // The refill: nothing in 4 ms, one unit in 5, 200 in a second, and never
+  // more than the burst however long the connection was quiet.
+  {
+    Harness a;
+    a.open();
+    a.feed(times(ping, 2000), 1000);
+    CHECK(goawayCode(a.feed(ping, 1004)) == kEnhanceYourCalm);
+    Harness b;
+    b.open();
+    b.feed(times(ping, 2000), 1000);
+    b.feed(ping, 1005);
+    CHECK(!b.session->dead());
+    CHECK(goawayCode(b.feed(ping, 1005)) == kEnhanceYourCalm);
+    Harness c;
+    c.open();
+    c.feed(times(ping, 2000), 1000);
+    c.feed(times(ping, 200), 2000);
+    CHECK(!c.session->dead());
+    CHECK(goawayCode(c.feed(ping, 2000)) == kEnhanceYourCalm);
+    Harness d;
+    d.open();
+    d.feed(times(ping, 2000), 1000);
+    d.feed(times(ping, 2000), 1000 + 3600 * 1000);
+    CHECK(!d.session->dead());
+    CHECK(goawayCode(d.feed(ping, 1000 + 3600 * 1000)) == kEnhanceYourCalm);
+  }
+
+  // A request the host was given and the peer then makes the server reset -
+  // by any frame that is a stream error on it - costs what resetting it
+  // costs: the host did the work of a request either way.
+  struct Provoke {
+    const char* name;
+    std::string (*one)(uint32_t id);
+    uint32_t code;
+  };
+  const Provoke provokes[] = {
+      {"WINDOW_UPDATE of zero", [](uint32_t id) { return frame(kWindowUpdate, 0, id, u32(0)); }, kProtocolError},
+      {"WINDOW_UPDATE past 2^31-1", [](uint32_t id) { return frame(kWindowUpdate, 0, id, u32(0x7fffffff)); }, kFlowControlError},
+      {"DATA after END_STREAM", [](uint32_t id) { return frame(kData, 0, id, "x"); }, kStreamClosed},
+      {"HEADERS after END_STREAM",
+       [](uint32_t id) { return frame(kHeaders, kFlagEndHeaders | kFlagEndStream, id, head({{"x-trailer", "t"}})); },
+       kStreamClosed},
+      {"PRIORITY of the wrong size", [](uint32_t id) { return frame(kPriority, 0, id, "1234"); }, kFrameSizeError},
+      {"PRIORITY on itself", [](uint32_t id) { return frame(kPriority, 0, id, u32(id) + std::string(1, 'w')); }, kProtocolError},
+  };
+  for (const Provoke& pv : provokes) {
+    Harness h;
+    h.open();
+    h.hold = true;
+    bool wrongCode = false;
+    for (uint32_t i = 0; i < 500; i++) {
+      const uint32_t id = 1 + 2 * i;
+      h.feed(request(id));
+      if (rstCode(h.feed(pv.one(id)), id) != pv.code) wrongCode = true;
+    }
+    CHECK(!wrongCode);
+    CHECK(!h.session->dead() && h.requests.size() == 500 && h.aborted.size() == 500);
+    h.feed(request(1001));
+    const std::vector<Frame> out = h.feed(pv.one(1001));
+    if (!h.session->dead()) std::fprintf(stderr, "budget: 501 requests reset through %s did not end the connection\n", pv.name);
+    CHECK(h.session->dead() && goawayCode(out) == kEnhanceYourCalm);
+  }
+  // A stream error on a stream the host does not have - a malformed request,
+  // a frame of the wrong size for a stream that does not exist - is a frame
+  // answered for free: one unit.
+  {
+    Harness h;
+    h.open();
+    h.feed(times(frame(kPriority, 0, 3, "1234"), 2000));
+    CHECK(!h.session->dead());
+    CHECK(goawayCode(h.feed(frame(kPriority, 0, 3, "1234"))) == kEnhanceYourCalm);
+    Harness m;
+    m.open();
+    Fields bad = get();
+    bad.emplace_back("Upper", "x");
+    std::string bytes;
+    for (uint32_t i = 0; i < 2000; i++) bytes += frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1 + 2 * i, head(bad));
+    m.feed(bytes);
+    CHECK(!m.session->dead() && m.requests.empty());
+    CHECK(goawayCode(m.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 4001, head(bad)))) == kEnhanceYourCalm);
+  }
+  // Empty DATA frames on streams that are closed are each answered with a
+  // reset; they draw on the budget like those on an open stream.
+  {
+    Harness h;
+    h.open();
+    h.hold = true;
+    std::string bytes;
+    for (uint32_t i = 0; i < 40; i++) bytes += request(1 + 2 * i);
+    h.feed(bytes);
+    for (Stream* st : h.heldStreams) h.answer(*st);
+    h.take();
+    CHECK(h.session->streamCount() == 0);
+    bytes.clear();
+    for (uint32_t i = 0; i < 2000; i++) bytes += frame(kData, 0, 1 + 2 * (i % 40), "");
+    h.feed(bytes);
+    CHECK(!h.session->dead());
+    CHECK(goawayCode(h.feed(frame(kData, 0, 1, ""))) == kEnhanceYourCalm);
+  }
+}
+
+// The other bounds a connection has, each at the bound and one past it.
+static void sessionBounds() {
+  const std::string okHead = head(get());
+  auto request = [&](uint32_t id) { return frame(kHeaders, kFlagEndHeaders | kFlagEndStream, id, okHead); };
+
+  // maxConcurrentStreams at its default: 256 at once, the 257th refused, and
+  // room again as soon as one is answered.
+  {
+    Harness h;
+    h.open();
+    h.hold = true;
+    std::string bytes;
+    for (uint32_t i = 0; i < 256; i++) bytes += request(1 + 2 * i);
+    std::vector<Frame> out = h.feed(bytes);
+    CHECK(h.requests.size() == 256 && !has(out, kRstStream) && h.session->streamCount() == 256);
+    out = h.feed(request(513));
+    CHECK(rstCode(out, 513) == kRefusedStream && h.requests.size() == 256 && !h.session->dead());
+    h.answer(*h.heldStreams[0]);
+    h.take();
+    out = h.feed(request(515));
+    CHECK(!has(out, kRstStream) && h.requests.size() == 257);
+  }
+
+  // A header block in CONTINUATION frames: 64 of them, empty ones included.
+  {
+    auto continued = [&](int frames) {
+      std::string bytes = frame(kHeaders, kFlagEndStream, 1, "");
+      for (int i = 0; i < frames - 1; i++) bytes += frame(kContinuation, 0, 1, "");
+      return bytes + frame(kContinuation, kFlagEndHeaders, 1, okHead);
+    };
+    Harness h;
+    h.open();
+    h.feed(continued(64));
+    CHECK(!h.session->dead() && h.requests.size() == 1);
+    Harness over;
+    over.open();
+    CHECK(goawayCode(over.feed(continued(65))) == kEnhanceYourCalm && over.requests.empty());
+  }
+  // ...and in bytes: maxHeaderListSize + 4096, in one frame or in several.
+  // (The filler is table size updates, which a block may open with and which
+  // add nothing to the header list.)
+  {
+    Settings s;
+    s.maxHeaderListSize = 1024;
+    const size_t limit = 1024 + 4096;
+    auto block = [&](size_t size) { return std::string(size - okHead.size(), '\x20') + okHead; };
+    Harness one(s);
+    one.open();
+    one.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1, block(limit)));
+    CHECK(!one.session->dead() && one.requests.size() == 1);
+    Harness oneOver(s);
+    oneOver.open();
+    CHECK(goawayCode(oneOver.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1, block(limit + 1)))) == kEnhanceYourCalm);
+    Harness cut(s);
+    cut.open();
+    cut.feed(frame(kHeaders, kFlagEndStream, 1, block(limit).substr(0, 3000)) +
+             frame(kContinuation, kFlagEndHeaders, 1, block(limit).substr(3000)));
+    CHECK(!cut.session->dead() && cut.requests.size() == 1);
+    Harness cutOver(s);
+    cutOver.open();
+    CHECK(goawayCode(cutOver.feed(frame(kHeaders, kFlagEndStream, 1, block(limit + 1).substr(0, 3000)) +
+                                  frame(kContinuation, kFlagEndHeaders, 1, block(limit + 1).substr(3000)))) ==
+          kEnhanceYourCalm);
+  }
+
+  // The HPACK table: a size update to the advertised 4096 and to one more.
+  {
+    Harness h;
+    h.open();
+    h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1, std::string("\x3f\xe1\x1f", 3) + okHead));
+    CHECK(!h.session->dead() && h.requests.size() == 1);
+    Harness over;
+    over.open();
+    CHECK(goawayCode(over.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1,
+                                     std::string("\x3f\xe2\x1f", 3) + okHead))) == kCompressionError);
+  }
+  // ...its content never larger than that, an entry of exactly the table's
+  // size kept and one a byte larger emptying it.
+  {
+    auto indexed = [](const std::string& name, const std::string& value) {
+      std::string b(1, '\x40');
+      encodeInt(b, 7, 0, static_cast<uint32_t>(name.size()));
+      b += name;
+      encodeInt(b, 7, 0, static_cast<uint32_t>(value.size()));
+      return b + value;
+    };
+    HpackDecoder d;
+    Fields got;
+    bool within = true;
+    for (int i = 0; i < 300; i++) {
+      if (!decodeAll(d, indexed("k", std::string(97, static_cast<char>('a' + i % 26))), got)) within = false;
+      if (d.tableSize() > 4096) within = false;
+    }
+    CHECK(within && d.tableEntries() == 31 && d.tableSize() == 31 * 130);
+    CHECK(decodeAll(d, indexed("a", std::string(4096 - 33, 'v')), got));
+    CHECK(d.tableEntries() == 1 && d.tableSize() == 4096);
+    CHECK(decodeAll(d, indexed("a", std::string(4096 - 32, 'v')), got));
+    CHECK(d.tableEntries() == 0 && d.tableSize() == 0);
+  }
+  // HPACK integers: 2^30 is the largest, in at most five continuation bytes,
+  // and the fifth cannot carry the value past 32 bits unnoticed.
+  {
+    auto decodes = [](std::initializer_list<uint8_t> bytes, uint32_t& v) {
+      const std::vector<uint8_t> b(bytes);
+      const uint8_t* p = b.data();
+      return decodeInt(p, b.data() + b.size(), 5, v);
+    };
+    uint32_t v = 0;
+    std::string e;
+    encodeInt(e, 5, 0, 1u << 30);
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(e.data());
+    CHECK(e.size() == 6 && decodeInt(p, p + e.size(), 5, v) && v == (1u << 30));
+    CHECK(!decodes({0x1f, 0xe2, 0xff, 0xff, 0xff, 0x03}, v));        // 2^30 + 1
+    CHECK(decodes({0x1f, 0x80, 0x80, 0x80, 0x80, 0x00}, v) && v == 31);  // five bytes, padded with zeros
+    CHECK(!decodes({0x1f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00}, v));  // six
+    CHECK(!decodes({0x1f, 0x80, 0x80, 0x80, 0x80, 0x10}, v));        // 31 + 2^32: not 31
+    CHECK(!decodes({0x1f, 0x80, 0x80, 0x80, 0x80, 0x7f}, v));
+  }
+
+  // The header list: exactly maxHeaderListSize (name + value + 32 a field,
+  // pseudo-headers included) is a request, a byte more is a 431.
+  {
+    Settings s;
+    s.maxHeaderListSize = 300;
+    Fields f = get();  // 178 by that count
+    f.emplace_back("x-pad", std::string(300 - 178 - 37, 'p'));
+    Harness h(s);
+    h.open();
+    std::vector<Frame> out = h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1, head(f)));
+    CHECK(h.requests.size() == 1 && statusOn(out, 1).empty());
+    f.back().second.push_back('p');
+    out = h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 3, head(f)));
+    CHECK(h.requests.size() == 1 && statusOn(out, 3) == "431" && !h.session->dead());
+
+    // A block that went over the limit was still decoded to its end: an
+    // entry it added to the table after that point is there for the next.
+    std::string block = head(get());
+    block += head({{"x-big", std::string(400, 'b')}});
+    block += std::string("\x40\x03" "x-a" "\x01" "1", 7);
+    out = h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 5, block));
+    CHECK(statusOn(out, 5) == "431");
+    out = h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 7, head(get()) + std::string("\xbe", 1)));
+    CHECK(h.requests.size() == 2 && !h.session->dead());
+    CHECK(h.requests.back().headers.size() == 2 && h.requests.back().headers[0] == std::make_pair(std::string("x-a"), std::string("1")));
+  }
+  // maxHeaders: that many fields are a request, one more is a 431.
+  {
+    Settings s;
+    s.maxHeaders = 5;
+    Harness h(s);
+    h.open();
+    Fields f = get();
+    for (int i = 0; i < 5; i++) f.emplace_back("x" + std::to_string(i), "v");
+    std::vector<Frame> out = h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1, head(f)));
+    CHECK(h.requests.size() == 1 && statusOn(out, 1).empty());
+    f.emplace_back("x5", "v");
+    out = h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 3, head(f)));
+    CHECK(h.requests.size() == 1 && statusOn(out, 3) == "431");
+  }
+
+  // maxBodySize: a body of exactly that size, declared or not, and one byte
+  // more.
+  {
+    Settings s;
+    s.maxBodySize = 10;
+    Harness h(s);
+    h.open();
+    auto post = [](uint32_t id, const char* declared) {
+      Fields f = {{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}};
+      if (declared) f.emplace_back("content-length", declared);
+      return frame(kHeaders, kFlagEndHeaders, id, head(f));
+    };
+    h.feed(post(1, nullptr) + frame(kData, kFlagEndStream, 1, "0123456789"));
+    CHECK(h.requests.size() == 1 && h.requests[0].body == "0123456789");
+    h.feed(post(3, "10") + frame(kData, 0, 3, "01234") + frame(kData, kFlagEndStream, 3, "56789"));
+    CHECK(h.requests.size() == 2 && h.requests[1].body == "0123456789");
+    std::vector<Frame> out = h.feed(post(5, "11"));
+    CHECK(statusOn(out, 5) == "413");
+    out = h.feed(post(7, nullptr) + frame(kData, 0, 7, "0123456789") + frame(kData, kFlagEndStream, 7, "A"));
+    CHECK(statusOn(out, 7) == "413" && h.requests.size() == 2 && !h.session->dead());
+  }
+
+  // Flow control: a window raised to exactly 2^31-1 and one past it, on the
+  // connection, on a stream, and through SETTINGS_INITIAL_WINDOW_SIZE.
+  {
+    Harness h;
+    h.open();
+    h.hold = true;
+    h.feed(request(1));
+    CHECK(h.feed(frame(kWindowUpdate, 0, 0, u32(0x7fffffff - 65535))).empty() && !h.session->dead());
+    std::vector<Frame> out = h.feed(frame(kWindowUpdate, 0, 1, u32(0x7fffffff - 65535)));
+    CHECK(out.empty() && h.aborted.empty());
+    out = h.feed(frame(kWindowUpdate, 0, 1, u32(1)));
+    CHECK(rstCode(out, 1) == kFlowControlError && h.aborted.size() == 1 && !h.session->dead());
+    CHECK(goawayCode(h.feed(frame(kWindowUpdate, 0, 0, u32(1)))) == kFlowControlError);
+
+    Harness viaSettings;
+    viaSettings.open();
+    viaSettings.hold = true;
+    viaSettings.feed(request(1));
+    viaSettings.feed(frame(kWindowUpdate, 0, 1, u32(0x7fffffff - 65535)));
+    CHECK(!viaSettings.session->dead());
+    CHECK(goawayCode(viaSettings.feed(frame(kSettings, 0, 0, std::string("\x00\x04", 2) + u32(65536)))) == kFlowControlError);
+    Harness largest;
+    largest.open();
+    largest.feed(frame(kSettings, 0, 0, std::string("\x00\x04", 2) + u32(0x7fffffff)));
+    CHECK(!largest.session->dead());
+  }
+  // ...and a peer that sends exactly the window it was given, and one byte more.
+  {
+    Settings s;
+    s.initialWindowSize = 10000;
+    s.connectionWindow = 65535;
+    const std::string post = frame(kHeaders, kFlagEndHeaders, 1, head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}}));
+    Harness h(s);
+    h.open();
+    std::vector<Frame> out = h.feed(post + frame(kData, kFlagEndStream, 1, std::string(10000, 'd')));
+    CHECK(!has(out, kRstStream) && h.requests.size() == 1);
+    Harness over(s);
+    over.open();
+    out = over.feed(post + frame(kData, kFlagEndStream, 1, std::string(10001, 'd')));
+    CHECK(rstCode(out, 1) == kFlowControlError && over.requests.empty() && !over.session->dead());
+
+    Settings c;
+    c.maxFrameSize = 65536;
+    c.initialWindowSize = 1 << 20;
+    c.connectionWindow = 65535;
+    Harness conn(c);
+    conn.open();
+    conn.feed(post + frame(kData, kFlagEndStream, 1, std::string(65535, 'd')));
+    CHECK(!conn.session->dead() && conn.requests.size() == 1);
+    Harness connOver(c);
+    connOver.open();
+    CHECK(goawayCode(connOver.feed(post + frame(kData, kFlagEndStream, 1, std::string(65536, 'd')))) == kFlowControlError);
+  }
+}
+
+// A client that keeps to flow control, uploading on several streams at once:
+// it sends what the windows it was given allow, a frame per stream in turn.
+struct Uploader {
+  Harness& h;
+  struct Up {
+    uint32_t id;
+    size_t left;
+    int64_t window;
+    bool over = false;
+    size_t sent = 0;
+  };
+  std::vector<Up> ups;
+  int64_t connWindow = 65535;
+  size_t peakBuffered = 0;
+  std::vector<uint32_t> refused;
+
+  Uploader(Harness& harness, int streams, size_t each, uint32_t streamWindow) : h(harness) {
+    for (int i = 0; i < streams; i++) {
+      const uint32_t id = 1 + 2 * static_cast<uint32_t>(i);
+      ups.push_back(Up{id, each, streamWindow});
+      take(h.feed(frame(kHeaders, kFlagEndHeaders, id, head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/up"}}))));
+    }
+  }
+  void take(const std::vector<Frame>& out) {
+    for (const Frame& f : out) {
+      if (f.type == kWindowUpdate) {
+        const uint32_t inc = readU32(reinterpret_cast<const uint8_t*>(f.payload.data()));
+        if (f.stream == 0) connWindow += inc;
+        for (Up& u : ups)
+          if (u.id == f.stream) u.window += inc;
+      } else if (f.type == kRstStream) {
+        for (Up& u : ups)
+          if (u.id == f.stream && !u.over) {
+            u.over = true;
+            if (readU32(reinterpret_cast<const uint8_t*>(f.payload.data())) == kRefusedStream) refused.push_back(u.id);
+          }
+      }
+    }
+  }
+  // One frame on every stream that can send; false when none could.
+  bool round() {
+    bool any = false;
+    for (Up& u : ups) {
+      if (u.over) continue;
+      const size_t n = static_cast<size_t>(std::min<int64_t>({16384, connWindow, u.window, static_cast<int64_t>(u.left)}));
+      if (n == 0) continue;
+      any = true;
+      u.left -= n;
+      u.sent += n;
+      u.window -= static_cast<int64_t>(n);
+      connWindow -= static_cast<int64_t>(n);
+      size_t buffered = 0;
+      for (const Up& b : ups)
+        if (!b.over) buffered += b.sent;
+      peakBuffered = std::max(peakBuffered, buffered);
+      if (u.left == 0) u.over = true;
+      take(h.feed(frame(kData, u.left == 0 ? kFlagEndStream : 0, u.id, std::string(n, 'u'))));
+    }
+    return any;
+  }
+  bool allOver() const {
+    for (const Up& u : ups)
+      if (!u.over) return false;
+    return true;
+  }
+};
+
+// Request bodies buffered before dispatch: bounded per connection, and a
+// connection at the bound is never left with requests that cannot complete.
+static void sessionBuffering() {
+  Settings s;
+  s.maxBodySize = 100000;
+  s.initialWindowSize = 65535;
+  s.connectionWindow = 65535;
+  const size_t bound = 4 * 65535;  // the larger of 2 x maxBodySize and four connection windows
+  // Four uploads of maxBodySize, arriving evenly, are more than the bound
+  // and a window on top of it. The session never holds more than that; each
+  // time the window is spent with no request able to complete, the newest is
+  // refused and the others go on. The bound holds two of these bodies and
+  // part of a third, so two complete - where, with nothing refused, none
+  // ever would.
+  {
+    Harness h(s);
+    h.open();
+    Uploader up(h, 4, 100000, 65535);
+    while (up.round()) {
+    }
+    CHECK(up.peakBuffered > bound && up.peakBuffered <= bound + 65535);
+    CHECK(up.allOver());
+    CHECK(h.requests.size() == 2 && up.refused == (std::vector<uint32_t>{7, 5}));
+    for (const Seen& r : h.requests) CHECK(r.body.size() == 100000);
+    CHECK(!h.session->dead() && h.session->streamCount() == 2);
+  }
+  // Three, the last of them shorter: one is refused and two complete, the
+  // short one among them.
+  {
+    Harness h(s);
+    h.open();
+    Uploader up(h, 3, 100000, 65535);
+    up.ups[2].left = 90000;
+    while (up.round()) {
+    }
+    CHECK(up.allOver() && h.requests.size() == 3 && up.refused.empty());
+  }
+  // Under the bound nothing is refused: two uploads of maxBodySize.
+  {
+    Harness h(s);
+    h.open();
+    Uploader up(h, 2, 100000, 65535);
+    while (up.round()) {
+    }
+    CHECK(up.allOver() && up.refused.empty() && h.requests.size() == 2);
+  }
+  // Over the bound with window left, the connection's window stays shut -
+  // and reopens when a stream that was buffered goes away: reset by the
+  // peer, or refused for its size.
+  for (const bool byReset : {true, false}) {
+    Settings t = s;
+    t.maxBodySize = 90000;  // the bound is still four windows
+    Harness h(t);
+    h.open();
+    Uploader up(h, 4, 90000, 65535);
+    for (int i = 0; i < 4; i++) up.round();  // 4 x 65536: four bytes past the bound
+    CHECK(up.connWindow == 65535 - 32768);   // half a window used and not given back
+    std::vector<Frame> out;
+    if (byReset) {
+      out = h.feed(frame(kRstStream, 0, 7, u32(kCancel)));
+    } else {
+      out = h.feed(frame(kData, 0, 7, std::string(16384, 'u')) + frame(kData, 0, 7, std::string(8081, 'u')));  // 90001
+      CHECK(statusOn(out, 7) == "413");
+    }
+    CHECK(has(out, kWindowUpdate, 0));
+    CHECK(!h.session->dead());
+  }
+}
+
+// What the HTTP/1 parser refuses in a request, a request over HTTP/2 is
+// refused for as well: a handler sees the same bytes ruled out on both.
+static void sessionHttp1Parity() {
+  auto verdict = [](const Fields& extra, Fields base = get()) {
+    Harness h;
+    h.open();
+    for (const auto& f : extra) base.push_back(f);
+    const std::vector<Frame> out = h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1, head(base)));
+    CHECK(!h.session->dead());
+    if (rstCode(out, 1) == kProtocolError && h.requests.empty()) return 'R';  // refused
+    return h.requests.size() == 1 ? 'D' : '?';                                // delivered
+  };
+  // Control bytes in a field value (RFC 9110 5.5): all but HTAB, and DEL.
+  for (int c = 0; c < 0x20; c++) {
+    if (c == '\t') continue;
+    std::string v = "a";
+    v.push_back(static_cast<char>(c));
+    v += "b";
+    CHECK(verdict({{"x-v", v}}) == 'R');
+  }
+  CHECK(verdict({{"x-v", std::string("a\x7f" "b")}}) == 'R');
+  CHECK(verdict({{"x-v", "a\tb c"}}) == 'D');
+  CHECK(verdict({{"x-v", "caf\xc3\xa9"}}) == 'D');  // obs-text stays
+  // ...and in the target.
+  CHECK(verdict({}, {{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", std::string("/a\x01" "b")}}) == 'R');
+  CHECK(verdict({}, {{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", std::string("/a\x7f")}}) == 'R');
+  CHECK(verdict({}, {{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/caf\xc3\xa9?q=\xff"}}) == 'D');
+
+  // Host (RFC 9112 3.2, RFC 9110 7.2): one, of the shape host[:port] -
+  // whether it arrives as Host or as :authority, which is delivered as Host.
+  const Fields noAuthority = {{":method", "GET"}, {":scheme", "http"}, {":path", "/"}};
+  for (const char* host : {"example.test", "example.test:8443", "[::1]:80", "EXAMPLE.test.", "10.0.0.1"}) {
+    CHECK(verdict({{"host", host}}, noAuthority) == 'D');
+    CHECK(verdict({{":authority", host}}, {{":method", "GET"}, {":scheme", "http"}, {":path", "/"}}) == 'D');
+  }
+  for (const char* host : {"a b", "evil.test/path", "user@evil.test", "a.test:80:90", "a.test, b.test", "a.test?x", "a.test#x",
+                           "a\\b", "[::1", "caf\xc3\xa9.test", "a.test:8o"}) {
+    CHECK(verdict({{"host", host}}, noAuthority) == 'R');
+    CHECK(verdict({{":authority", host}}, {{":method", "GET"}, {":scheme", "http"}, {":path", "/"}}) == 'R');
+  }
+  CHECK(verdict({{"host", "a.test"}, {"host", "a.test"}}, noAuthority) == 'R');
+  CHECK(verdict({{"host", "a.test"}, {"host", "b.test"}}, noAuthority) == 'R');
+  CHECK(verdict({}, {{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {":authority", "a.test"}, {":authority", "b.test"}}) == 'R');
+  CHECK(verdict({}, {{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {":authority", "a.test"}, {":authority", "a.test"}}) == 'R');
+
+  // Content-Length: digits only, one value, and the body that long.
+  const Fields post = {{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}};
+  for (const char* cl : {"", "+1", "-1", "1,1", "1, 1", "0x1", " 1", "1 1", "1e1", "99999999999999999999"})
+    CHECK(verdict({{"content-length", cl}}, post) == 'R');
+  CHECK(verdict({{"content-length", "0"}}, post) == 'D');
+  CHECK(verdict({{"content-length", "0"}, {"content-length", "0"}}, post) == 'D');  // repeated, the same: one value
+  CHECK(verdict({{"content-length", "0"}, {"content-length", "00"}}, post) == 'D');
+  CHECK(verdict({{"content-length", "1"}}, post) == 'R');  // END_STREAM with no byte of it
+}
+
+// The host stops the session part-way through its input and lets it go on
+// later: the same requests in the same order, whatever arrived in between.
+static void sessionPausing() {
+  const std::string okHead = head(get());
+  std::string bytes;
+  for (uint32_t i = 0; i < 50; i++) bytes += frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1 + 2 * i, head(get("/p" + std::to_string(i))));
+  {
+    Harness h;
+    h.open();
+    h.pauseFrom = 3;
+    h.feed(bytes.substr(0, 700));  // some whole frames and a part of one
+    CHECK(h.requests.size() == 3 && h.session->paused());
+    const size_t heldAfterThree = h.session->inputHeld();
+    CHECK(heldAfterThree > 0 && heldAfterThree < 700);
+    h.feed(bytes.substr(700));     // kept, not acted on
+    CHECK(h.requests.size() == 3);
+    CHECK(h.session->inputHeld() == heldAfterThree + (bytes.size() - 700));
+    // Resumed, it stops again at each request while the host says so.
+    for (size_t want = 4; want <= 50; want++) {
+      h.session->resume();
+      h.feed("");
+      CHECK(h.requests.size() == want);
+    }
+    h.session->resume();
+    h.feed("");
+    CHECK(!h.session->paused() && h.session->inputHeld() == 0 && !h.session->dead());
+    bool inOrder = h.requests.size() == 50;
+    for (size_t i = 0; inOrder && i < 50; i++) inOrder = h.requests[i].path == "/p" + std::to_string(i);
+    CHECK(inOrder);
+  }
+  // Paused before anything arrived, a byte at a time: nothing is acted on
+  // until it resumes, and then everything is.
+  {
+    Harness h;
+    h.session->pause();
+    const std::string all = std::string(kPreface) + frame(kSettings, 0, 0, "") + bytes + frame(kPing, 0, 0, "12345678");
+    for (const char ch : all) h.session->feed(&ch, 1, 1000);
+    CHECK(h.requests.empty() && h.session->inputHeld() == all.size() - kPreface.size());
+    h.take();
+    h.session->resume();
+    const std::vector<Frame> out = h.feed("");
+    CHECK(h.requests.size() == 50 && has(out, kPing) && h.session->inputHeld() == 0);
+  }
+  // A connection error while paused input is being gone through ends it there.
+  {
+    Harness h;
+    h.open();
+    h.pauseFrom = 1;
+    const std::string two = frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1, okHead) +
+                            frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 3, okHead);
+    h.feed(two + frame(kData, 0, 0, "x") + frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 5, okHead));
+    CHECK(h.requests.size() == 1 && !h.session->dead());
+    h.pauseFrom = 0;
+    h.session->resume();
+    const std::vector<Frame> out = h.feed("");
+    CHECK(h.requests.size() == 2 && h.session->dead() && goawayCode(out) == kProtocolError && h.session->inputHeld() == 0);
+  }
+}
+
+// A DATA frame's payload goes to its request as it arrives: the session does
+// not hold a frame back until it is whole, and whatever it does with a byte
+// stream of request bodies - bodies delivered, refused, read past, flow
+// control given back, errors - it does the same however the stream is cut.
+static void sessionDataInPieces() {
+  // Half of a frame's payload has arrived: it is in the request already and
+  // nothing of it waits in the session's input.
+  {
+    Harness h;
+    h.open();
+    h.feed(frame(kHeaders, kFlagEndHeaders, 1, head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/up"}})));
+    const std::string data = frame(kData, kFlagEndStream, 1, std::string(16384, 'd'));
+    h.feed(data.substr(0, 9 + 8000));
+    CHECK(h.session->inputHeld() == 0);
+    CHECK(h.requests.empty());
+    h.feed(data.substr(9 + 8000, 5));
+    h.feed(data.substr(9 + 8005, 0));
+    CHECK(h.session->inputHeld() == 0);
+    h.feed(data.substr(9 + 8005));
+    CHECK(h.requests.size() == 1 && h.requests[0].body == std::string(16384, 'd'));
+    CHECK(h.session->inputHeld() == 0 && !h.session->dead());
+  }
+  // A frame header cut in two is the only part that waits; a padded frame
+  // waits whole (its padding is not payload).
+  {
+    Harness h;
+    h.open();
+    h.feed(frame(kHeaders, kFlagEndHeaders, 1, head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/up"}})));
+    const std::string data = frame(kData, 0, 1, std::string(1000, 'a'));
+    h.feed(data.substr(0, 4));
+    CHECK(h.session->inputHeld() == 4);
+    h.feed(data.substr(4, 300));
+    CHECK(h.session->inputHeld() == 0);
+    h.feed(data.substr(304));
+    const std::string padded = frame(kData, kFlagPadded | kFlagEndStream, 1, std::string(1, '\x05') + std::string(500, 'b') + std::string(5, '\0'));
+    h.feed(padded.substr(0, 200));
+    CHECK(h.session->inputHeld() == 200);
+    h.feed(padded.substr(200));
+    CHECK(h.requests.size() == 1 && h.requests[0].body == std::string(1000, 'a') + std::string(500, 'b'));
+    CHECK(h.session->inputHeld() == 0);
+  }
+
+  // One stream of everything a body can meet, cut every way.
+  Settings s;
+  s.maxBodySize = 40000;
+  s.initialWindowSize = 65535;
+  const Fields post = {{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/up"}};
+  auto body = [](size_t n, char seed) {
+    std::string b(n, '\0');
+    for (size_t i = 0; i < n; i++) b[i] = static_cast<char>(seed + i % 61);
+    return b;
+  };
+  std::string bytes = std::string(kPreface) + frame(kSettings, 0, 0, "");
+  // 1: three frames, one of them padded, another stream's frames in between.
+  bytes += frame(kHeaders, kFlagEndHeaders, 1, head(post));
+  bytes += frame(kHeaders, kFlagEndHeaders, 3, head(post));
+  bytes += frame(kData, 0, 1, body(9000, 'a'));
+  bytes += frame(kData, 0, 3, body(16384, 'k'));
+  bytes += frame(kData, kFlagPadded, 1, std::string(1, '\x07') + body(3000, 'b') + std::string(7, '\0'));
+  bytes += frame(kPing, 0, 0, "abcdefgh");
+  bytes += frame(kData, 0, 1, "");
+  bytes += frame(kData, kFlagEndStream, 1, body(5000, 'c'));
+  // 3: ends with trailers.
+  bytes += frame(kData, 0, 3, body(100, 'l'));
+  bytes += frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 3, head({{"x-trailer", "1"}}));
+  // 5: over the body limit part-way: refused, and what follows is read past.
+  bytes += frame(kHeaders, kFlagEndHeaders, 5, head(post));
+  bytes += frame(kData, 0, 5, body(16384, 'm'));
+  bytes += frame(kData, 0, 5, body(16384, 'n'));
+  bytes += frame(kData, 0, 5, body(16384, 'o'));
+  bytes += frame(kData, kFlagEndStream, 5, body(16384, 'p'));
+  // 7: a declared length the body does not match.
+  Fields declared = post;
+  declared.emplace_back("content-length", "20000");
+  bytes += frame(kHeaders, kFlagEndHeaders, 7, head(declared));
+  bytes += frame(kData, kFlagEndStream, 7, body(12000, 'q'));
+  // 9: declared and matching, in frames of unequal size.
+  bytes += frame(kHeaders, kFlagEndHeaders, 9, head(declared));
+  bytes += frame(kData, 0, 9, body(1, 'r'));
+  bytes += frame(kData, 0, 9, body(16384, 's'));
+  bytes += frame(kData, kFlagEndStream, 9, body(3615, 't'));
+  // DATA on a stream that is over, and on one the peer reset.
+  bytes += frame(kData, 0, 1, body(2000, 'u'));
+  bytes += frame(kHeaders, kFlagEndHeaders, 11, head(post));
+  bytes += frame(kData, 0, 11, body(4000, 'v'));
+  bytes += frame(kRstStream, 0, 11, u32(kCancel));
+  bytes += frame(kData, kFlagEndStream, 11, body(4000, 'w'));
+  bytes += frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 13, head(get("/after")));
+
+  auto run = [&](size_t piece, size_t pauseFrom) {
+    Harness h(s);
+    h.pauseFrom = pauseFrom;
+    std::string out;
+    size_t maxHeld = 0;
+    for (size_t off = 0; off < bytes.size(); off += piece) {
+      const size_t n = std::min(piece, bytes.size() - off);
+      h.session->feed(bytes.data() + off, n, 1000);
+      if (pauseFrom == 0) maxHeld = std::max(maxHeld, h.session->inputHeld());
+      // A host that stopped the session lets it go on before the next read.
+      while (h.session->paused()) {
+        h.session->resume();
+        h.session->feed("", 0, 1000);
+      }
+      out += h.session->out();
+      h.session->out().clear();
+    }
+    std::string summary = out;
+    for (const Seen& r : h.requests) summary += "|" + std::to_string(r.id) + r.path + "#" + r.body;
+    CHECK(!h.session->dead());
+    CHECK(h.requests.size() == 4);
+    // Never more waiting than a frame that has to be whole: here the padded
+    // one (3,017 bytes), far below a DATA frame of 16 KiB.
+    if (pauseFrom == 0) CHECK(maxHeld < 3100);
+    return summary;
+  };
+  const std::string whole = run(bytes.size(), 0);
+  {
+    Harness h(s);
+    h.feed(bytes);
+    CHECK(h.requests.size() == 4);
+    if (h.requests.size() == 4) {
+      CHECK(h.requests[0].id == 1 && h.requests[0].body == body(9000, 'a') + body(3000, 'b') + body(5000, 'c'));
+      CHECK(h.requests[1].id == 3 && h.requests[1].body == body(16384, 'k') + body(100, 'l'));
+      CHECK(h.requests[2].id == 9 && h.requests[2].body == body(1, 'r') + body(16384, 's') + body(3615, 't'));
+      CHECK(h.requests[3].id == 13 && h.requests[3].body.empty());
+    }
+  }
+  for (size_t piece : {size_t(1), size_t(2), size_t(3), size_t(5), size_t(8), size_t(9), size_t(10), size_t(13),
+                       size_t(100), size_t(1000), size_t(4096), size_t(16384), size_t(16393), size_t(16394), size_t(40000)}) {
+    CHECK(run(piece, 0) == whole);
+    CHECK(run(piece, 1) == whole);  // ...and when the host stops the session at every request
+  }
+
+  // A connection error found in a frame's header is raised when the header
+  // arrives, with the same code as when the frame arrives whole.
+  for (const size_t cut : {size_t(9), size_t(10), size_t(5000)}) {
+    Harness h;
+    h.open();
+    const std::string onIdle = frame(kData, 0, 5, std::string(6000, 'x'));
+    const std::vector<Frame> out = h.feed(onIdle.substr(0, cut));
+    CHECK(h.session->dead() && goawayCode(out) == kProtocolError);
+  }
+  {
+    Settings small;
+    small.initialWindowSize = 1000;
+    Harness h(small);
+    h.open();
+    h.feed(frame(kHeaders, kFlagEndHeaders, 1, head(post)));
+    const std::string over = frame(kData, 0, 1, std::string(1001, 'x'));
+    const std::vector<Frame> out = h.feed(over.substr(0, 20));
+    CHECK(rstCode(out, 1) == kFlowControlError && !h.session->dead());
+    h.feed(over.substr(20));  // read past
+    const std::vector<Frame> next = h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 3, head(get())));
+    CHECK(h.requests.size() == 1 && h.requests[0].id == 3 && !h.session->dead());
+  }
+}
+
+// A request's declared Content-Length is not room set aside when its header
+// block arrives: the buffer follows what has been received until a sixteenth
+// of the declared length is in, and is then reserved once.
+static void sessionDeclaredLength() {
+  const size_t kSize = 10 * 1024 * 1024;  // the default body limit
+  Harness h;
+  h.open();
+  Fields f = {{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/up"}};
+  f.emplace_back("content-length", std::to_string(kSize));
+  // 64 streams, each declaring the limit and sending nothing: no buffer.
+  gLargestAlloc = 0;
+  for (uint32_t i = 0; i < 64; i++) h.feed(frame(kHeaders, kFlagEndHeaders, 1 + 2 * i, head(f)));
+  CHECK(h.session->streamCount() == 64);
+  CHECK(gLargestAlloc < 65536);
+  // ...nor for one byte each.
+  for (uint32_t i = 0; i < 64; i++) h.feed(frame(kData, 0, 1 + 2 * i, "x"));
+  CHECK(gLargestAlloc < 65536);
+  for (uint32_t i = 1; i < 64; i++) h.feed(frame(kRstStream, 0, 1 + 2 * i, u32(kCancel)));
+
+  // The first stream goes on. Up to a sixteenth of the body the buffer stays
+  // within a small multiple of what was received.
+  std::string chunk(16384, '\0');
+  size_t sent = 1;
+  bool proportionate = true;
+  auto fill = [&](size_t at) {
+    for (size_t i = 0; i < chunk.size(); i++) chunk[i] = static_cast<char>('a' + (at + i) % 23);
+  };
+  while (sent + chunk.size() < kSize / 16) {
+    fill(sent);
+    h.feed(frame(kData, 0, 1, chunk));
+    sent += chunk.size();
+    proportionate = proportionate && gLargestAlloc <= 4 * sent + 65536;
+  }
+  CHECK(proportionate);
+  // From there it is reserved in full, once: no further growth however many
+  // frames the body takes.
+  fill(sent);
+  h.feed(frame(kData, 0, 1, chunk));
+  sent += chunk.size();
+  CHECK(gLargestAlloc >= kSize);
+  gLargeAllocs = 0;
+  size_t bodyAllocs = 0;
+  while (sent < kSize) {
+    const size_t n = std::min(chunk.size(), kSize - sent);
+    fill(sent);
+    const size_t before = gLargeAllocs;
+    h.session->feed(frame(kData, sent + n == kSize ? kFlagEndStream : 0, 1, chunk.substr(0, n)).data(), 9 + n, 1000);
+    // (the harness's own copies of the request are not the session's)
+    if (sent + n < kSize) bodyAllocs += gLargeAllocs - before;
+    h.session->out().clear();
+    sent += n;
+  }
+  CHECK(bodyAllocs == 0);
+  // A body of up to 64 KiB has its room from the header block on: nothing
+  // is allocated for it while it arrives.
+  {
+    Fields small = {{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/small"}};
+    small.emplace_back("content-length", "65536");
+    gLargestAlloc = 0;
+    h.session->feed(frame(kHeaders, kFlagEndHeaders, 201, head(small)).data(), 9 + head(small).size(), 1000);
+    CHECK(gLargestAlloc >= 65536 && gLargestAlloc < 2 * 65536);
+    const std::string part = frame(kData, 0, 201, std::string(16384, 's'));
+    gLargeAllocs = 0;
+    for (int i = 0; i < 3; i++) h.session->feed(part.data(), part.size(), 1000);
+    CHECK(gLargeAllocs == 0);
+    Fields over = small;
+    over.back().second = "65537";  // one byte more: it waits, like any large body
+    gLargestAlloc = 0;
+    h.session->feed(frame(kHeaders, kFlagEndHeaders, 203, head(over)).data(), 9 + head(over).size(), 1000);
+    CHECK(gLargestAlloc < 4096);
+    h.feed(frame(kRstStream, 0, 201, u32(kCancel)) + frame(kRstStream, 0, 203, u32(kCancel)));
+    h.session->out().clear();
+  }
+  // A body with no declared length grows through the same sizes however the
+  // reads cut its frames: 1 MiB arriving 5,000 bytes at a time ends in a
+  // buffer of 1 MiB, as it does arriving frame by frame.
+  {
+    Harness g;
+    g.open();
+    g.feed(frame(kHeaders, kFlagEndHeaders, 1, head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/grow"}})));
+    std::string wire;
+    for (int i = 0; i < 64; i++) wire += frame(kData, i == 63 ? kFlagEndStream : 0, 1, std::string(16384, static_cast<char>('a' + i % 26)));
+    gLargestAlloc = 0;
+    size_t largestWhileArriving = 0;
+    for (size_t off = 0; off < wire.size(); off += 5000) {
+      g.session->feed(wire.data() + off, std::min<size_t>(5000, wire.size() - off), 1000);
+      g.session->out().clear();
+      if (g.requests.empty()) largestWhileArriving = gLargestAlloc;
+    }
+    CHECK(largestWhileArriving >= (1u << 20) - 16384 && largestWhileArriving <= (1u << 20) + 64);
+    CHECK(g.requests.size() == 1 && g.requests[0].body.size() == (1u << 20));
+  }
+  CHECK(h.requests.size() == 1 && h.requests[0].body.size() == kSize);
+  bool intact = h.requests.size() == 1 && h.requests[0].body[0] == 'x';
+  for (size_t i = 1; intact && i < kSize; i += 4099) intact = h.requests[0].body[i] == static_cast<char>('a' + i % 23);
+  CHECK(intact);
+  CHECK(!h.session->dead());
+}
+
+// A host told in place that a stream has room may end the response there and
+// then. The stream is released inside that call - and, with the session's
+// spare streams all in use, freed - so nothing after the call may read it:
+// not the window update that drained it, not the pass over the streams that
+// were waiting.
+static void sessionHostEndsInWritable() {
+  for (const bool byConnection : {false, true}) {
+    Settings s;
+    Harness h(s);
+    // The client's stream window is zero (or, for the connection case, large
+    // with the connection's own window left at its 65,535).
+    h.feed(std::string(kPreface) + frame(kSettings, 0, 0, std::string("\x00\x04", 2) + u32(byConnection ? (1u << 24) : 0)));
+    h.take();
+    // 200 requests left waiting for a body, then the one under test, then
+    // the 200 completed and answered: more streams released than the session
+    // keeps spare, so the next one released is freed.
+    h.hold = true;
+    std::string wire;
+    for (uint32_t i = 0; i < 200; i++)
+      wire += frame(kHeaders, kFlagEndHeaders, 1 + 2 * i, head({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/s"}}));
+    const uint32_t target = 401;
+    wire += frame(kHeaders, kFlagEndHeaders | kFlagEndStream, target, head(get("/t")));
+    h.feed(wire);
+    CHECK(h.heldStreams.size() == 1);
+    Stream* t = h.heldStreams.empty() ? nullptr : h.heldStreams[0];
+    if (t == nullptr) continue;
+    std::string block;
+    encodeStatus(block, 200);
+    h.session->sendHeaders(*t, block, false);
+    const std::string body(400000, 'a');
+    const size_t heldBack = h.session->sendData(*t, body.data(), body.size(), false);
+    CHECK(heldBack > 300000);
+    t->wantDrain = true;
+    h.take();
+    h.heldStreams.clear();
+    for (uint32_t i = 0; i < 200; i++) {
+      h.feed(frame(kData, kFlagEndStream, 1 + 2 * i, ""));
+      if (!h.heldStreams.empty()) {
+        h.answer(*h.heldStreams.back());
+        h.heldStreams.pop_back();
+      }
+    }
+    h.take();
+    CHECK(h.session->streamCount() == 1 && h.session->held() == 1);
+
+    h.endOnWritable = true;
+    std::vector<Frame> out;
+    if (byConnection) {
+      out = h.feed(frame(kWindowUpdate, 0, 0, u32(1u << 22)));
+    } else {
+      h.feed(frame(kWindowUpdate, 0, 0, u32(1u << 20)));
+      out = h.feed(frame(kWindowUpdate, 0, target, u32(1u << 20)));
+    }
+    size_t bytes = 0;
+    bool ended = false;
+    for (const Frame& f : out) {
+      if (f.type == kData && f.stream == target) {
+        bytes += f.payload.size();
+        ended = ended || (f.flags & kFlagEndStream) != 0;
+      }
+    }
+    CHECK(h.writable.size() == 1);
+    CHECK(bytes >= heldBack + 4 && ended);  // what was held back, and the host's last piece
+    CHECK(h.session->streamCount() == 0 && h.session->held() == 0 && h.session->heldBytes() == 0);
+    CHECK(!h.session->dead());
+    // The session goes on: another window update, another request.
+    h.endOnWritable = false;
+    h.hold = false;
+    h.feed(frame(kWindowUpdate, 0, 0, u32(1000)));
+    const size_t before = h.requests.size();
+    h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 403, head(get("/next"))));
+    CHECK(h.requests.size() == before + 1 && !h.session->dead());
+  }
+}
+
+// WINDOW_UPDATE frames beyond what the peer was sent and asked for draw on the
+// budget for frames that cost it nothing; the ones a client sends as it opens
+// streams and takes in DATA never do.
+static void sessionWindowUpdateBudget() {
+  const std::string okHead = head(get());
+  // Nothing sent, nothing asked for: 16 are free, then one unit each, and
+  // the connection is ended when the 2000 units are spent.
+  {
+    Harness h;
+    h.open();
+    std::string flood;
+    for (int i = 0; i < 16 + 1 + 2000; i++) flood += frame(kWindowUpdate, 0, 0, u32(1));
+    h.feed(flood);
+    CHECK(!h.session->dead());
+    const std::vector<Frame> out = h.feed(frame(kWindowUpdate, 0, 0, u32(1)));
+    CHECK(h.session->dead() && goawayCode(out) == kEnhanceYourCalm);
+  }
+  // On a stream that waits with its window shut, as well.
+  {
+    Settings s;
+    Harness h(s);
+    h.feed(std::string(kPreface) + frame(kSettings, 0, 0, std::string("\x00\x04", 2) + u32(0)));
+    h.hold = true;
+    h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1, okHead));
+    std::string block;
+    encodeStatus(block, 200);
+    h.session->sendHeaders(*h.heldStreams[0], block, false);
+    const std::string body(100000, 'b');
+    h.session->sendData(*h.heldStreams[0], body.data(), body.size(), false);
+    h.take();
+    std::string flood;
+    for (int i = 0; i < 5000; i++) flood += frame(kWindowUpdate, 0, 1, u32(1));
+    const std::vector<Frame> out = h.feed(flood);
+    CHECK(h.session->dead() && goawayCode(out) == kEnhanceYourCalm);
+  }
+  // A client that updates both windows for every DATA frame of a 16 MiB
+  // response - twice the frames any real one sends - is never charged.
+  {
+    Harness h;
+    h.open();
+    h.hold = true;
+    h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1, okHead));
+    std::string block;
+    encodeStatus(block, 200);
+    Stream& st = *h.heldStreams[0];
+    h.session->sendHeaders(st, block, false);
+    const std::string body(16u << 20, 'c');
+    h.session->sendData(st, body.data(), body.size(), true);
+    size_t got = 0, updates = 0;
+    std::vector<Frame> out = h.take();
+    for (int round = 0; round < 100000 && !h.session->dead(); round++) {
+      std::string acks;
+      for (const Frame& f : out) {
+        if (f.type != kData || f.payload.empty()) continue;
+        got += f.payload.size();
+        acks += frame(kWindowUpdate, 0, 0, u32(static_cast<uint32_t>(f.payload.size())));
+        acks += frame(kWindowUpdate, 0, 1, u32(static_cast<uint32_t>(f.payload.size())));
+        updates += 2;
+      }
+      if (acks.empty()) break;
+      out = h.feed(acks);
+    }
+    CHECK(got == body.size() && updates > 2000 && !h.session->dead());
+  }
+  // ...nor is one that sends a WINDOW_UPDATE with every request it opens,
+  // for however many requests, whatever the size of the answers.
+  {
+    Harness h;
+    h.open();
+    h.hold = true;
+    for (uint32_t i = 0; i < 6000 && !h.session->dead(); i++) {
+      const uint32_t id = 1 + 2 * i;
+      h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, id, okHead) + frame(kWindowUpdate, 0, id, u32(1u << 20)));
+      h.answer(*h.heldStreams.back());
+      h.heldStreams.pop_back();
+      h.take();
+    }
+    CHECK(!h.session->dead() && h.requests.size() == 6000);
+  }
+}
+
+// What a connection has set aside for request bodies is bounded as what it
+// has received is: a declared length is reserved in full only while the
+// connection's reserved total stays within its buffering bound.
+static void sessionReservedBodies() {
+  const size_t kMiB = 1024 * 1024;
+  Harness h;  // body limit 10 MiB, bound on buffered bodies 32 MiB
+  h.open();
+  Fields f = {{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/up"}};
+  f.emplace_back("content-length", std::to_string(10 * kMiB));
+  const size_t before = gLiveBytes;
+  for (uint32_t i = 0; i < 48; i++) h.feed(frame(kHeaders, kFlagEndHeaders, 1 + 2 * i, head(f)));
+  const std::string chunk(16384, 'u');
+  size_t sent = 0;
+  for (size_t off = 0; off < 10 * kMiB / 16 + 16384; off += chunk.size()) {
+    for (uint32_t i = 0; i < 48; i++) {
+      h.session->feed(frame(kData, 0, 1 + 2 * i, chunk).data(), 9 + chunk.size(), 1000);
+      sent += chunk.size();
+    }
+    h.session->out().clear();
+  }
+  CHECK(!h.session->dead() && h.session->streamCount() == 48);
+  const size_t held = gLiveBytes - before;
+  // 30.8 MiB received. Reserved in full for each, that was 480 MiB.
+  CHECK(sent > 30 * kMiB && sent < 32 * kMiB);
+  CHECK(held >= sent && held < 100 * kMiB);
+  // The first streams did get their declared length in one piece...
+  CHECK(gLargestAlloc >= 10 * kMiB);
+  // ...and every body is still whole when its request completes.
+  h.hold = false;
+  size_t whole = 0;
+  for (uint32_t i = 0; i < 48; i++) {
+    const uint32_t id = 1 + 2 * i;
+    h.feed(frame(kRstStream, 0, id, u32(kCancel)));
+  }
+  CHECK(h.session->streamCount() == 0);
+  // Released with the streams: a second round reserves as the first did.
+  const size_t after = gLiveBytes;
+  CHECK(after < before + 8 * kMiB);
+  for (uint32_t i = 48; i < 52; i++) h.feed(frame(kHeaders, kFlagEndHeaders, 1 + 2 * i, head(f)));
+  gLargeAllocs = 0;
+  gLargestAlloc = 0;
+  for (size_t off = 0; off < 10 * kMiB / 16 + 16384; off += chunk.size()) {
+    for (uint32_t i = 48; i < 52; i++) h.session->feed(frame(kData, 0, 1 + 2 * i, chunk).data(), 9 + chunk.size(), 1000);
+    h.session->out().clear();
+  }
+  CHECK(gLargestAlloc >= 10 * kMiB && !h.session->dead());
+  (void)whole;
+}
+
+// Cookie fields are one field to the application (RFC 9113 8.2.3), and an
+// authority is never empty.
+static void sessionCookieAndAuthority() {
+  auto seen = [](const Fields& extra, Settings s = Settings()) {
+    Harness h(s);
+    h.open();
+    Fields f = get("/c");
+    for (const auto& e : extra) f.push_back(e);
+    const std::vector<Frame> out = h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1, head(f)));
+    if (h.requests.size() != 1) return Fields{{"status", statusOn(out, 1)}, {"rst", std::to_string(rstCode(out, 1))}};
+    return h.requests[0].headers;
+  };
+  CHECK(seen({{"cookie", "a=1"}}) == (Fields{{"cookie", "a=1"}, {"host", "example.test"}}));
+  CHECK(seen({{"cookie", "a=1"}, {"x-between", "1"}, {"cookie", "b=2"}, {"cookie", "c=3; d=4"}}) ==
+        (Fields{{"cookie", "a=1; b=2; c=3; d=4"}, {"x-between", "1"}, {"host", "example.test"}}));
+  CHECK(seen({{"cookie", ""}, {"cookie", "b=2"}, {"cookie", ""}}) == (Fields{{"cookie", "b=2"}, {"host", "example.test"}}));
+  CHECK(seen({{"cookie", ""}}) == (Fields{{"cookie", ""}, {"host", "example.test"}}));
+  // However many fields it came in, it is one of the headers counted.
+  {
+    Settings s;
+    s.maxHeaders = 3;
+    Fields many;
+    for (int i = 0; i < 20; i++) many.emplace_back("cookie", "k" + std::to_string(i) + "=v");
+    many.emplace_back("x-a", "1");
+    many.emplace_back("x-b", "2");
+    const Fields got = seen(many, s);
+    CHECK(got.size() == 4 && got[0].first == "cookie" && got[0].second.size() > 20 * 5 && got[1].first == "x-a" &&
+          got[2] == (Fields::value_type{"x-b", "2"}) && got[3].first == "host");
+    // The joined field stands where the first of them stood, the fields around it as they were.
+    CHECK(seen({{"x-first", "1"}, {"cookie", "a=1"}, {"x-mid", "22"}, {"cookie", "b=2"}, {"x-last", ""}, {"cookie", "c=3"}}) ==
+          (Fields{{"x-first", "1"}, {"cookie", "a=1; b=2; c=3"}, {"x-mid", "22"}, {"x-last", ""}, {"host", "example.test"}}));
+    many.emplace_back("x-c", "3");
+    CHECK(seen(many, s) == (Fields{{"status", "431"}, {"rst", std::to_string(0xffffffffu)}}));
+  }
+  // A control byte in any one of them still makes the request malformed.
+  CHECK(seen({{"cookie", "a=1"}, {"cookie", std::string("b=\x01")}}) == (Fields{{"status", ""}, {"rst", std::to_string(kProtocolError)}}));
+
+  // An empty :authority, and an empty Host, with or without the other.
+  auto refused = [](const Fields& fields) {
+    Harness h;
+    h.open();
+    const std::vector<Frame> out = h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1, head(fields)));
+    return h.requests.empty() && rstCode(out, 1) == kProtocolError && !h.session->dead();
+  };
+  const Fields base = {{":method", "GET"}, {":scheme", "https"}, {":path", "/"}};
+  auto with = [&base](const Fields& extra) {
+    Fields f = base;
+    for (const auto& e : extra) f.push_back(e);
+    return f;
+  };
+  CHECK(refused(with({{":authority", ""}})));
+  CHECK(refused(with({{":authority", ""}, {"host", "evil.test"}})));
+  CHECK(refused(with({{"host", ""}})));
+  CHECK(refused(with({{":authority", "a.test"}, {"host", ""}})));
+  CHECK(!refused(with({{":authority", "a.test"}})));
+  CHECK(!refused(with({{"host", "a.test"}})));
+  // An http or https request names its authority, in one field or the other
+  // (RFC 9110 7.2): with neither it is malformed, whatever the target.
+  CHECK(refused(base));
+  CHECK(refused({{":method", "GET"}, {":scheme", "http"}, {":path", "/"}}));
+  CHECK(refused({{":method", "GET"}, {":scheme", "HTTPS"}, {":path", "/"}, {"accept", "*/*"}}));
+  CHECK(refused({{":method", "OPTIONS"}, {":scheme", "https"}, {":path", "*"}}));
+  CHECK(!refused({{":method", "OPTIONS"}, {":scheme", "https"}, {":path", "*"}, {":authority", "a.test"}}));
+  CHECK(!refused({{":method", "OPTIONS"}, {":scheme", "http"}, {":path", "*"}, {"host", "a.test"}}));
+  // ...and however the scheme is spelled: as an entry of the static table
+  // (0x86 http, 0x87 https), which is how nearly every client sends it.
+  for (const char* block : {"\x82\x86\x84", "\x82\x87\x84"}) {
+    Harness h;
+    h.open();
+    const std::vector<Frame> out = h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 1, block));
+    CHECK(h.requests.empty() && rstCode(out, 1) == kProtocolError && !h.session->dead());
+    const std::string named = std::string(block) + std::string("\x01\x06" "a.test", 8);  // :authority a.test
+    const std::vector<Frame> out2 = h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, 3, named));
+    CHECK(h.requests.size() == 1 && rstCode(out2, 3) != kProtocolError);
+  }
+  // A scheme of another kind may have no authority, and is left alone.
+  for (const char* scheme : {"urn", "file", "httpx", "htt", "ws"}) {
+    CHECK(!refused({{":method", "GET"}, {":scheme", scheme}, {":path", "/"}}));
+  }
+}
+
 int main(int argc, char** argv) {
   const char* vectors = argc > 1 ? argv[1] : "test/fixtures/hpack-vectors.txt";
   hpackVectors(vectors);
@@ -950,6 +2361,17 @@ int main(int argc, char** argv) {
   sessionErrors();
   sessionLimits();
   sessionSplitting();
+  sessionBudget();
+  sessionBounds();
+  sessionBuffering();
+  sessionHttp1Parity();
+  sessionPausing();
+  sessionDataInPieces();
+  sessionDeclaredLength();
+  sessionHostEndsInWritable();
+  sessionWindowUpdateBudget();
+  sessionReservedBodies();
+  sessionCookieAndAuthority();
 
   if (failures) {
     std::fprintf(stderr, "%d of %d checks failed\n", failures, checks);

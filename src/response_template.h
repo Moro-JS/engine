@@ -7,9 +7,10 @@
 // ONCE (prepareResponse / setStaticRoute) with the same header builder the
 // per-request respond() path uses, then replayed per request with a body:
 // the bytes on the wire are identical to respond(status, headers, body), the
-// per-request header walk is simply gone. Date, the actual Content-Length and
-// the Connection header stay per response (appendResponse), which is why a
-// template stores the header block and not a pre-rendered head.
+// per-request header walk is simply gone. The actual Content-Length and the
+// Connection header stay per response (appendResponseHead); the part ahead
+// of them - status line, Date, header block - is kept rendered beside the
+// header block and rebuilt when the Date second changes (`head`).
 //
 // Ids are per Server, dense from 1 (0 = none/invalid). Original-code policy
 // applies (CONTRIBUTING.md).
@@ -34,6 +35,13 @@ struct ResponseTemplate {
   // first time the template answers an HTTP/2 request. The engine's encoder
   // keeps no per-connection state, so one block serves every connection.
   mutable std::string h2Block;
+  // The HTTP/1 head up to and including "Content-Length: " - status line,
+  // Date, the header block - as it is on the wire for a response that has a
+  // body length: rebuilt when the server's Date cache ticks (`headAt` is the
+  // second it was built for, as StaticRoute::frame), appended in one piece
+  // otherwise. See Server::appendResponseHead.
+  mutable std::string head;
+  mutable time_t headAt = 0;
 };
 
 class TemplateStore {

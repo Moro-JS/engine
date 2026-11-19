@@ -15,10 +15,12 @@
 // FAILED, and the process exits 0. Run with: node --test
 //
 // Behaviors that are RFC-permissible but engine-specific are documented inline
-// and asserted as the ACTUAL behavior (see the "connection failure" tests: the
-// engine hard-closes the TCP socket on a protocol error rather than sending a
-// 1002 Close frame first — RFC 6455 §7.1.7 makes the Close frame a SHOULD, and
-// the engine still surfaces close code 1002 to onWsClose).
+// and asserted as the ACTUAL behavior. On a protocol error the engine sends a
+// Close frame with the failure's status code first (RFC 6455 §7.1.7: 1002,
+// 1007 for invalid UTF-8, 1009 for a message over the size limit), reports
+// the same code to onWsClose, then half-closes and reads until the peer has
+// closed too (§7.1.1) - see the "connection failure" and "closes the server
+// starts" tests.
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -136,13 +138,17 @@ function tryDecodeFrame(buf) {
 // own growing buffer so frame boundaries are under test control.
 // ---------------------------------------------------------------------------
 
-function openWs(port, host = '127.0.0.1') {
+// allowHalfOpen: the client does not answer the server's FIN with its own
+// (what a peer that is still sending looks like to the server).
+function openWs(port, host = '127.0.0.1', { allowHalfOpen = false } = {}) {
   return new Promise((resolveConnect, rejectConnect) => {
-    const socket = net.connect({ host, port });
+    const socket = net.connect({ host, port, allowHalfOpen });
     socket.setNoDelay(true);
 
     let connected = false;
     let closed = false;
+    let ended = false;   // the server's FIN arrived
+    let errored = null;  // a socket error after connect (ECONNRESET, EPIPE)
     let buf = Buffer.alloc(0);
     const waiters = new Set();
     const pump = () => {
@@ -157,8 +163,13 @@ function openWs(port, host = '127.0.0.1') {
       buf = Buffer.concat([buf, d]);
       pump();
     });
+    socket.on('end', () => {
+      ended = true;
+      pump();
+    });
     socket.on('error', (err) => {
       if (!connected) rejectConnect(err);
+      else errored = err;
     });
     socket.on('close', () => {
       closed = true;
@@ -195,8 +206,15 @@ function openWs(port, host = '127.0.0.1') {
     }
 
     const client = {
+      socket,
       get closed() {
         return closed;
+      },
+      get ended() {
+        return ended;
+      },
+      get errored() {
+        return errored;
       },
       destroy() {
         socket.destroy();
@@ -240,6 +258,9 @@ function openWs(port, host = '127.0.0.1') {
       waitClose({ timeout = 5000 } = {}) {
         return waitFor(() => (closed ? true : undefined), { timeout, label: 'socket close' });
       },
+      waitEnd({ timeout = 5000 } = {}) {
+        return waitFor(() => (ended ? true : undefined), { timeout, label: 'the server FIN' });
+      },
       remainingBytes() {
         return buf.length;
       },
@@ -253,12 +274,15 @@ function openWs(port, host = '127.0.0.1') {
 // the WS callbacks, so this suite starts serve() directly).
 // ---------------------------------------------------------------------------
 
-function startWsServer(serveOptions) {
+// `hooks` replaces what a callback does after the event is recorded:
+// onRequest(reqId), onWsMessage(wsId, data, isBinary), onWsClose(wsId, code).
+function startWsServer(serveOptions, hooks = {}) {
   const events = { opens: [], messages: [], closes: [], rejected: [], requests: [] };
 
   const callbacks = {
     onRequest(reqId) {
       events.requests.push(reqId);
+      if (hooks.onRequest) return hooks.onRequest(reqId);
       const wsId = engine.upgradeToWebSocket(reqId);
       if (wsId === -1) {
         // Not a valid upgrade request (§4.2.1): keep it HTTP and answer 400.
@@ -274,10 +298,12 @@ function startWsServer(serveOptions) {
     onWsMessage(wsId, data, isBinary) {
       const size = isBinary ? data.byteLength : Buffer.byteLength(data, 'utf8');
       events.messages.push({ wsId, isBinary, size });
+      if (hooks.onWsMessage) return hooks.onWsMessage(wsId, data, isBinary);
       engine.wsSend(wsId, data, isBinary); // echo verbatim
     },
     onWsClose(wsId, code) {
       events.closes.push({ wsId, code });
+      if (hooks.onWsClose) hooks.onWsClose(wsId, code);
     },
   };
 
@@ -316,10 +342,10 @@ function startWsServer(serveOptions) {
 // handshake-rejection tests.
 function upgradeRequest(
   path = '/',
-  { key, version = '13', includeKey = true, includeVersion = true, host = '127.0.0.1', extra = '' } = {}
+  { key, version = '13', includeKey = true, includeVersion = true, host = '127.0.0.1', extra = '', method = 'GET', httpVersion = '1.1' } = {}
 ) {
   const k = key ?? crypto.randomBytes(16).toString('base64');
-  let req = `GET ${path} HTTP/1.1${CRLF}Host: ${host}${CRLF}Upgrade: websocket${CRLF}Connection: Upgrade${CRLF}`;
+  let req = `${method} ${path} HTTP/${httpVersion}${CRLF}Host: ${host}${CRLF}Upgrade: websocket${CRLF}Connection: Upgrade${CRLF}`;
   if (includeKey) req += `Sec-WebSocket-Key: ${k}${CRLF}`;
   if (includeVersion) req += `Sec-WebSocket-Version: ${version}${CRLF}`;
   req += extra;
@@ -449,6 +475,70 @@ describe('@morojs/engine RFC 6455 WebSocket conformance', { skip }, () => {
       assert.equal(head.status, 400);
     } finally {
       client.destroy();
+    }
+  });
+
+  // RFC 6455 §4.2.1 item 1: the handshake is "an HTTP/1.1 or higher GET
+  // request". Anything else that carries the upgrade headers is an ordinary
+  // request: upgradeToWebSocket() answers -1 and the application responds.
+  for (const method of ['POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD']) {
+    it(`handshake rejection: ${method} with a full set of upgrade headers is NOT upgraded (§4.2.1)`, T, async () => {
+      const opens = server.events.opens.length;
+      const client = await openWs(server.port);
+      try {
+        const extra = method === 'POST' || method === 'PUT' ? `Content-Length: 0${CRLF}` : '';
+        const { req } = upgradeRequest('/', { method, extra });
+        await client.send(req);
+        const head = parseHead(await client.readHandshake());
+        assert.equal(head.status, 400, `${method} must not be switched to the WebSocket protocol`);
+        assert.equal(server.events.opens.length, opens);
+      } finally {
+        client.destroy();
+      }
+    });
+  }
+
+  it('handshake rejection: an HTTP/1.0 request with upgrade headers is NOT upgraded (§4.2.1)', T, async () => {
+    const client = await openWs(server.port);
+    try {
+      const { req } = upgradeRequest('/', { httpVersion: '1.0' });
+      await client.send(req);
+      const head = parseHead(await client.readHandshake());
+      assert.equal(head.status, 400, 'HTTP/1.0 cannot carry an Upgrade');
+    } finally {
+      client.destroy();
+    }
+  });
+
+  // §11.3.1 / §11.3.5: Sec-WebSocket-Key and Sec-WebSocket-Version "MUST NOT
+  // appear more than once in an HTTP request".
+  it('handshake rejection: two Sec-WebSocket-Key lines are NOT upgraded (§11.3.1)', T, async () => {
+    for (const second of [crypto.randomBytes(16).toString('base64'), null]) {
+      const client = await openWs(server.port);
+      try {
+        const key = crypto.randomBytes(16).toString('base64');
+        // a different second key, and the same key twice
+        const { req } = upgradeRequest('/', { key, extra: `Sec-WebSocket-Key: ${second ?? key}${CRLF}` });
+        await client.send(req);
+        const head = parseHead(await client.readHandshake());
+        assert.equal(head.status, 400, 'a request with two keys must not be upgraded');
+      } finally {
+        client.destroy();
+      }
+    }
+  });
+
+  it('handshake rejection: two Sec-WebSocket-Version lines are NOT upgraded, whatever their order (§11.3.5)', T, async () => {
+    for (const [first, second] of [['8', '13'], ['13', '8'], ['13', '13']]) {
+      const client = await openWs(server.port);
+      try {
+        const { req } = upgradeRequest('/', { version: first, extra: `Sec-WebSocket-Version: ${second}${CRLF}` });
+        await client.send(req);
+        const head = parseHead(await client.readHandshake());
+        assert.equal(head.status, 400, `versions ${first} then ${second} must not be upgraded`);
+      } finally {
+        client.destroy();
+      }
     }
   });
 
@@ -911,7 +1001,7 @@ describe('@morojs/engine RFC 6455 WebSocket conformance', { skip }, () => {
       const before = auto.events.requests.length;
       let client = await openWs(auto.port);
       try {
-        const { req } = upgradeRequest('/', { version: '8' });
+        const { req } = upgradeRequest('/', { key: 'not-a-16-byte-nonce' });
         await client.send(req);
         const head = parseHead(await client.readHandshake());
         assert.equal(head.status, 400, 'the fixture answers a non-upgrade request with 400');
@@ -929,6 +1019,53 @@ describe('@morojs/engine RFC 6455 WebSocket conformance', { skip }, () => {
       assert.equal(auto.events.requests.length, before + 2, 'both went through onRequest');
     });
 
+    it('an unsupported Sec-WebSocket-Version is answered 426 naming version 13, without reaching onRequest (§4.2.2, §4.4)', T, async () => {
+      for (const version of ['8', '14', '8, 13']) {
+        const before = auto.events.requests.length;
+        const opens = auto.events.opens.length;
+        const client = await openWs(auto.port);
+        try {
+          const { req } = upgradeRequest('/', { version });
+          await client.send(req);
+          const head = parseHead(await client.readHandshake());
+          assert.equal(head.status, 426, `version ${version}: ${head.statusLine}`);
+          assert.match(head.statusLine, /^HTTP\/1\.1 426 Upgrade Required$/);
+          assert.equal(head.headers['sec-websocket-version'], '13');
+          assert.equal((head.headers['upgrade'] || '').toLowerCase(), 'websocket', 'a 426 names the protocol to upgrade to (RFC 9110 §15.5.22)');
+          assert.equal(head.headers['content-length'], '0');
+          assert.equal(auto.events.requests.length, before, 'the engine answered; onRequest did not run');
+          assert.equal(auto.events.opens.length, opens);
+          // The connection is still an HTTP connection: a handshake with the
+          // version the 426 named succeeds on it.
+          const again = upgradeRequest('/retry');
+          await client.send(again.req);
+          const second = parseHead(await client.readHandshake());
+          assert.equal(second.status, 101);
+          assert.equal(second.headers['sec-websocket-accept'], computeAccept(again.key));
+        } finally {
+          client.destroy();
+        }
+      }
+    });
+
+    it('a request that is not a GET, or is HTTP/1.0, reaches onRequest whatever upgrade headers it carries', T, async () => {
+      for (const opts of [{ method: 'POST', extra: `Content-Length: 0${CRLF}` }, { method: 'DELETE' }, { httpVersion: '1.0' }]) {
+        const before = auto.events.requests.length;
+        const opens = auto.events.opens.length;
+        const client = await openWs(auto.port);
+        try {
+          const { req } = upgradeRequest('/', opts);
+          await client.send(req);
+          const head = parseHead(await client.readHandshake());
+          assert.equal(head.status, 400, `${JSON.stringify(opts)}: the fixture's own answer to a request it could not upgrade`);
+          assert.equal(auto.events.requests.length, before + 1, 'the application saw it as an ordinary request');
+          assert.equal(auto.events.opens.length, opens);
+        } finally {
+          client.destroy();
+        }
+      }
+    });
+
     it('the accessors answer undefined once the socket is closed', T, async () => {
       const { client } = await connectAndHandshake(auto);
       const wsId = auto.events.opens.at(-1).wsId;
@@ -938,6 +1075,551 @@ describe('@morojs/engine RFC 6455 WebSocket conformance', { skip }, () => {
       assert.equal(engine.wsGetHeaders(wsId), undefined);
       assert.equal(engine.wsGetQuery(wsId), undefined);
       assert.equal(engine.wsGetRemoteAddress(wsId), undefined);
+    });
+  });
+
+  // ---- Closes the server starts (wsClose) ----
+
+  describe('closes the server starts', () => {
+    // One server whose message handler does what the current test says.
+    let local;
+    let action;
+    before(() => {
+      local = startWsServer(undefined, { onWsMessage: (wsId, data, isBinary) => action(wsId, data, isBinary) });
+    });
+    after(() => {
+      if (local) local.close();
+    });
+    async function closeWith(fn) {
+      action = fn;
+      const { client } = await connectAndHandshake(local);
+      await client.sendFrame({ opcode: OP.TEXT, payload: 'go' });
+      return client;
+    }
+
+    // §5.5: "All control frames MUST have a payload length of 125 bytes or
+    // less". Two of them are the status code, so a reason has 123.
+    it('a reason longer than 123 bytes is cut so the Close stays a legal control frame (§5.5)', T, async () => {
+      for (const [reason, expected] of [
+        ['r'.repeat(200), 'r'.repeat(123)],
+        ['r'.repeat(123), 'r'.repeat(123)],
+        // 122 ASCII bytes, then two-byte characters: byte 123 would split one
+        ['r'.repeat(122) + 'éé', 'r'.repeat(122)],
+        // 121 bytes, then a three-byte and a four-byte character
+        ['r'.repeat(120) + '€𝄞', 'r'.repeat(120) + '€'],
+      ]) {
+        const client = await closeWith((wsId) => engine.wsClose(wsId, 1001, reason));
+        try {
+          const f = await client.nextFrame();
+          assert.equal(f.opcode, OP.CLOSE);
+          assert.ok(f.payload.length <= 125, `Close payload of ${f.payload.length} bytes`);
+          assert.equal(f.payload.readUInt16BE(0), 1001);
+          assert.equal(f.payload.subarray(2).toString('utf8'), expected, 'cut at a character boundary');
+          assert.equal(client.remainingBytes(), 0, 'one frame, nothing behind it');
+        } finally {
+          client.destroy();
+        }
+      }
+    });
+
+    // §7.4.1 / §7.4.2: 1005, 1006 and 1015 "MUST NOT be set as a status code
+    // in a Close control frame by an endpoint"; 0-999 are not used; nothing is
+    // defined from 5000 up. The frame that goes out is legal whatever
+    // wsClose() was given: 1005 ("no status code was present") is a Close with
+    // no status, anything else that cannot be sent goes out as 1011.
+    // onWsClose reports the code as it was passed.
+    it('wsClose(code) sends the code when it may appear on the wire, 1011 when it may not, and no status for 1005 (§7.4.1, §7.4.2)', T, async () => {
+      for (const [code, onWire] of [
+        [1005, null],
+        [1006, 1011],
+        [1015, 1011],
+        [1004, 1011],
+        [0, 1011],
+        [999, 1011],
+        [1016, 1011],
+        [2999, 1011],
+        [5000, 1011],
+        [65535, 1011],
+        [70000, 1011], // not 70000 mod 65536
+        [-1, 1011],
+        [1000, 1000],
+        [1001, 1001],
+        [1011, 1011],
+        [1013, 1013],
+        [3000, 3000],
+        [4999, 4999],
+      ]) {
+        const before = local.events.closes.length;
+        const client = await closeWith((wsId) => engine.wsClose(wsId, code, 'why'));
+        try {
+          const f = await client.nextFrame();
+          assert.equal(f.opcode, OP.CLOSE, `wsClose(${code})`);
+          if (onWire === null) {
+            assert.equal(f.payload.length, 0, `wsClose(${code}): no status code, and so no reason`);
+          } else {
+            assert.equal(f.payload.readUInt16BE(0), onWire, `wsClose(${code})`);
+            assert.equal(f.payload.subarray(2).toString(), 'why');
+          }
+          await client.waitClose();
+          assert.deepEqual(local.events.closes.slice(before).map((c) => c.code), [code], 'onWsClose reports the code as passed');
+        } finally {
+          client.destroy();
+        }
+      }
+    });
+
+    it('wsSend() answers false for a payload it cannot send, and sends nothing', T, async () => {
+      const results = [];
+      const client = await closeWith((wsId) => {
+        for (const bad of [42, {}, undefined, null, true, [1, 2], Symbol.iterator]) results.push(engine.wsSend(wsId, bad, false));
+        results.push(engine.wsSend(wsId, 'text', false));
+        results.push(engine.wsSend(wsId, Buffer.from('bytes'), true));
+      });
+      try {
+        const a = await client.nextFrame();
+        assert.equal(a.opcode, OP.TEXT);
+        assert.equal(a.payload.toString(), 'text', 'the first frame on the wire is the first payload that could be sent');
+        const b = await client.nextFrame();
+        assert.equal(b.opcode, OP.BINARY);
+        assert.equal(b.payload.toString(), 'bytes');
+        assert.deepEqual(results, [false, false, false, false, false, false, false, true, true]);
+        assert.equal(client.remainingBytes(), 0);
+        assert.equal(client.closed, false, 'the socket is unaffected');
+      } finally {
+        client.destroy();
+      }
+    });
+
+    // RFC 6455 §7.1.1: to close cleanly the server half-closes and reads
+    // until the peer has closed too. A peer that is still sending when the
+    // server's Close goes out must receive that Close: closed outright, its
+    // bytes in flight are answered with a RST, and the RST discards what the
+    // peer had not read yet - the Close frame and its status code.
+    it('a Close for a message over the size limit reaches a client that is still uploading it (1009, every time)', { timeout: 60000 }, async () => {
+      const small = startWsServer({ wsMaxMessageSize: 1024 * 1024 }, { onWsMessage() {} });
+      const trials = 15;
+      let seen = 0;
+      const lost = [];
+      try {
+        for (let t = 0; t < trials; t++) {
+          const { client } = await connectAndHandshake(small);
+          try {
+            // 4 MiB against a 1 MiB limit: the server answers after the frame
+            // header, with megabytes still on their way.
+            client.socket.write(buildFrame({ opcode: OP.BINARY, payload: Buffer.alloc(4 * 1024 * 1024, 1), maskKey: [0, 0, 0, 0] }));
+            await client.waitClose({ timeout: 10000 }).catch(() => {});
+            const f = await client.nextFrame({ allowClose: true, timeout: 500 }).catch(() => undefined);
+            if (f && f.opcode === OP.CLOSE && f.payload.readUInt16BE(0) === 1009) seen++;
+            else lost.push(client.errored ? client.errored.code : 'EOF without a Close');
+          } finally {
+            client.destroy();
+          }
+        }
+        assert.equal(seen, trials, `the client lost the Close frame in ${trials - seen} of ${trials} uploads: ${lost}`);
+        assert.equal(small.events.closes.length, trials);
+        assert.ok(small.events.closes.every((c) => c.code === 1009));
+      } finally {
+        small.close();
+      }
+    });
+
+    it('after its Close the server sends FIN, drops what the peer still sends, and closes when the peer does', T, async () => {
+      let delivered = 0;
+      action = (wsId) => {
+        delivered++;
+        engine.wsClose(wsId, 4001, 'policy');
+      };
+      // allowHalfOpen: this client decides when its own side closes
+      const client = await openWs(local.port, '127.0.0.1', { allowHalfOpen: true });
+      try {
+        await client.send(upgradeRequest('/').req);
+        assert.equal(parseHead(await client.readHandshake()).status, 101);
+        await client.sendFrame({ opcode: OP.TEXT, payload: 'go' });
+        const f = await client.nextFrame();
+        assert.equal(f.opcode, OP.CLOSE);
+        assert.equal(f.payload.readUInt16BE(0), 4001);
+        await client.waitEnd();
+        // The peer keeps sending for a while: no reset, nothing delivered.
+        for (let i = 0; i < 10; i++) {
+          await client.sendFrame({ opcode: OP.TEXT, payload: 'x'.repeat(4096) });
+          await delay(10);
+        }
+        assert.equal(client.errored, null, `the connection was reset: ${client.errored}`);
+        assert.equal(client.closed, false, 'the server waits for the peer to close');
+        assert.equal(delivered, 1, 'frames that follow the server Close are not delivered');
+        // The peer answers with its own Close and closes: the server is done.
+        await client.sendFrame({ opcode: OP.CLOSE, payload: Buffer.from([0x0f, 0xa1]) });
+        client.socket.end();
+        await client.waitClose();
+        assert.equal(client.errored, null);
+      } finally {
+        client.destroy();
+      }
+    });
+
+    it('a peer that never closes its side is cut at the linger deadline', T, async () => {
+      action = (wsId) => engine.wsClose(wsId, 1000, '');
+      const client = await openWs(local.port, '127.0.0.1', { allowHalfOpen: true });
+      try {
+        await client.send(upgradeRequest('/').req);
+        assert.equal(parseHead(await client.readHandshake()).status, 101);
+        await client.sendFrame({ opcode: OP.TEXT, payload: 'go' });
+        assert.equal((await client.nextFrame()).opcode, OP.CLOSE);
+        await client.waitEnd();
+        // The peer never sends its FIN; it keeps writing a little. While the
+        // server lingers the bytes are taken; once it has closed, a write is
+        // answered with a reset. 2 s of linger, checked by a sweep that runs
+        // at most once a second.
+        const t0 = Date.now();
+        while (!client.closed && Date.now() - t0 < 8000) {
+          client.socket.write(buildFrame({ opcode: OP.PING, payload: 'still here' }));
+          await delay(50);
+        }
+        const waited = Date.now() - t0;
+        assert.equal(client.closed, true, 'the server kept a half-closed WebSocket for more than 8 s');
+        assert.ok(waited >= 500 && waited < 5000, `cut after ${waited} ms`);
+      } finally {
+        client.destroy();
+      }
+    });
+  });
+
+  // ---- onWsClose: once per socket, whatever the callback does ----
+
+  describe('onWsClose fires once, also when the callback calls back into the engine', () => {
+    it('wsClose() from inside the onWsClose of a socket whose peer went away does not fire it again; the accessors still answer', T, async () => {
+      const calls = [];
+      const local = startWsServer(undefined, {
+        onWsClose(wsId, code) {
+          const headers = engine.wsGetHeaders(wsId);
+          calls.push({ code, headers: Array.isArray(headers) && headers.includes('x-who'), address: engine.wsGetRemoteAddress(wsId) });
+          engine.wsClose(wsId, 1000, ''); // a "make sure it is closed" cleanup
+        },
+      });
+      try {
+        const { client } = await connectAndHandshake(local, '/', { extra: `X-Who: me${CRLF}` });
+        client.destroy(); // FIN, no Close frame
+        await waitForEvent(() => calls.length > 0, { message: 'onWsClose never fired' });
+        await delay(100);
+        assert.deepEqual(calls, [{ code: 1006, headers: true, address: '127.0.0.1' }]);
+        assert.equal(local.events.closes.length, 1);
+      } finally {
+        local.close();
+      }
+    });
+
+    it('wsSend() from inside onWsClose answers false on every way a socket closes', T, async () => {
+      const results = [];
+      const local = startWsServer(undefined, {
+        onWsMessage: (wsId) => engine.wsClose(wsId, 1001, ''),
+        onWsClose(wsId, code) {
+          results.push([code, engine.wsSend(wsId, 'x', false)]);
+        },
+      });
+      try {
+        const a = await connectAndHandshake(local);
+        a.client.destroy(); // the peer goes away
+        await waitForEvent(() => results.length === 1, { message: 'no onWsClose for a peer that went away' });
+        const b = await connectAndHandshake(local);
+        await b.client.sendFrame({ opcode: OP.CLOSE }); // the peer's Close frame
+        await waitForEvent(() => results.length === 2, { message: 'no onWsClose for a Close frame' });
+        b.client.destroy();
+        const c = await connectAndHandshake(local);
+        await c.client.sendFrame({ opcode: OP.TEXT, payload: 'close me' }); // the server's own wsClose()
+        await waitForEvent(() => results.length === 3, { message: 'no onWsClose for wsClose()' });
+        c.client.destroy();
+        const d = await connectAndHandshake(local);
+        await d.client.sendFrame({ opcode: 0x3 }); // a protocol error
+        await waitForEvent(() => results.length === 4, { message: 'no onWsClose for a protocol error' });
+        d.client.destroy();
+        assert.deepEqual(results, [[1006, false], [1005, false], [1001, false], [1002, false]]);
+      } finally {
+        local.close();
+      }
+    });
+
+    // A broadcast that reaches a client which has just gone: the peer's reset
+    // is on the socket, the loop has not read it yet, and the send is what
+    // finds the error. The close is reported once wsSend() has returned,
+    // never from inside it: there the binding may be reading a string
+    // payload straight out of the V8 heap, and V8 ends the process if JS
+    // runs under that. The bytes payload goes first: it is not read that
+    // way, so a callback made inside the send fails this test instead.
+    //
+    // MORO_ENGINE_NOTIFY=sync is the mode in which notifications are
+    // delivered where they arise: there the close is reported from inside
+    // the send that found the reset, and the binding copies the payload
+    // first so that it may be. The test then asserts that - once, for both
+    // payload kinds, with the process still running.
+    it('a send that finds the connection reset reports the close after wsSend() has returned', T, async () => {
+      const insideSend = engine.probe().notify === 'sync';
+      let sending = false;
+      const seen = [];
+      const local = startWsServer(undefined, {
+        onWsClose: (wsId, code) => seen.push({ wsId, code, insideSend: sending }),
+      });
+      try {
+        for (const payload of [Buffer.alloc(64 * 1024, 0x61), 'a'.repeat(64 * 1024)]) {
+          const kind = typeof payload === 'string' ? 'string' : 'bytes';
+          const opened = local.events.opens.length;
+          const { client } = await connectAndHandshake(local);
+          await waitForEvent(() => local.events.opens.length > opened, { message: 'onWsOpen never fired' });
+          const { wsId } = local.events.opens.at(-1);
+          client.socket.resetAndDestroy(); // RST; over loopback it is on the server's socket when this returns
+          sending = true;
+          try {
+            engine.wsSend(wsId, payload, kind === 'bytes');
+            engine.wsSend(wsId, payload, kind === 'bytes');
+          } finally {
+            sending = false;
+          }
+          await waitForEvent(() => seen.some((e) => e.wsId === wsId), { message: `${kind}: onWsClose never fired` });
+          await delay(50);
+          assert.deepEqual(
+            seen.filter((e) => e.wsId === wsId),
+            [{ wsId, code: 1006, insideSend }],
+            `${kind}: one onWsClose(1006), delivered ${insideSend ? 'inside' : 'outside'} wsSend()`
+          );
+        }
+      } finally {
+        local.close();
+      }
+    });
+  });
+
+  // ---- Send backpressure (wsBackpressureLimit, default 1 MiB) ----
+  //
+  // The limit sheds a consumer that is not keeping up: one that still had
+  // bytes of an earlier send waiting when the next send arrived. A message
+  // larger than the limit is not, by itself, a slow consumer - it is over
+  // the limit the moment it is queued, whatever its reader does.
+
+  describe('send backpressure sheds a consumer that is not draining, not a large message', () => {
+    const MiB = 1024 * 1024;
+    // For the peers that do not read: far more than the kernel's socket
+    // buffers take on their own (a few MiB on each side at most), so most of
+    // the message is certain to be waiting in the engine's write queue.
+    const STALLED = 24 * MiB;
+
+    it('a client that is reading receives 1, 2 and 8 MiB messages and stays open', { timeout: 60000 }, async () => {
+      const results = [];
+      const local = startWsServer(undefined, {
+        onWsMessage(wsId, data) {
+          results.push(engine.wsSend(wsId, Buffer.alloc(Number(data), 0x5a), true));
+        },
+      });
+      try {
+        const { client } = await connectAndHandshake(local);
+        try {
+          for (const size of [1 * MiB, 2 * MiB, 8 * MiB, 16]) {
+            await client.sendFrame({ opcode: OP.TEXT, payload: String(size) });
+            const f = await client.nextFrame({ timeout: 30000 });
+            assert.equal(f.opcode, OP.BINARY, `${size} bytes: a ${f.opcode === OP.CLOSE ? `Close ${f.payload.readUInt16BE(0)}` : 'frame'} arrived instead of the message`);
+            assert.equal(f.payload.length, size);
+            assert.ok(f.payload.equals(Buffer.alloc(size, 0x5a)), `${size} bytes arrived intact`);
+          }
+          await delay(50); // room for a deferred shed to show up
+          assert.equal(client.remainingBytes(), 0, 'nothing follows the messages');
+          assert.equal(client.closed, false, 'the socket stays open');
+          assert.deepEqual(local.events.closes, []);
+          // wsSend() still reports a queue over the high-water mark for the
+          // large ones; the last, small one went straight out.
+          assert.equal(results.length, 4);
+          assert.equal(results[3], true);
+        } finally {
+          client.destroy();
+        }
+      } finally {
+        local.close();
+      }
+    });
+
+    it('a client that is not reading is shed with 1013 by the next send, and onWsClose fires once', { timeout: 60000 }, async () => {
+      const results = [];
+      const local = startWsServer(undefined, {
+        onWsMessage(wsId, data) {
+          if (data === 'large') results.push(engine.wsSend(wsId, Buffer.alloc(STALLED, 1), true));
+          else results.push(engine.wsSend(wsId, 'second', false), engine.wsSend(wsId, 'third', false));
+        },
+      });
+      try {
+        const { client } = await connectAndHandshake(local);
+        try {
+          client.socket.pause(); // the peer stops reading
+          await client.sendFrame({ opcode: OP.TEXT, payload: 'large' });
+          await waitForEvent(() => results.length === 1, { message: 'the large send never ran' });
+          await delay(150);
+          assert.deepEqual(local.events.closes, [], 'one message with nothing queued ahead of it does not shed the socket');
+          assert.equal(results[0], false, 'wsSend() reports the queue over the high-water mark');
+
+          // The next send finds the first still queued: the consumer is slow.
+          await client.sendFrame({ opcode: OP.TEXT, payload: 'more' });
+          await waitForEvent(() => local.events.closes.length > 0, { message: 'a consumer with unsent data was not shed by the next send' });
+          await delay(50);
+          assert.deepEqual(local.events.closes.map((c) => c.code), [1013], 'onWsClose fires once, with 1013');
+          assert.deepEqual(results, [false, false, false]);
+
+          // When the peer does read, what was queued arrives in order - the
+          // message, the send that shed the socket - ending with the Close
+          // that says why. The send after the shed was refused, not queued.
+          client.socket.resume();
+          const a = await client.nextFrame({ timeout: 30000 });
+          assert.equal(a.opcode, OP.BINARY);
+          assert.equal(a.payload.length, STALLED);
+          assert.equal((await client.nextFrame()).payload.toString(), 'second');
+          const close = await client.nextFrame();
+          assert.equal(close.opcode, OP.CLOSE);
+          assert.equal(close.payload.readUInt16BE(0), 1013);
+          await client.waitClose();
+          assert.equal(local.events.closes.length, 1);
+        } finally {
+          client.destroy();
+        }
+      } finally {
+        local.close();
+      }
+    });
+
+    // One segment of small messages, each answered with a larger one, from a
+    // peer that reads nothing: the replies stop being queued where the limit
+    // is reached. The shed itself is delivered on the next loop turn, and
+    // every reply of the read used to be queued in between - a few kilobytes
+    // sent held the product of the message count and the reply size.
+    //
+    // Under MORO_ENGINE_NOTIFY=sync the shed is not put off to the next loop
+    // turn: the send that reaches the limit closes the socket (1013) before
+    // it returns. A closed socket delivers nothing more in any mode, so the
+    // messages behind that one in the read are discarded with the
+    // connection: the handler is given none of them.
+    it('the replies to one read of small messages stop at the limit for a peer that is not reading', { timeout: 60000 }, async () => {
+      const shedInPlace = engine.probe().notify === 'sync';
+      const REPLY = 32 * 1024;
+      const COUNT = 2000; // 64 MiB of replies for 14 kB sent
+      const reply = Buffer.alloc(REPLY, 0x52);
+      let refused = 0;
+      let closedInsideSend = 0;
+      let local;
+      local = startWsServer(undefined, {
+        onWsMessage(wsId) {
+          const closesBefore = local.events.closes.length;
+          if (!engine.wsSend(wsId, reply, true)) refused++;
+          if (local.events.closes.length > closesBefore) closedInsideSend++;
+        },
+      });
+      const socket = net.connect({ host: '127.0.0.1', port: local.port });
+      try {
+        let received = 0;
+        let tail = Buffer.alloc(0);
+        await new Promise((resolve, reject) => {
+          socket.once('error', reject);
+          socket.once('connect', () => socket.write(upgradeRequest().req));
+          socket.once('data', (d) => {
+            assert.match(d.toString('latin1'), /^HTTP\/1\.1 101 /);
+            socket.pause(); // the peer stops reading
+            resolve();
+          });
+        });
+        socket.write(Buffer.concat(Array.from({ length: COUNT }, () => buildFrame({ opcode: OP.TEXT, payload: 'q' }))));
+        await waitForEvent(() => local.events.closes.length > 0, { timeout: 15000, message: 'the consumer was never shed' });
+        assert.deepEqual(local.events.closes.map((c) => c.code), [1013]);
+        if (shedInPlace) {
+          const delivered = local.events.messages.length;
+          assert.equal(closedInsideSend, 1, 'the send that reached the limit closed the socket before it returned');
+          assert.ok(refused >= 1 && refused < delivered, `sends were refused from the high-water mark on (${refused})`);
+          assert.ok(delivered > 1 && delivered < COUNT / 2, `delivery stopped at the shed (${delivered} of ${COUNT})`);
+          await delay(300);
+          assert.equal(local.events.messages.length, delivered, 'nothing is delivered on the closed socket afterwards');
+        } else {
+          assert.equal(closedInsideSend, 0, 'the shed is delivered after the read, never inside a send');
+          assert.equal(local.events.messages.length, COUNT, 'every message of the read was delivered');
+          assert.ok(refused > COUNT / 2, `most replies were refused (${refused} of ${COUNT})`);
+        }
+
+        // What the engine kept for this peer is what the peer can still read:
+        // the kernel's buffers, the limit, and little more.
+        const closed = new Promise((resolve) => socket.once('close', resolve));
+        socket.on('data', (d) => {
+          received += d.length;
+          tail = Buffer.concat([tail, d]).subarray(-4);
+        });
+        socket.on('error', () => {});
+        socket.resume();
+        await closed;
+        assert.ok(
+          received < 24 * MiB,
+          `${(received / MiB).toFixed(1)} MiB had been queued for a peer over a ${1} MiB limit (${COUNT} replies of ${REPLY} bytes)`
+        );
+        assert.deepEqual([...tail], [0x88, 0x02, 0x03, 0xf5], 'the Close(1013) is the last thing sent');
+      } finally {
+        socket.destroy();
+        local.close();
+      }
+    });
+
+    // The same segment from a peer that resets the connection behind it: the
+    // first reply finds the socket dead, and nothing is kept for it. Queued,
+    // the replies of the whole read were held until the transport reported
+    // the failed write on a later pass of the loop. (The epoll transport
+    // learns of the reset before it reads and delivers none of the burst.)
+    it('the replies to one read of small messages are not held for a peer that has reset the connection', { timeout: 60000 }, async () => {
+      const REPLY = 64 * 1024;
+      const COUNT = 4000; // 256 MiB of replies for 28 kB sent
+      const reply = Buffer.alloc(REPLY, 0x52);
+      let base = 0;
+      let peak = 0;
+      let seen = 0;
+      const local = startWsServer(undefined, {
+        onWsMessage(wsId) {
+          engine.wsSend(wsId, reply, true);
+          if ((++seen & 127) === 0) peak = Math.max(peak, process.memoryUsage().rss);
+        },
+      });
+      try {
+        const { client } = await connectAndHandshake(local);
+        const burst = Buffer.concat(Array.from({ length: COUNT }, () => buildFrame({ opcode: OP.TEXT, payload: 'q' })));
+        base = process.memoryUsage().rss;
+        client.socket.write(burst);
+        client.socket.resetAndDestroy(); // the RST is on the server's socket before the engine reads the burst
+        await waitForEvent(() => local.events.closes.length > 0, { timeout: 15000, message: 'onWsClose never fired' });
+        peak = Math.max(peak, process.memoryUsage().rss);
+        assert.deepEqual(local.events.closes.map((c) => c.code), [1006]);
+        const grew = (peak - base) / MiB;
+        assert.ok(grew < 96, `resident memory grew by ${grew.toFixed(0)} MiB answering a connection that was already reset`);
+      } finally {
+        local.close();
+      }
+    });
+
+    it('a peer that stops reading with one large message in flight is closed by responseTimeoutMs', { timeout: 60000 }, async () => {
+      let sent = null;
+      const local = startWsServer({ responseTimeoutMs: 1000 }, {
+        onWsMessage(wsId) {
+          sent = engine.wsSend(wsId, Buffer.alloc(STALLED, 2), true);
+        },
+      });
+      try {
+        const { client } = await connectAndHandshake(local);
+        try {
+          client.socket.pause();
+          await client.sendFrame({ opcode: OP.TEXT, payload: 'go' });
+          await waitForEvent(() => sent !== null, { message: 'the send never ran' });
+          const t0 = Date.now();
+          await delay(300);
+          assert.deepEqual(local.events.closes, [], 'not shed for its size');
+          // No drain progress for the whole budget: the delivery deadline
+          // closes the connection (a sweep every 500 ms at this setting).
+          await waitForEvent(() => local.events.closes.length > 0, { timeout: 8000, message: 'a stalled peer kept its message queued past the response timeout' });
+          const waited = Date.now() - t0;
+          assert.deepEqual(local.events.closes.map((c) => c.code), [1006], 'closed by the deadline, not shed with 1013');
+          assert.ok(waited >= 700 && waited < 5000, `closed after ${waited} ms`);
+          await delay(50);
+          assert.equal(local.events.closes.length, 1);
+        } finally {
+          client.destroy();
+        }
+      } finally {
+        local.close();
+      }
     });
   });
 
@@ -1046,6 +1728,129 @@ describe('@morojs/engine RFC 6455 WebSocket conformance', { skip }, () => {
       assert.equal(Buffer.compare(f.payload, payload), 0, 'large payload must round-trip byte-identical');
     } finally {
       client.destroy();
+    }
+  });
+
+  // A large message is written from the application's bytes behind a frame
+  // header of its own, not copied into a frame first: among small frames of
+  // the same read it keeps its place, and sent to a socket that is not being
+  // read it is queued whole behind what that socket already has waiting.
+  it('large and small messages in one segment echo in order', T, async () => {
+    const { client } = await connectAndHandshake(server);
+    try {
+      const sizes = [3, 40000, 17, 32768, 32767, 0, 200000, 125, 65536, 1];
+      const payloads = sizes.map((n, i) => {
+        const p = Buffer.alloc(n);
+        for (let k = 0; k < n; k++) p[k] = (k * 31 + i * 7 + 3) & 0xff;
+        return p;
+      });
+      await client.send(Buffer.concat(payloads.map((payload) => buildFrame({ opcode: OP.BINARY, payload }))));
+      for (let i = 0; i < payloads.length; i++) {
+        const f = await client.nextFrame({ timeout: 15000 });
+        assert.equal(f.opcode, OP.BINARY, `frame ${i}`);
+        assert.equal(f.payload.length, sizes[i], `frame ${i}: length`);
+        assert.ok(f.payload.equals(payloads[i]), `frame ${i}: payload must round-trip in its place`);
+      }
+    } finally {
+      client.destroy();
+    }
+  });
+
+  it('large messages sent to a socket that is not being read arrive whole and in order once it reads', { timeout: 60000 }, async () => {
+    const messages = Array.from({ length: 24 }, (_, i) => {
+      const n = i % 4 === 3 ? 50 + i : 150000 + i * 4099;
+      const p = Buffer.alloc(n);
+      for (let k = 0; k < n; k++) p[k] = (k * 17 + i * 29 + 5) & 0xff;
+      return p;
+    });
+    const ids = [];
+    const local = startWsServer({ wsBackpressureLimit: 0 }, {
+      onWsMessage(wsId) {
+        for (const other of ids) if (other !== wsId) for (const m of messages) engine.wsSend(other, m, true);
+      },
+    });
+    try {
+      const reader = await connectAndHandshake(local);
+      const writer = await connectAndHandshake(local);
+      try {
+        await waitForEvent(() => local.events.opens.length === 2);
+        for (const o of local.events.opens) ids.push(o.wsId);
+        reader.client.socket.pause();  // the kernel's buffers fill and the rest queues in the engine
+        await writer.client.sendFrame({ opcode: OP.TEXT, payload: 'go' });
+        await delay(300);
+        reader.client.socket.resume();
+        for (let i = 0; i < messages.length; i++) {
+          const f = await reader.client.nextFrame({ timeout: 30000 });
+          assert.equal(f.opcode, OP.BINARY, `message ${i}`);
+          assert.equal(f.payload.length, messages[i].length, `message ${i}: length`);
+          assert.ok(f.payload.equals(messages[i]), `message ${i}: intact and in its place`);
+        }
+      } finally {
+        reader.client.destroy();
+        writer.client.destroy();
+      }
+    } finally {
+      local.close();
+    }
+  });
+
+  // A large binary message is delivered as an ArrayBuffer over the memory it
+  // was received into. The application owns it from then on: buffers kept
+  // past the callback hold their own bytes whatever arrives afterwards, on
+  // this socket or another, whole frames or fragments.
+  it('large binary messages kept by the application keep their bytes', { timeout: 60000 }, async () => {
+    const kept = [];
+    const local = startWsServer({ wsMaxMessageSize: 8 * 1024 * 1024 }, {
+      onWsMessage(wsId, data, isBinary) {
+        if (isBinary) kept.push(data);
+        engine.wsSend(wsId, isBinary ? String(data.byteLength) : 'text', false);
+      },
+    });
+    const make = (n, seed) => {
+      const p = Buffer.alloc(n);
+      for (let k = 0; k < n; k++) p[k] = (k * 13 + seed * 31 + 7) & 0xff;
+      return p;
+    };
+    try {
+      const a = await connectAndHandshake(local);
+      const b = await connectAndHandshake(local);
+      try {
+        const sizes = [300000, 20000, 1 << 20, 17000, 70000, 16385, 100, 2 * 1024 * 1024 + 5];
+        const sent = [];
+        for (let i = 0; i < sizes.length; i++) {
+          const client = (i % 2 ? b : a).client;
+          const payload = make(sizes[i], i);
+          sent.push(payload);
+          if (i % 3 === 2) {
+            // three fragments, the middle one empty now and then
+            const cut = Math.floor(sizes[i] / 3);
+            await client.send(buildFrame({ fin: false, opcode: OP.BINARY, payload: payload.subarray(0, cut) }));
+            await client.send(buildFrame({ fin: false, opcode: OP.CONT, payload: i % 2 ? Buffer.alloc(0) : payload.subarray(cut, 2 * cut) }));
+            await client.send(buildFrame({ fin: true, opcode: OP.CONT, payload: i % 2 ? payload.subarray(cut) : payload.subarray(2 * cut) }));
+          } else {
+            await client.send(buildFrame({ opcode: OP.BINARY, payload }));
+          }
+          const f = await client.nextFrame({ timeout: 20000 });
+          assert.equal(f.payload.toString(), String(sizes[i]), `message ${i}: length seen by the handler`);
+        }
+        // A text message in between does not come as a buffer.
+        await a.client.send(buildFrame({ opcode: OP.TEXT, payload: 't'.repeat(50000) }));
+        assert.equal((await a.client.nextFrame({ timeout: 20000 })).payload.toString(), 'text');
+        assert.equal(kept.length, sizes.length);
+        for (let i = 0; i < sizes.length; i++) {
+          assert.ok(kept[i] instanceof ArrayBuffer, `message ${i} is an ArrayBuffer`);
+          assert.equal(kept[i].byteLength, sizes[i], `message ${i}: length`);
+          assert.ok(Buffer.from(kept[i]).equals(sent[i]), `message ${i}: its bytes, after everything that followed`);
+        }
+        // The buffers are the application's: writing to one changes no other.
+        new Uint8Array(kept[0]).fill(0xee);
+        for (let i = 1; i < sizes.length; i++) assert.ok(Buffer.from(kept[i]).equals(sent[i]), `message ${i} untouched`);
+      } finally {
+        a.client.destroy();
+        b.client.destroy();
+      }
+    } finally {
+      local.close();
     }
   });
 

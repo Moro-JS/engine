@@ -11,6 +11,10 @@
 // v8.setFlagsFromString so `node --test` needs no flags: code containing
 // %OptimizeFunctionOnNextCall is compiled AFTER the flag flips (new Function).
 //
+// A fast call is only ever made from optimised code, so (2)-(4) need V8's
+// optimising compiler. Where V8 runs without it the three tests skip and say
+// so (see `optimiser` below); (1) and the kill-switch test still run.
+//
 // Run with: node --test
 
 // Must be set before the addon loads (helpers' loadEngine imports lazily).
@@ -36,7 +40,6 @@ const T = { timeout: 60000 };
 // plain callbacks are installed instead: the fast-path assertions are skipped
 // with the reason, and the install test checks the reason matches the env.
 const fastOn = !!info?.fastApi?.installed;
-const TF = { ...T, skip: fastOn ? false : `fast calls not installed (${info?.fastApi?.reason}) - fast-path assertions skipped` };
 const CRLF = '\r\n';
 const ENGINE_ENTRY = new URL('../packages/engine/index.mjs', import.meta.url).href;
 
@@ -54,6 +57,39 @@ const makeOptimised = (paramNames, body) =>
   `
   );
 const optimise = new Function('f', '%OptimizeFunctionOnNextCall(f);');
+
+// Whether this V8 optimises at all, asked of V8 itself with two functions that
+// have nothing to do with the engine: one is forced through the optimiser, its
+// twin is only called. Where the optimiser runs they end up with different
+// status words; where it does not, the forcing is a no-op and the words are
+// the same. (They are compared, not decoded: the bit layout of the status
+// word changes between V8 versions.) There is no optimiser under --no-opt or
+// --jitless, nor where V8 switches TurboFan off by itself at start-up because
+// the CPU lacks an instruction set it needs - an x86-64 node under Rosetta
+// (linux/amd64 containers on Apple silicon) lists `--no-turbofan` as the
+// default in `node --v8-options`. Every call then goes through the regular
+// callback, and "the fast counter went up" would fail for a reason that is
+// V8's, not the engine's.
+const optimiser = new Function(`
+  function forced(a) { return a + 1; }
+  function twin(a) { return a + 1; }
+  %PrepareFunctionForOptimization(forced);
+  %PrepareFunctionForOptimization(twin);
+  forced(1); forced(2);
+  twin(1); twin(2);
+  %OptimizeFunctionOnNextCall(forced);
+  forced(3);
+  twin(3);
+  return %GetOptimizationStatus(forced) !== %GetOptimizationStatus(twin);
+`)();
+const TF = {
+  ...T,
+  skip: !fastOn
+    ? `fast calls not installed (${info?.fastApi?.reason}) - fast-path assertions skipped`
+    : !optimiser
+      ? 'this V8 runs without its optimising compiler (TurboFan off: an emulated CPU, --no-opt or --jitless), so no caller can take a fast path - fast-path assertions skipped'
+      : false,
+};
 
 const stats = () => engine.probe().fastCallStats;
 

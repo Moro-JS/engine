@@ -24,6 +24,7 @@ import {
   sslInlineOptions,
   openRawTls,
   rawTlsRequest,
+  clientCertOptions,
 } from './tls-helpers.mjs';
 
 const engine = await loadEngine();
@@ -178,4 +179,53 @@ describe('@morojs/engine TLS reload (updateSsl)', { skip }, () => {
       server.close();
     }
   });
+
+  // The ticket keys carry over, the client-certificate policy does not: a
+  // session whose certificate was verified against the CA the update removed
+  // would otherwise keep resuming, with no certificate asked for, until its
+  // ticket ran out.
+  for (const version of ['TLSv1.3', 'TLSv1.2']) {
+    it(`a session verified against a client CA the update replaced is not resumed (${version})`, T, async () => {
+      const only = { minVersion: version, maxVersion: version, ...clientCertOptions() };
+      const guarded = (ca) => ({ ...sslInlineOptions(), requestCert: true, rejectUnauthorized: true, ca: fixturePem(ca) });
+      const server = await startFixtureServer(engine, ok, {
+        ssl: { ...guarded('client-ca.pem'), ticketKeys: crypto.randomBytes(48) },
+      });
+      const attempt = async (session) => {
+        try {
+          const c = await openRawTls(server.port, { session, tls: only });
+          try {
+            await c.send(GET());
+            return parseResponse(await c.read()).status === 200;
+          } finally {
+            c.destroy();
+          }
+        } catch {
+          return false;
+        }
+      };
+      try {
+        const first = await openRawTls(server.port, { tls: only });
+        const session = await first.waitSession(GET());
+        first.destroy();
+        assert.ok(session, 'server issued a session ticket');
+
+        // The same policy again (a certificate rotation): the session lives on.
+        engine.updateSsl(server.serverId, { ...guarded('client-ca.pem'), key: fixturePem('alt.key'), cert: fixturePem('alt.pem') });
+        const kept = await openRawTls(server.port, { session, rejectUnauthorized: false, tls: only });
+        assert.equal(kept.socket.isSessionReused(), true);
+        kept.destroy();
+
+        // The client CA replaced: the client's certificate is no longer
+        // accepted, with its old session or without.
+        engine.updateSsl(server.serverId, guarded('client-ca2.pem'));
+        const before = server.requests.length;
+        assert.equal(await attempt(undefined), false, 'a full handshake under the new CA');
+        assert.equal(await attempt(session), false, 'the session from before the update');
+        assert.equal(server.requests.length, before);
+      } finally {
+        server.close();
+      }
+    });
+  }
 });

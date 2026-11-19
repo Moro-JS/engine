@@ -8,6 +8,8 @@
 //     exactly once, in submission order
 //   - the ring never hands out more than sqEntries SQEs without an enter
 //   - CQ overflow loses nothing and preserves order across the drain
+//   - forEachUnsubmitted reports exactly the SQEs the kernel has not
+//     consumed, oldest first
 //   - the provided-buffer ring's tail only ever advances by the buffers
 //     pushed, and at(bid) stays inside the mapping
 //
@@ -123,6 +125,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
       }
       default:
         break;
+    }
+    // What the kernel has not taken is the last pending() SQEs handed out.
+    {
+      unsigned n = 0;
+      uint64_t expect = nextId - ring.pending();
+      ring.forEachUnsubmitted([&](const abi::io_uring_sqe& s) {
+        if (s.user_data != expect++) std::abort();
+        n++;
+      });
+      if (n != ring.pending()) std::abort();
     }
   }
 

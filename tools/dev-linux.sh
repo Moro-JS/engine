@@ -23,7 +23,7 @@ SETUP='apt-get update -qq >/dev/null && apt-get install -y -qq clang lld llvm cu
 SECCOMP=(--security-opt seccomp=unconfined)
 while [ $# -gt 0 ]; do
   case "$1" in
-    --musl) IMAGE=node:24-alpine; SETUP='apk add --no-cache build-base clang lld llvm curl zlib-dev openssl-dev cmake git linux-headers >/dev/null'; shift ;;
+    --musl) IMAGE=node:24-alpine; SETUP='apk add --no-cache build-base clang compiler-rt lld llvm curl zlib-dev openssl-dev cmake git linux-headers >/dev/null'; shift ;;
     --seccomp-default) SECCOMP=(); shift ;;
     --) shift; break ;;
     *) break ;;

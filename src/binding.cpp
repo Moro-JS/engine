@@ -14,6 +14,11 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#if defined(_MSC_VER)
+#include <intrin.h>  // _AddressOfReturnAddress
+#endif
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -87,6 +92,16 @@ struct JsServer {
   // Set by the environment cleanup hook: the isolate is being torn down and
   // JS may no longer run, so every callback into JS becomes a no-op.
   bool tearingDown = false;
+  // onRequest, onRequestBatch, onAborted and onWritable were handed to
+  // serve() wrapped in the loader's trampolines (packages/engine/index.js,
+  // "dispatch trampolines"): they catch and report what the application's
+  // callback throws, and the batch one says when JS has left its loop, so
+  // these are entered through node::MakeCallback (see invokeJs).
+  bool viaTrampoline = false;
+  // A dispatch that starts below this stack address starts deep in the
+  // stack, far below where the event loop calls in (see
+  // dispatchesFromDeepStack). Set by serve().
+  uintptr_t deepDispatchBelow = 0;
   // When the cleanup hook is waiting for this server to finish closing, it
   // points here so freeJsServer can report completion.
   bool* closedFlag = nullptr;
@@ -96,14 +111,14 @@ struct JsServer {
   // <= kPathCacheMaxLen are cached and at most kPathCacheMaxEntries live here
   // (past the cap, requests simply build the string per-call as before), so
   // an adversary spraying unique URLs can't grow it. Freed with the JsServer.
-  std::unordered_map<std::string, Global<String>> pathCache;
+  StringMap<Global<String>> pathCache;
   static constexpr size_t kPathCacheMaxEntries = 512;
   static constexpr size_t kPathCacheMaxLen = 128;
   // Same idea for request header NAMES (getHeaders/getHeader hot path when
   // apps read req.headers): a bounded set in practice (host, accept, ...),
   // so intern them instead of a String::NewFromUtf8 per name per request.
   // Values are never cached - they vary per request. Same lifetime story.
-  std::unordered_map<std::string, Global<String>> headerNameCache;
+  StringMap<Global<String>> headerNameCache;
   static constexpr size_t kHeaderNameCacheMaxEntries = 256;
   static constexpr size_t kHeaderNameCacheMaxLen = 64;
 
@@ -112,14 +127,21 @@ struct JsServer {
   // advances as slots complete (Server::setBatchControl), and the path table
   // JS indexes with pathIdx (the interned strings of pathCache; a path the
   // cache will not hold is kNoPathIdx and JS asks getPath(reqId)). V8-owned
-  // ArrayBuffers: their storage never moves, so the raw pointers below stay
-  // valid for the server's lifetime.
+  // ArrayBuffers: their storage never moves, and the server holds it too
+  // (batchDescStore/batchCtlStore), so the raw pointers below stay valid for
+  // the server's lifetime.
   Global<ArrayBuffer> batchDesc;
   Global<ArrayBuffer> batchCtl;
   Global<Array> batchPaths;
+  // The storage itself, held here as well: JS can take it away from the two
+  // ArrayBuffers (ArrayBuffer.prototype.transfer, a transfer list), and the
+  // pointers below must stay good for as long as the server writes through
+  // them, whoever else still owns the bytes by then.
+  std::shared_ptr<BackingStore> batchDescStore;
+  std::shared_ptr<BackingStore> batchCtlStore;
   uint32_t* desc = nullptr;
   uint32_t* ctl = nullptr;
-  std::unordered_map<std::string, uint32_t> pathIndex;
+  StringMap<uint32_t> pathIndex;
   static constexpr uint32_t kNoPathIdx = 0xFFFFFFFFu;
 };
 
@@ -127,8 +149,8 @@ struct JsServer {
 // HttpLimits::reusePort) runs one engine per thread, each with its own uv loop
 // and servers, and a serverId only ever crosses the JS<->C++ boundary on the
 // thread that created it - per-thread registries are race-free without locks.
-static thread_local std::unordered_map<uint32_t, JsServer*> g_servers;
-static thread_local uint32_t g_serverIdCounter = 0;
+// The servers created on this thread and the id counter for them live in the
+// thread's ThreadState (thread_state.h), with everything else per thread.
 
 // Notification delivery mode (see Server::setDeferredNotify). Read once from
 // MORO_ENGINE_NOTIFY in Initialize; process-wide because the environment is.
@@ -153,9 +175,7 @@ static void cleanupJsServer(void* arg);
 // every server closes and reaps its cancel/close completions through the
 // ring first; then the ring's poll/prepare handles and mappings go.
 static void cleanupUringLoop(void*) { Server::UringLoop::shutdownForThread(); }
-static thread_local bool g_uringHookRegistered = false;
 static void cleanupEpollLoop(void*) { Server::EpollLoop::shutdownForThread(); }
-static thread_local bool g_epollHookRegistered = false;
 #endif
 
 // Invoked by Server once it is fully closed and self-deleted. Releases the
@@ -168,7 +188,7 @@ static void freeJsServer(void* user) {
   // is currently running (the teardown path) is a no-op in Node.
   node::RemoveEnvironmentCleanupHook(js->isolate, cleanupJsServer, js);
   if (js->closedFlag) *js->closedFlag = true;
-  g_servers.erase(js->id);
+  threadState().servers.erase(js->id);
   delete js;
 }
 
@@ -196,10 +216,10 @@ static void cleanupJsServer(void* arg) {
 }
 
 // Reverse lookup for binding functions that only hold a Connection (e.g.
-// getHeaders): g_servers is tiny (one entry per serve() on this thread), so
+// getHeaders): the thread's servers are few (one entry per serve() on it), so
 // a scan beats storing a back-pointer on every connection.
 static JsServer* jsServerFor(const Server* srv) {
-  for (auto& [id, js] : g_servers)
+  for (auto& [id, js] : threadState().servers)
     if (js->server == srv) return js;
   return nullptr;
 }
@@ -210,7 +230,7 @@ static JsServer* jsServerFor(const Server* srv) {
 // fails only past V8's string-length cap (~512MB, reachable when an operator
 // raises a size limit that far) or under allocation pressure - degrade to an
 // empty string instead of aborting the whole Node process.
-static Local<String> str(Isolate* iso, const std::string& s) {
+static Local<String> str(Isolate* iso, std::string_view s) {
   Local<String> out;
   // NewFromUtf8's length is an int. A string past INT_MAX (reachable only when
   // an operator raises a size limit past 2 GiB) would cast negative - V8 then
@@ -218,7 +238,7 @@ static Local<String> str(Isolate* iso, const std::string& s) {
   // wrap to a small positive length (silent truncation). Guard before the
   // cast; degrade to an empty string, the same fallback as a NewFromUtf8 fail.
   if (s.size() > static_cast<size_t>(INT_MAX)) return String::Empty(iso);
-  if (String::NewFromUtf8(iso, s.c_str(), v8::NewStringType::kNormal,
+  if (String::NewFromUtf8(iso, s.data(), v8::NewStringType::kNormal,
                           static_cast<int>(s.size()))
           .ToLocal(&out))
     return out;
@@ -255,24 +275,24 @@ static bool readAsciiOneByte(Isolate* iso, Local<String> str8,
 // std::string per response (heap-allocating past SSO for even one header).
 // buildHeaders can run arbitrary JS (array index getters / valueOf), which
 // can re-enter respond(); nested calls get a plain local so the outer block
-// is never clobbered. thread_local by the same ownership rules as the
-// registries. Plain std::string, so thread-exit destruction never touches V8.
-static thread_local std::string g_headerBlock;
-static thread_local bool g_headerBlockInUse = false;
+// is never clobbered. Per thread (ThreadState) by the same ownership rules as
+// the registries. Plain std::string, so thread-exit destruction never touches
+// V8.
 class HeaderBlockLease {
  public:
   HeaderBlockLease() {
-    if (!g_headerBlockInUse) {
-      g_headerBlockInUse = true;
+    ThreadState& t = threadState();
+    if (!t.headerBlockInUse) {
+      t.headerBlockInUse = true;
       owned_ = true;
-      g_headerBlock.clear();
-      block_ = &g_headerBlock;
+      t.headerBlock.clear();
+      block_ = &t.headerBlock;
     } else {
       block_ = &local_;
     }
   }
   ~HeaderBlockLease() {
-    if (owned_) g_headerBlockInUse = false;
+    if (owned_) threadState().headerBlockInUse = false;
   }
   std::string& get() { return *block_; }
 
@@ -285,9 +305,6 @@ class HeaderBlockLease {
 // Same pattern for the two small buildHeaders scratch strings (name/value
 // per pair). These never hold state across a JS call within one pair, but
 // buildHeaders itself nests via getters - the lease keeps nesting correct.
-static thread_local std::string g_hdrKeyScratch;
-static thread_local std::string g_hdrValScratch;
-static thread_local bool g_hdrScratchInUse = false;
 
 // Borrowed, zero-copy view of a JS value's bytes (string | ArrayBuffer |
 // TypedArray | DataView). A string's UTF-8 lives in the owned Utf8Value
@@ -310,8 +327,6 @@ static thread_local bool g_hdrScratchInUse = false;
 // a JS call (each binding entry point builds headers FIRST, then the body,
 // then hands both to the server synchronously), but the in-use flag makes
 // nesting fall back to Utf8Value rather than assume that.
-static thread_local std::string g_byteScratch;
-static thread_local bool g_byteScratchInUse = false;
 
 class ByteSource {
  public:
@@ -330,11 +345,11 @@ class ByteSource {
       if (!borrow) {
         // Copy path (see above): the same malloc-free ASCII fast copy the
         // pre-ValueView V8s use, else Utf8Value.
-        if (!g_byteScratchInUse && readAsciiOneByte(iso, s, g_byteScratch, 65536)) {
-          g_byteScratchInUse = true;
+        if (!threadState().byteScratchInUse && readAsciiOneByte(iso, s, threadState().byteScratch, 65536)) {
+          threadState().byteScratchInUse = true;
           usedScratch_ = true;
-          data_ = g_byteScratch.data();
-          size_ = g_byteScratch.size();
+          data_ = threadState().byteScratch.data();
+          size_ = threadState().byteScratch.size();
           valid_ = true;
           return;
         }
@@ -365,13 +380,13 @@ class ByteSource {
             valid_ = true;
             return;
           }
-          if (!g_byteScratchInUse) {
-            g_byteScratchInUse = true;
+          if (!threadState().byteScratchInUse) {
+            threadState().byteScratchInUse = true;
             usedScratch_ = true;
-            text::latin1ToUtf8(p, n, g_byteScratch);
+            text::latin1ToUtf8(p, n, threadState().byteScratch);
             view_.reset();
-            data_ = g_byteScratch.data();
-            size_ = g_byteScratch.size();
+            data_ = threadState().byteScratch.data();
+            size_ = threadState().byteScratch.size();
             valid_ = true;
             return;
           }
@@ -381,11 +396,11 @@ class ByteSource {
 #else
       // Node 20/22 (V8 < 12.9, no ValueView): malloc-free copy for ASCII
       // one-byte strings up to 64 KiB; larger or non-ASCII take Utf8Value.
-      if (!g_byteScratchInUse && readAsciiOneByte(iso, s, g_byteScratch, 65536)) {
-        g_byteScratchInUse = true;
+      if (!threadState().byteScratchInUse && readAsciiOneByte(iso, s, threadState().byteScratch, 65536)) {
+        threadState().byteScratchInUse = true;
         usedScratch_ = true;
-        data_ = g_byteScratch.data();
-        size_ = g_byteScratch.size();
+        data_ = threadState().byteScratch.data();
+        size_ = threadState().byteScratch.size();
         valid_ = true;
         return;
       }
@@ -422,8 +437,8 @@ class ByteSource {
     if (usedScratch_) {
       // Don't let one huge non-ASCII body pin its capacity for the thread's
       // lifetime (same 64 KiB watermark as the engine's own scratch buffers).
-      if (g_byteScratch.capacity() > 65536) std::string().swap(g_byteScratch);
-      g_byteScratchInUse = false;
+      if (threadState().byteScratch.capacity() > 65536) std::string().swap(threadState().byteScratch);
+      threadState().byteScratchInUse = false;
     }
   }
   ByteSource(const ByteSource&) = delete;
@@ -513,16 +528,83 @@ static void buildHeaders(Isolate* iso, Local<Context> ctx, Local<Value> v,
   uint32_t n = arr->Length();
   // Scratch lease: the Get()s below can run JS (element getters), which can
   // re-enter respond() and therefore this function - nested calls get plain
-  // locals so the outer pair is never clobbered.
+  // locals so the outer pair is never clobbered. Taken at the first pair
+  // that needs it: the usual pair, below, is read straight into the block.
   std::string localK, localV;
-  const bool ownScratch = !g_hdrScratchInUse;
-  if (ownScratch) g_hdrScratchInUse = true;
-  std::string& kbuf = ownScratch ? g_hdrKeyScratch : localK;
-  std::string& vbuf = ownScratch ? g_hdrValScratch : localV;
+  bool ownScratch = false;
+  std::string* kbufp = nullptr;
+  std::string* vbufp = nullptr;
   for (uint32_t i = 0; i + 1 < n; i += 2) {
     Local<Value> kv, vv;
     if (!arr->Get(ctx, i).ToLocal(&kv)) continue;
     if (!arr->Get(ctx, i + 1).ToLocal(&vv)) continue;
+    // The usual pair - two one-byte strings, the value plain ASCII - is
+    // written where it will stand in the block and checked there, by the
+    // same rules as below with the same result: a name that is not a token
+    // or a value with a control byte drops the pair, the headers the engine
+    // owns are dropped, Content-Length is parsed and never copied. No JS
+    // runs between the two reads. Anything else (a two-byte string, a value
+    // with bytes to be encoded as UTF-8, a value that is not a string, a
+    // length past what the scratch path takes) is left to the code below.
+    if (kv->IsString() && vv->IsString() && kv.As<String>()->IsOneByte() &&
+        vv.As<String>()->IsOneByte()) {
+      const int kLen = kv.As<String>()->Length();
+      const int vLen = vv.As<String>()->Length();
+      if (kLen > 0 && kLen <= 4096 && vLen >= 0 && vLen <= 65536) {
+        const size_t at = block.size();
+        const size_t kn = static_cast<size_t>(kLen), vn = static_cast<size_t>(vLen);
+        block.resize(at + kn + vn + 4);
+        char* const name = &block[at];
+        char* const value = name + kn + 2;
+        v8compat::writeOneByte(iso, kv.As<String>(), reinterpret_cast<uint8_t*>(name),
+                               static_cast<uint32_t>(kn));
+        v8compat::writeOneByte(iso, vv.As<String>(), reinterpret_cast<uint8_t*>(value),
+                               static_cast<uint32_t>(vn));
+        if (text::isAscii(reinterpret_cast<const uint8_t*>(value), vn)) {
+          bool keep = validValueBytes(reinterpret_cast<const unsigned char*>(value), vn);
+          for (size_t j = 0; keep && j < kn; ++j) keep = isTokenChar(static_cast<unsigned char>(name[j]));
+          if (keep) {
+            switch (kn) {
+              case 4: keep = !headerNameIs(name, kLen, "date"); break;
+              case 10: keep = !headerNameIs(name, kLen, "connection") && !headerNameIs(name, kLen, "keep-alive"); break;
+              case 17: keep = !headerNameIs(name, kLen, "transfer-encoding"); break;
+              case 14:
+                if (headerNameIs(name, kLen, "content-length")) {
+                  long long parsed = 0;
+                  bool ok = vn > 0 && vn <= 18;
+                  for (size_t j = 0; ok && j < vn; ++j) {
+                    const char d = value[j];
+                    if (d < '0' || d > '9') ok = false;
+                    else parsed = parsed * 10 + (d - '0');
+                  }
+                  if (ok) customCL = parsed;
+                  keep = false;
+                }
+                break;
+              default: break;
+            }
+          }
+          if (keep) {
+            name[kn] = ':';
+            name[kn + 1] = ' ';
+            value[vn] = '\r';
+            value[vn + 1] = '\n';
+          } else {
+            block.resize(at);
+          }
+          continue;
+        }
+        block.resize(at);
+      }
+    }
+    if (kbufp == nullptr) {
+      ownScratch = !threadState().hdrScratchInUse;
+      if (ownScratch) threadState().hdrScratchInUse = true;
+      kbufp = ownScratch ? &threadState().hdrKeyScratch : &localK;
+      vbufp = ownScratch ? &threadState().hdrValScratch : &localV;
+    }
+    std::string& kbuf = *kbufp;
+    std::string& vbuf = *vbufp;
     // Malloc-free one-byte read for plain-ASCII strings (the overwhelmingly
     // common case for header names and values); String::Utf8Value otherwise,
     // which also preserves ToString coercion for non-string values. `kd`/`vd`
@@ -585,12 +667,31 @@ static void buildHeaders(Isolate* iso, Local<Context> ctx, Local<Value> v,
     if (vd) block.append(vd, static_cast<size_t>(vn));
     block.append("\r\n");
   }
-  if (ownScratch) g_hdrScratchInUse = false;
+  if (ownScratch) threadState().hdrScratchInUse = false;
 }
 
 // ---- Server-side callbacks that trampoline into JS ----
 
 static void reportCaught(Isolate* iso, TryCatch& tc, const char* where);
+
+// Print "[morojs-engine] <where> threw: <the value as a string>". The string
+// is the value's own (String(value)), unless producing it fails - a toString
+// that throws, a Symbol, no stack left to call toString with - in which case
+// it is V8's description of the value, made without running JavaScript.
+// (Utf8Value catches what the conversion throws: nothing is left behind.)
+static void printThrown(Isolate* iso, Local<Value> value, const char* where) {
+  String::Utf8Value msg(iso, value);
+  if (*msg != nullptr) {
+    fprintf(stderr, "[morojs-engine] %s threw: %s\n", where, *msg);
+    return;
+  }
+  if (iso->IsExecutionTerminating()) return;
+  String::Utf8Value described(iso, v8::Exception::CreateMessage(iso, value)->Get());
+  const char* s = *described != nullptr ? *described : "(unprintable value)";
+  static constexpr char kUncaught[] = "Uncaught ";
+  if (std::strncmp(s, kUncaught, sizeof(kUncaught) - 1) == 0) s += sizeof(kUncaught) - 1;
+  fprintf(stderr, "[morojs-engine] %s threw: %s\n", where, s);
+}
 
 // Every trampoline into JS runs inside a Node callback scope - the scope Node
 // itself opens around its own I/O callbacks. When the OUTERMOST scope closes,
@@ -607,9 +708,71 @@ inline CallbackScopeFor::CallbackScopeFor(JsServer* js, Isolate* iso)
             js->asyncResource.IsEmpty() ? Object::New(iso) : js->asyncResource.Get(iso),
             node::async_context{0, 0}) {}
 
-static void invokeJs(JsServer* js, Global<Function>& fn, uint32_t reqId,
-                     bool withExtra, int32_t methodIdx, const std::string& path) {
-  if (fn.IsEmpty() || js->tearingDown) return;
+// The path argument of onRequest: the interned string when the path is one
+// the cache holds or can take (see JsServer).
+static Local<String> pathStringFor(JsServer* js, Isolate* iso, const std::string& path) {
+  if (path.size() > JsServer::kPathCacheMaxLen) return str(iso, path);
+  if (Global<String>* cached = js->pathCache.find(path)) return cached->Get(iso);
+  Local<String> pathStr = str(iso, path);
+  if (js->pathCache.size() < JsServer::kPathCacheMaxEntries) {
+    js->pathCache.insert(path, Global<String>(iso, pathStr));
+  }
+  return pathStr;
+}
+
+// A callback the loader wrapped in a trampoline (JsServer::viaTrampoline) is
+// entered through node::MakeCallback: the same callback scope as
+// CallbackScopeFor - the server's resource object, the nextTick queue and the
+// microtasks drained when the outermost scope closes - kept on the stack,
+// where node::CallbackScope allocates one per call. No TryCatch here: what
+// the application's callback throws is caught and reported by the trampoline
+// (JavaScript; ReportCaught prints it), before the scope closes, and what a
+// nextTick callback or a microtask throws while the scope closes is the
+// process's uncaught exception, as it is under a CallbackScope.
+//
+// That leaves one way for an exception to reach the code that called into the
+// engine: the trampoline itself failing to start, for want of stack. Not
+// possible from the event loop, which calls in near the top of the stack; it
+// is from JavaScript running deep in it - a close(), say, that delivers
+// onAborted in place from a deeply recursive caller. A dispatch that starts
+// well below where the loop calls in therefore takes the path below,
+// trampoline or not: its own callback scope and TryCatch around a plain call.
+// "Well below" is measured from where serve() was called - JavaScript, so at
+// or below the depth the event loop calls in from - and fixed then: the test
+// is one load and a compare per dispatch.
+static constexpr uintptr_t kDeepDispatchBytes = 64 * 1024;
+// (The stack pointer itself where it can be read directly: taking the frame
+// address instead makes the compiler set up the whole frame on entry to the
+// function that asks, early returns included.)
+static inline uintptr_t stackPosition() {
+#if defined(_MSC_VER)
+  return reinterpret_cast<uintptr_t>(_AddressOfReturnAddress());
+#elif defined(__aarch64__)
+  uintptr_t sp;
+  __asm__("mov %0, sp" : "=r"(sp));
+  return sp;
+#elif defined(__x86_64__)
+  uintptr_t sp;
+  __asm__("mov %%rsp, %0" : "=r"(sp));
+  return sp;
+#else
+  return reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+#endif
+}
+static inline bool dispatchesFromDeepStack(JsServer* js) {
+  const bool deep = stackPosition() < js->deepDispatchBelow;  // stacks grow down on every target
+#if defined(__GNUC__)
+  return __builtin_expect(deep, 0);
+#else
+  return deep;
+#endif
+}
+
+// A call inside the engine's own callback scope and TryCatch: every call
+// when the callbacks are not the loader's trampolines, and a trampoline call
+// that starts deep in the stack (see dispatchesFromDeepStack).
+MORO_NOINLINE static void invokeUnderScope(JsServer* js, Global<Function>& fn, uint32_t reqId,
+                                           bool withExtra, int32_t methodIdx, const std::string& path) {
   Isolate* iso = js->isolate;
   HandleScope scope(iso);
   Local<Context> ctx = js->context.Get(iso);
@@ -619,21 +782,7 @@ static void invokeJs(JsServer* js, Global<Function>& fn, uint32_t reqId,
 
   Local<Function> f = fn.Get(iso);
   if (withExtra) {
-    // Serve the path from the interned cache when possible (see JsServer).
-    Local<String> pathStr;
-    if (path.size() <= JsServer::kPathCacheMaxLen) {
-      auto it = js->pathCache.find(path);
-      if (it != js->pathCache.end()) {
-        pathStr = it->second.Get(iso);
-      } else {
-        pathStr = str(iso, path);
-        if (js->pathCache.size() < JsServer::kPathCacheMaxEntries) {
-          js->pathCache.emplace(path, Global<String>(iso, pathStr));
-        }
-      }
-    } else {
-      pathStr = str(iso, path);
-    }
+    Local<String> pathStr = pathStringFor(js, iso, path);
     Local<Value> argv[3] = {
         Integer::NewFromUnsigned(iso, reqId),
         Integer::New(iso, methodIdx),
@@ -645,11 +794,29 @@ static void invokeJs(JsServer* js, Global<Function>& fn, uint32_t reqId,
     if (f->Call(ctx, ctx->Global(), 1, argv).IsEmpty()) { /* threw: reported below */ }
   }
   // Swallow handler exceptions - one bad request must not tear down the loop.
-  if (tryCatch.HasCaught()) {
-    // Report to stderr for diagnostics.
-    String::Utf8Value msg(iso, tryCatch.Exception());
-    if (*msg) fprintf(stderr, "[morojs-engine] handler threw: %s\n", *msg);
+  // (Not an exception: the isolate being terminated under the handler, which
+  // is how a worker thread ends. There is nothing to report then.)
+  reportCaught(iso, tryCatch, "handler");
+}
+
+static void invokeJs(JsServer* js, Global<Function>& fn, uint32_t reqId,
+                     bool withExtra, int32_t methodIdx, const std::string& path) {
+  if (fn.IsEmpty() || js->tearingDown) return;
+  if (!js->viaTrampoline || dispatchesFromDeepStack(js)) {
+    invokeUnderScope(js, fn, reqId, withExtra, methodIdx, path);
+    return;
   }
+  Isolate* iso = js->isolate;
+  HandleScope scope(iso);
+  Local<Value> argv[3] = {Integer::NewFromUnsigned(iso, reqId), Local<Value>(), Local<Value>()};
+  int argc = 1;
+  if (withExtra) {
+    argv[1] = Integer::New(iso, methodIdx);
+    argv[2] = pathStringFor(js, iso, path);
+    argc = 3;
+  }
+  (void)node::MakeCallback(iso, js->asyncResource.Get(iso), fn.Get(iso), argc, argv,
+                           node::async_context{0, 0});
 }
 
 static void cbOnRequest(void* user, Connection* c) {
@@ -661,40 +828,47 @@ static void cbOnRequest(void* user, Connection* c) {
 
 // The batch buffers, created on first need (getBatchBuffers() or the first
 // batch) and handed to the engine as its control cell.
-static void ensureBatchBuffers(JsServer* js, Isolate* iso, Local<Context> ctx) {
-  if (js->desc) return;
+// (Out of line: every batch call asks, and only the first one per server
+// comes here.)
+MORO_NOINLINE static void createBatchBuffers(JsServer* js, Isolate* iso);
+static inline void ensureBatchBuffers(JsServer* js, Isolate* iso, Local<Context> ctx) {
+  (void)ctx;
+  if (!js->desc) createBatchBuffers(js, iso);
+}
+MORO_NOINLINE static void createBatchBuffers(JsServer* js, Isolate* iso) {
+  Context::Scope ctxScope(js->context.Get(iso));
   Local<ArrayBuffer> d = ArrayBuffer::New(iso, 3 * Server::kMaxStaged * sizeof(uint32_t));
   Local<ArrayBuffer> c = ArrayBuffer::New(iso, sizeof(uint32_t));
   Local<Array> paths = Array::New(iso, static_cast<int>(JsServer::kPathCacheMaxEntries));
   js->batchDesc.Reset(iso, d);
   js->batchCtl.Reset(iso, c);
   js->batchPaths.Reset(iso, paths);
-  js->desc = static_cast<uint32_t*>(d->Data());
-  js->ctl = static_cast<uint32_t*>(c->Data());
+  js->batchDescStore = d->GetBackingStore();
+  js->batchCtlStore = c->GetBackingStore();
+  js->desc = static_cast<uint32_t*>(js->batchDescStore->Data());
+  js->ctl = static_cast<uint32_t*>(js->batchCtlStore->Data());
   std::memset(js->desc, 0, 3 * Server::kMaxStaged * sizeof(uint32_t));
   *js->ctl = 0;
   if (js->server) js->server->setBatchControl(js->ctl);
-  (void)ctx;
 }
 
 // Index of `path` in the JS path table (interning it on first sight, under
 // the same bounds as pathCache), or kNoPathIdx when it is not cacheable.
 static uint32_t pathIndexFor(JsServer* js, Isolate* iso, Local<Context> ctx, const std::string& path) {
   if (path.size() > JsServer::kPathCacheMaxLen) return JsServer::kNoPathIdx;
-  auto it = js->pathIndex.find(path);
-  if (it != js->pathIndex.end()) return it->second;
+  if (const uint32_t* known = js->pathIndex.find(path)) return *known;
   if (js->pathIndex.size() >= JsServer::kPathCacheMaxEntries) return JsServer::kNoPathIdx;
+  Context::Scope ctxScope(ctx);
   const uint32_t idx = static_cast<uint32_t>(js->pathIndex.size());
   Local<String> pathStr;
-  auto cached = js->pathCache.find(path);
-  if (cached != js->pathCache.end()) {
-    pathStr = cached->second.Get(iso);
+  if (Global<String>* cached = js->pathCache.find(path)) {
+    pathStr = cached->Get(iso);
   } else {
     pathStr = str(iso, path);
-    if (js->pathCache.size() < JsServer::kPathCacheMaxEntries) js->pathCache.emplace(path, Global<String>(iso, pathStr));
+    if (js->pathCache.size() < JsServer::kPathCacheMaxEntries) js->pathCache.insert(path, Global<String>(iso, pathStr));
   }
   (void)js->batchPaths.Get(iso)->Set(ctx, idx, pathStr).FromMaybe(false);
-  js->pathIndex.emplace(path, idx);
+  js->pathIndex.insert(path, idx);
   return idx;
 }
 
@@ -702,14 +876,10 @@ static uint32_t pathIndexFor(JsServer* js, Isolate* iso, Local<Context> ctx, con
 // 1..count-1 its staged ring in order. JS returns after answering the slots
 // it could answer synchronously (the engine tracks that itself through the
 // control cell and c->active, so the return value is not load-bearing).
-static void cbOnRequestBatch(void* user, Connection* c, uint32_t count) {
-  JsServer* js = static_cast<JsServer*>(user);
-  if (js->tearingDown || js->onRequestBatch.IsEmpty()) return;
-  Isolate* iso = js->isolate;
-  HandleScope scope(iso);
-  Local<Context> ctx = js->context.Get(iso);
-  Context::Scope ctxScope(ctx);
-  CallbackScopeFor cb(js, iso);
+// The batch descriptors of `c` and its staged requests (or of an HTTP/2
+// batch), filled in for JS. Returns the count, capped at the ring's size.
+static inline uint32_t fillBatchDescriptors(JsServer* js, Isolate* iso, Local<Context> ctx, Connection* c,
+                                            uint32_t count) {
   ensureBatchBuffers(js, iso, ctx);
   if (count > Server::kMaxStaged) count = Server::kMaxStaged;
   uint32_t* d = js->desc;
@@ -732,10 +902,60 @@ static void cbOnRequestBatch(void* user, Connection* c, uint32_t count) {
       d[3 * k + 2] = pathIndexFor(js, iso, ctx, sr.path);
     }
   }
-  TryCatch tryCatch(iso);
+  return count;
+}
+
+// A batch call inside the engine's own callback scope and TryCatch: every
+// call when the callbacks are not the loader's trampolines, and a trampoline
+// call that starts deep in the stack (see dispatchesFromDeepStack), whose
+// _batchDone must then reach this server, not an outer batch's.
+MORO_NOINLINE static void batchUnderScope(JsServer* js, Connection* c, uint32_t count) {
+  Isolate* iso = js->isolate;
+  HandleScope scope(iso);
+  Local<Context> ctx = js->context.Get(iso);
+  Context::Scope ctxScope(ctx);
+  CallbackScopeFor cb(js, iso);
+  count = fillBatchDescriptors(js, iso, ctx, c, count);
   Local<Value> argv[1] = {Integer::NewFromUnsigned(iso, count)};
+  TryCatch tryCatch(iso);
+  ThreadState& t = threadState();
+  JsServer* const outer = t.batchJs;
+  if (js->viaTrampoline) t.batchJs = js;
   if (js->onRequestBatch.Get(iso)->Call(ctx, ctx->Global(), 1, argv).IsEmpty()) { /* threw: reported below */ }
+  t.batchJs = outer;
+  // JS is out of its loop; the callback scope closing below runs microtasks
+  // and nextTicks, which may still answer requests of this batch.
+  js->server->batchLoopReturned();
   reportCaught(iso, tryCatch, "onRequestBatch");
+}
+
+static void cbOnRequestBatch(void* user, Connection* c, uint32_t count) {
+  JsServer* js = static_cast<JsServer*>(user);
+  if (js->tearingDown || js->onRequestBatch.IsEmpty()) return;
+  if (!js->viaTrampoline || dispatchesFromDeepStack(js)) {
+    batchUnderScope(js, c, count);
+    return;
+  }
+  // Through the trampoline: node::MakeCallback enters the context for the
+  // call; what comes before it needs one only where it creates objects (the
+  // first batch of a server, the first sight of a path), and opens it there.
+  Isolate* iso = js->isolate;
+  HandleScope scope(iso);
+  Local<Context> ctx = js->context.Get(iso);
+  count = fillBatchDescriptors(js, iso, ctx, c, count);
+  Local<Value> argv[1] = {Integer::NewFromUnsigned(iso, count)};
+  // The trampoline tells the engine that JS is out of its loop (BatchDone)
+  // before it returns, which is before MakeCallback closes the scope and
+  // runs the microtasks and nextTicks that may still answer requests of
+  // this batch. A call that ends without it - the isolate terminated under
+  // the handler - is covered here; batchLoopReturned() may run twice.
+  ThreadState& t = threadState();
+  JsServer* const outer = t.batchJs;
+  t.batchJs = js;
+  (void)node::MakeCallback(iso, js->asyncResource.Get(iso), js->onRequestBatch.Get(iso), 1, argv,
+                           node::async_context{0, 0});
+  t.batchJs = outer;
+  js->server->batchLoopReturned();
 }
 // Delivered from Server::drainNotifications (a uv_async callback, or
 // synchronously from close()), by reqId: the Connection may be gone already.
@@ -751,9 +971,8 @@ static void cbOnWritable(void* user, uint32_t reqId) {
 // Log (never rethrow) an exception left by a JS callback, so a throwing WS
 // handler is surfaced for diagnostics rather than silently swallowed.
 static void reportCaught(Isolate* iso, TryCatch& tc, const char* where) {
-  if (!tc.HasCaught()) return;
-  String::Utf8Value msg(iso, tc.Exception());
-  if (*msg) fprintf(stderr, "[morojs-engine] %s threw: %s\n", where, *msg);
+  if (!tc.HasCaught() || tc.HasTerminated()) return;  // terminated: the thread is ending, no handler threw
+  printThrown(iso, tc.Exception(), where);
 }
 
 static void cbOnWsOpen(void* user, Connection* c, const std::string& path) {
@@ -856,6 +1075,30 @@ static void cbOnWsMessage(void* user, Connection* c, const char* data,
   reportCaught(iso, tc, "onWsMessage");
 }
 
+static void FreeBodyHolder(void*, size_t, void* hint);
+
+// A large binary message, in the string the engine received it into: the
+// ArrayBuffer is made over those bytes - the string becomes its backing
+// store - where cbOnWsMessage allocates a buffer of the same size and copies
+// them across. A plain V8 backing store, for the reason GetBody gives.
+static void cbOnWsBinaryOwned(void* user, Connection* c, std::string& message) {
+  JsServer* js = static_cast<JsServer*>(user);
+  if (js->tearingDown) return;
+  if (js->onWsMessage.IsEmpty()) return;
+  Isolate* iso = js->isolate;
+  HandleScope scope(iso);
+  Local<Context> ctx = js->context.Get(iso);
+  WsCallScopes scopes(js, iso, ctx);
+  TryCatch tc(iso);
+  auto* holder = new std::string();
+  holder->swap(message);
+  Local<ArrayBuffer> ab = ArrayBuffer::New(
+      iso, ArrayBuffer::NewBackingStore(holder->data(), holder->size(), FreeBodyHolder, holder));
+  Local<Value> argv[3] = {Integer::NewFromUnsigned(iso, c->wsId), ab, v8::Boolean::New(iso, true)};
+  if (js->onWsMessage.Get(iso)->Call(ctx, ctx->Global(), 3, argv).IsEmpty()) { /* threw: reported below */ }
+  reportCaught(iso, tc, "onWsMessage");
+}
+
 static void cbOnWsClose(void* user, Connection* c, int code) {
   JsServer* js = static_cast<JsServer*>(user);
   if (js->tearingDown) return;
@@ -870,6 +1113,30 @@ static void cbOnWsClose(void* user, Connection* c, int code) {
   if (js->onWsClose.Get(iso)->Call(ctx, ctx->Global(), 2, argv).IsEmpty()) { /* threw: reported below */ }
   reportCaught(iso, tc, "onWsClose");
 }
+
+// _reportCaught(which, error): what a dispatch trampoline (the loader's) does
+// with an exception the application's callback threw - the line reportCaught
+// prints. `which`: 0 a request, abort or drain callback, 1 onRequestBatch.
+static void ReportCaught(const FunctionCallbackInfo<Value>& args) {
+  Isolate* iso = args.GetIsolate();
+  if (args.Length() < 2) return;
+  const bool batch = args[0]->IsInt32() && args[0].As<Int32>()->Value() == 1;
+  printThrown(iso, args[1], batch ? "onRequestBatch" : "handler");
+}
+
+// _batchDone(): the batch trampoline's notice that the application's
+// onRequestBatch has returned (or thrown): JS is out of its loop over the
+// batch, and whatever answers a request of it from here on - a microtask, a
+// nextTick - is outside it (Server::batchLoopReturned). Two stores, no V8:
+// also a fast-call target.
+static inline void batchDone() {
+  JsServer* js = threadState().batchJs;
+  if (js != nullptr && js->server != nullptr) js->server->batchLoopReturned();
+}
+static void BatchDone(const FunctionCallbackInfo<Value>&) { batchDone(); }
+#if MORO_FAST_API_ENABLED
+static void FastBatchDone(Local<Value>) { batchDone(); }
+#endif
 
 // ---- JS-exposed functions ----
 
@@ -898,12 +1165,31 @@ static bool parseSslOptions(Isolate* iso, Local<Context> ctx, Local<Object> so, 
       out = v->BooleanValue(iso);
     }
   };
+  // A policy value of the wrong type is a configuration error, not "unset":
+  // read as unset, `requestCert: 1` is a server that asks nobody for a
+  // certificate and `minVersion: 1.3` one that still takes TLS 1.2, with
+  // nothing said. undefined and null are "not given".
+  auto typed = [&](const char* name, bool wantString) {
+    Local<Value> v;
+    if (!so->Get(ctx, str(iso, name)).ToLocal(&v)) return false;
+    if (v->IsNullOrUndefined() || (wantString ? v->IsString() : v->IsBoolean())) return true;
+    iso->ThrowException(v8::Exception::TypeError(str(
+        iso, (std::string("ssl.") + name + (wantString ? " must be a string" : " must be a boolean")).c_str())));
+    return false;
+  };
+  for (const char* name : {"passphrase", "ciphers", "ciphersuites", "ecdhCurve", "minVersion", "maxVersion"}) {
+    if (!typed(name, /*wantString=*/true)) return false;
+  }
+  for (const char* name : {"requestCert", "rejectUnauthorized"}) {
+    if (!typed(name, /*wantString=*/false)) return false;
+  }
   getStr("key_file_name", ssl.keyFile);
   getStr("cert_file_name", ssl.certFile);
   getStr("ca_file_name", ssl.caFile);
   getBytes("key", ssl.keyPem);
   getBytes("cert", ssl.certPem);
   getBytes("ca", ssl.caPem);
+  getBytes("crl", ssl.crlPem);
   getBytes("ticketKeys", ssl.ticketKeys);
   if (!ssl.ticketKeys.empty() && ssl.ticketKeys.size() != 48) {
     iso->ThrowException(v8::Exception::Error(str(
@@ -923,6 +1209,15 @@ static bool parseSslOptions(Isolate* iso, Local<Context> ctx, Local<Object> so, 
   if (!minVer.empty() && minVer != "TLSv1.2" && minVer != "TLSv1.3") {
     iso->ThrowException(v8::Exception::Error(
         str(iso, "ssl.minVersion must be 'TLSv1.2' or 'TLSv1.3'")));
+    return false;
+  }
+  std::string maxVer;
+  getStr("maxVersion", maxVer);
+  if (maxVer == "TLSv1.2") ssl.maxVersion = TLS1_2_VERSION;
+  if (maxVer == "TLSv1.3") ssl.maxVersion = TLS1_3_VERSION;
+  if (!maxVer.empty() && ssl.maxVersion == 0) {
+    iso->ThrowException(v8::Exception::Error(
+        str(iso, "ssl.maxVersion must be 'TLSv1.2' or 'TLSv1.3'")));
     return false;
   }
   getBool("requestCert", ssl.requestCert);
@@ -994,6 +1289,15 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
   js->isolate = iso;
   js->context.Reset(iso, ctx);
   js->asyncResource.Reset(iso, Object::New(iso));
+  js->viaTrampoline = args.Length() >= 3 && args[2]->IsTrue();
+  {
+    const uintptr_t here = stackPosition();
+    js->deepDispatchBelow = here > kDeepDispatchBytes ? here - kDeepDispatchBytes : 0;
+  }
+  // A getter or Proxy trap of the callbacks or options object that throws
+  // fails serve() with that exception and nothing created. Carrying on would
+  // build a server whose id the caller never receives, and so can never close.
+  std::optional<TryCatch> optionErrors(std::in_place, iso);
 
   auto grab = [&](const char* name, Global<Function>& out) {
     Local<Value> v;
@@ -1116,6 +1420,13 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
     }
   }
 
+  if (optionErrors->HasCaught()) {
+    delete js;
+    optionErrors->ReThrow();
+    return;
+  }
+  optionErrors.reset();
+
   // options.ssl -> in-process TLS termination. Both MoroJS shapes are accepted: file paths (key_file_name/cert_file_name/ca_file_name) and inline PEM (key/cert/ca as string|Buffer|ArrayBuffer); inline wins when both are present. Config errors THROW from serve() - a misconfigured TLS server must never silently boot as plaintext.
   SslConfig ssl;
   bool sslRequested = false;
@@ -1124,8 +1435,10 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
     Local<Value> sslVal;
     if (opts->Get(ctx, str(iso, "ssl")).ToLocal(&sslVal) && sslVal->IsObject()) {
       sslRequested = true;
-      if (!parseSslOptions(iso, ctx, sslVal.As<Object>(), ssl)) {
+      TryCatch sslErrors(iso);  // a throwing getter of the ssl object, as above
+      if (!parseSslOptions(iso, ctx, sslVal.As<Object>(), ssl) || sslErrors.HasCaught()) {
         delete js;
+        sslErrors.ReThrow();
         return;
       }
       ssl.alpnH2 = limits.http2.enabled;  // offer "h2" ahead of "http/1.1"
@@ -1149,6 +1462,7 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
 
   scb.onWsOpen = cbOnWsOpen;
   scb.onWsMessage = cbOnWsMessage;
+  scb.onWsBinaryOwned = cbOnWsBinaryOwned;
   scb.onWsClose = cbOnWsClose;
   scb.onWsRead = cbOnWsRead;
 
@@ -1156,19 +1470,25 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
   js->server->setDeferredNotify(g_notifyDeferred);
   js->server->setBatchDispatch(g_batchEnabled);
 #if defined(__linux__)
-  if (js->server->transportKind() == TransportKind::Uring && !g_uringHookRegistered) {
-    g_uringHookRegistered = true;
+  if (js->server->transportKind() == TransportKind::Uring && !threadState().uringHookRegistered) {
+    threadState().uringHookRegistered = true;
     node::AddEnvironmentCleanupHook(iso, cleanupUringLoop, nullptr);
   }
-  if (js->server->transportKind() == TransportKind::Epoll && !g_epollHookRegistered) {
-    g_epollHookRegistered = true;
+  // A server that prefers io_uring runs on the epoll transport when its
+  // thread cannot have a ring (Server::listen), or once its ring has died,
+  // so that thread's epoll state needs its hook as well: the check handle
+  // it owns would otherwise still be open when Node closes the loop.
+  if ((js->server->transportKind() == TransportKind::Epoll ||
+       js->server->transportKind() == TransportKind::Uring) &&
+      !threadState().epollHookRegistered) {
+    threadState().epollHookRegistered = true;
     node::AddEnvironmentCleanupHook(iso, cleanupEpollLoop, nullptr);
   }
 #endif
   if (tlsCtx.valid()) js->server->adoptTls(std::move(tlsCtx));
-  uint32_t id = ++g_serverIdCounter;
+  uint32_t id = ++threadState().serverIdCounter;
   js->id = id;
-  g_servers[id] = js;
+  threadState().servers[id] = js;
   // Removed again in freeJsServer when JS closes the server itself.
   node::AddEnvironmentCleanupHook(iso, cleanupJsServer, js);
   args.GetReturnValue().Set(Integer::NewFromUnsigned(iso, id));
@@ -1177,8 +1497,8 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
 static JsServer* serverFrom(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
   uint32_t id = args[0]->Uint32Value(iso->GetCurrentContext()).FromMaybe(0);
-  auto it = g_servers.find(id);
-  return it == g_servers.end() ? nullptr : it->second;
+  auto it = threadState().servers.find(id);
+  return it == threadState().servers.end() ? nullptr : it->second;
 }
 
 // listen(serverId, host, port) -> actual bound port (throws on failure)
@@ -1308,18 +1628,17 @@ static void GetHeaders(const FunctionCallbackInfo<Value>& args) {
   Local<Array> arr = Array::New(iso, static_cast<int>(hint));
   JsServer* js = jsServerFor(c->server);
   uint32_t idx = 0;
-  for (const auto& h : c->headers) {
+  for (const Header h : c->headers) {
     // Names come from a small bounded set in practice - serve them from the
     // per-server interning cache (same pattern and lifetime as pathCache).
     Local<String> nameStr;
     if (js && h.name.size() <= JsServer::kHeaderNameCacheMaxLen) {
-      auto it = js->headerNameCache.find(h.name);
-      if (it != js->headerNameCache.end()) {
-        nameStr = it->second.Get(iso);
+      if (Global<String>* cached = js->headerNameCache.find(h.name)) {
+        nameStr = cached->Get(iso);
       } else {
         nameStr = str(iso, h.name);
         if (js->headerNameCache.size() < JsServer::kHeaderNameCacheMaxEntries) {
-          js->headerNameCache.emplace(h.name, Global<String>(iso, nameStr));
+          js->headerNameCache.insert(h.name, Global<String>(iso, nameStr));
         }
       }
     } else {
@@ -1335,10 +1654,13 @@ static void GetHeaders(const FunctionCallbackInfo<Value>& args) {
 
 static void GetHeader(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
-  Connection* c = connFrom(args);
-  if (!c || args.Length() < 2) return;
+  if (args.Length() < 2) return;
+  // The name is read first: converting it can run JavaScript (toString),
+  // which can end the request the lookup below would otherwise have found.
   String::Utf8Value name(iso, args[1]);
   if (*name == nullptr) return;
+  Connection* c = connFrom(args);
+  if (!c) return;
   // The snapshot (c->headers) is the source of truth; the parser has already moved its fields out and may have been reset for the next request.
   for (const auto& h : c->headers) {
     if (h.name.size() == static_cast<size_t>(name.length()) &&
@@ -1485,11 +1807,15 @@ static void ReleaseLentBody(void* p) {
     Local<ArrayBuffer> buffer = lent->buffer.Get(iso);
     // Already detached when JS transferred it away: the bytes are the new
     // owner's. Otherwise the buffer gives up its reference here, and when
-    // that leaves this one the only reference there is, nothing else can
-    // ever read the bytes again: their storage goes back to the server's
-    // pool for the next body (the holder is freed empty). Anything else
-    // still holding the store - a native operation in flight on another
-    // thread - keeps the bytes for as long as it needs them.
+    // that leaves this one the only reference there is, their storage goes
+    // back to the server's pool for the next body (the holder is freed
+    // empty). Anything else that holds the store itself keeps the bytes for
+    // as long as it needs them. That does not cover Node's own asynchronous
+    // operations (an fs or socket write, a zlib or crypto job): they keep a
+    // pointer into the memory and a reference to the JS object, not the
+    // store, so one still running here goes on to read the next body. The
+    // caller has to let them finish before it completes the response
+    // (docs/API.md says so); nothing here can see them.
     if (!buffer->WasDetached()) {
       std::shared_ptr<BackingStore> store = buffer->GetBackingStore();
       (void)buffer->Detach(Local<Value>());
@@ -1537,7 +1863,7 @@ static void GetRemoteAddress(const FunctionCallbackInfo<Value>& args) {
 }
 
 static void IsAborted(const FunctionCallbackInfo<Value>& args) {
-  if (g_countCalls) ++fastcall::g_slowHits[fastcall::kIsAborted];
+  if (g_countCalls) ++fastcall::slowHits()[fastcall::kIsAborted];
   Connection* c = connFrom(args);
   args.GetReturnValue().Set(c == nullptr);  // gone from registry == aborted/ended
 }
@@ -1546,17 +1872,21 @@ static void IsAborted(const FunctionCallbackInfo<Value>& args) {
 static void Respond(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
   Local<Context> ctx = iso->GetCurrentContext();
-  Connection* c = connFrom(args);
-  if (!c) return;
   int status = args[1]->Int32Value(ctx).FromMaybe(200);
   HeaderBlockLease headersLease;
   std::string& headers = headersLease.get();
   long long customCL = -1;
   buildHeaders(iso, ctx, args[2], headers, customCL);
-  // The body borrow is taken AFTER buildHeaders: buildHeaders can run
-  // arbitrary JS (array getters / valueOf), which could detach an ArrayBuffer
-  // out from under an earlier borrow. Both stay on this stack through the
-  // respond() call.
+  // The request is looked up AFTER the status and the headers have been
+  // read. Both can run arbitrary JS (valueOf, array getters, toString), and
+  // that JS can answer this very request or close its connection: a
+  // Connection found before it ran may by now be on its next request, or -
+  // an HTTP/2 request - back in the pool with no socket behind it.
+  Connection* c = connFrom(args);
+  if (!c) return;
+  // The body borrow is taken AFTER buildHeaders for the same reason: that JS
+  // could detach an ArrayBuffer out from under an earlier borrow. Both stay
+  // on this stack through the respond() call.
   ByteSource body(iso, args[3]);
   c->server->respond(c, status, headers, customCL, body.data(), body.size());
 }
@@ -1565,19 +1895,20 @@ static void Respond(const FunctionCallbackInfo<Value>& args) {
 static void WriteHead(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
   Local<Context> ctx = iso->GetCurrentContext();
-  Connection* c = connFrom(args);
-  if (!c) return;
   int status = args[1]->Int32Value(ctx).FromMaybe(200);
   HeaderBlockLease headersLease;
   std::string& headers = headersLease.get();
   long long customCL = -1;
   buildHeaders(iso, ctx, args[2], headers, customCL);
+  // Looked up after the arguments have been read (see Respond).
+  Connection* c = connFrom(args);
+  if (!c) return;
   c->server->writeHead(c, status, headers, customCL);
 }
 
 // write(reqId, chunk) -> boolean backpressure
 static void Write(const FunctionCallbackInfo<Value>& args) {
-  if (g_countCalls) ++fastcall::g_slowHits[fastcall::kWrite];
+  if (g_countCalls) ++fastcall::slowHits()[fastcall::kWrite];
   Isolate* iso = args.GetIsolate();
   Connection* c = connFrom(args);
   if (!c) { args.GetReturnValue().Set(false); return; }
@@ -1589,7 +1920,7 @@ static void Write(const FunctionCallbackInfo<Value>& args) {
 
 // end(reqId, chunk?)
 static void End(const FunctionCallbackInfo<Value>& args) {
-  if (g_countCalls) ++fastcall::g_slowHits[fastcall::kEnd];
+  if (g_countCalls) ++fastcall::slowHits()[fastcall::kEnd];
   Isolate* iso = args.GetIsolate();
   Connection* c = connFrom(args);
   if (!c) return;
@@ -1721,42 +2052,43 @@ static void ReleaseTemplates(const FunctionCallbackInfo<Value>& args) {
 // respondPrepared(reqId, tplId, body|null) - respond() with a template.
 // An invalid tplId answers 500 (see Server::respondTemplate).
 static void RespondPrepared(const FunctionCallbackInfo<Value>& args) {
-  if (g_countCalls) ++fastcall::g_slowHits[fastcall::kRespondPrepared];
+  if (g_countCalls) ++fastcall::slowHits()[fastcall::kRespondPrepared];
   Isolate* iso = args.GetIsolate();
   Local<Context> ctx = iso->GetCurrentContext();
+  // The id first: its conversion can run JS (valueOf), see Respond.
+  const uint32_t tplId = args[1]->Uint32Value(ctx).FromMaybe(0);
   Connection* c = connFrom(args);
   if (!c) return;
-  const uint32_t tplId = args[1]->Uint32Value(ctx).FromMaybe(0);
   ByteSource body(iso, args[2]);
   c->server->respondTemplate(c, tplId, body.data(), body.size());
 }
 
 // respondPreparedEmpty(reqId, tplId) - respond() with a template and no body.
 static void RespondPreparedEmpty(const FunctionCallbackInfo<Value>& args) {
-  if (g_countCalls) ++fastcall::g_slowHits[fastcall::kRespondPreparedEmpty];
+  if (g_countCalls) ++fastcall::slowHits()[fastcall::kRespondPreparedEmpty];
   Isolate* iso = args.GetIsolate();
   Local<Context> ctx = iso->GetCurrentContext();
+  const uint32_t tplId = args[1]->Uint32Value(ctx).FromMaybe(0);
   Connection* c = connFrom(args);
   if (!c) return;
-  const uint32_t tplId = args[1]->Uint32Value(ctx).FromMaybe(0);
   c->server->respondTemplate(c, tplId, nullptr, 0);
 }
 
 // writeHeadPrepared(reqId, tplId) - writeHead() with a template (streaming).
 static void WriteHeadPrepared(const FunctionCallbackInfo<Value>& args) {
-  if (g_countCalls) ++fastcall::g_slowHits[fastcall::kWriteHeadPrepared];
+  if (g_countCalls) ++fastcall::slowHits()[fastcall::kWriteHeadPrepared];
   Isolate* iso = args.GetIsolate();
   Local<Context> ctx = iso->GetCurrentContext();
+  const uint32_t tplId = args[1]->Uint32Value(ctx).FromMaybe(0);
   Connection* c = connFrom(args);
   if (!c) return;
-  const uint32_t tplId = args[1]->Uint32Value(ctx).FromMaybe(0);
   c->server->writeHeadTemplate(c, tplId);
 }
 
 // endWith(reqId, chunk) - exactly end(reqId, chunk), as a fixed-arity twin so
 // a call site that always passes a chunk has one shape (fast-call eligible).
 static void EndWith(const FunctionCallbackInfo<Value>& args) {
-  if (g_countCalls) ++fastcall::g_slowHits[fastcall::kEndWith];
+  if (g_countCalls) ++fastcall::slowHits()[fastcall::kEndWith];
   Isolate* iso = args.GetIsolate();
   Connection* c = connFrom(args);
   if (!c) return;
@@ -1794,7 +2126,10 @@ static void WsSend(const FunctionCallbackInfo<Value>& args) {
   // (Server::kNotifyWsShed), so nothing can run JS or move the string while
   // the engine copies the payload into its frame. Sync mode still copies.
   ByteSource data(iso, args[1]);
-  bool ok = true;
+  // A payload that is not a string or bytes (a number, an object, undefined)
+  // cannot be sent, and the answer says so: false, as for any frame that
+  // did not go out.
+  bool ok = false;
   if (data.valid()) ok = c->server->wsSend(c, data.data(), data.size(), isBinary);
   args.GetReturnValue().Set(ok);
 }
@@ -1805,9 +2140,12 @@ static void WsClose(const FunctionCallbackInfo<Value>& args) {
   Local<Context> ctx = iso->GetCurrentContext();
   Connection* c = wsFrom(args);
   if (!c) return;
-  uint16_t code = 1000;  // normal closure (§7.4.1)
+  // Kept as the integer it is: narrowed to the 16 bits of the wire field
+  // here, 70000 would turn into the unrelated 4464. Server::wsClose decides
+  // what a value that may not be sent becomes.
+  int code = 1000;  // normal closure (§7.4.1)
   if (args.Length() >= 2 && args[1]->IsNumber())
-    code = static_cast<uint16_t>(args[1]->Int32Value(ctx).FromMaybe(1000));
+    code = args[1]->Int32Value(ctx).FromMaybe(1000);
   std::string reason;
   if (args.Length() >= 3 && args[2]->IsString()) {
     String::Utf8Value r(iso, args[2]);
@@ -1860,19 +2198,48 @@ static void WsGetRemoteAddress(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(str(args.GetIsolate(), c->server->remoteAddress(c)));
 }
 
+// A batch buffer JS transferred away (ArrayBuffer.prototype.transfer,
+// structuredClone or postMessage with a transfer list) is detached, and its
+// storage belongs to whoever received it. The engine moves to new storage of
+// its own - the current contents copied over, so a batch in flight reads on
+// from the new views - and stops writing into the storage that was given
+// away. Asked by getBatchBuffers() only, never per request.
+static void renewTransferredBatchBuffers(JsServer* js, Isolate* iso) {
+  constexpr size_t kDescBytes = 3 * Server::kMaxStaged * sizeof(uint32_t);
+  if (js->batchDesc.Get(iso)->ByteLength() != kDescBytes) {
+    Local<ArrayBuffer> d = ArrayBuffer::New(iso, kDescBytes);
+    std::shared_ptr<BackingStore> store = d->GetBackingStore();
+    std::memcpy(store->Data(), js->desc, kDescBytes);
+    js->desc = static_cast<uint32_t*>(store->Data());
+    js->batchDescStore = std::move(store);
+    js->batchDesc.Reset(iso, d);
+  }
+  if (js->batchCtl.Get(iso)->ByteLength() != sizeof(uint32_t)) {
+    Local<ArrayBuffer> c = ArrayBuffer::New(iso, sizeof(uint32_t));
+    std::shared_ptr<BackingStore> store = c->GetBackingStore();
+    *static_cast<uint32_t*>(store->Data()) = *js->ctl;
+    js->ctl = static_cast<uint32_t*>(store->Data());
+    js->batchCtlStore = std::move(store);
+    js->batchCtl.Reset(iso, c);
+    if (js->server) js->server->setBatchControl(js->ctl);
+  }
+}
+
 // getBatchBuffers(serverId) -> { descriptors: Uint32Array(3*16), control:
-// Uint32Array(1), paths: string[] } - the same objects every call.
+// Uint32Array(1), paths: string[] }: views of the same storage every call
+// (new storage once JS has transferred the old away).
 static void GetBatchBuffers(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
   Local<Context> ctx = iso->GetCurrentContext();
   uint32_t id = args[0]->Uint32Value(ctx).FromMaybe(0);
-  auto it = g_servers.find(id);
-  if (it == g_servers.end()) {
+  auto it = threadState().servers.find(id);
+  if (it == threadState().servers.end()) {
     iso->ThrowException(v8::Exception::RangeError(str(iso, "getBatchBuffers: unknown serverId")));
     return;
   }
   JsServer* js = it->second;
   ensureBatchBuffers(js, iso, ctx);
+  renewTransferredBatchBuffers(js, iso);
   Local<Object> out = Object::New(iso);
   (void)out->Set(ctx, str(iso, "descriptors"),
                  v8::Uint32Array::New(js->batchDesc.Get(iso), 0, 3 * Server::kMaxStaged)).FromMaybe(false);
@@ -1943,6 +2310,9 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   setCap("tlsPolicy", true);
   // updateSsl(serverId, ssl) swaps the certificate/key for new handshakes.
   setCap("tlsReload", true);
+  // ssl.crl (client-certificate revocation lists) and ssl.maxVersion are
+  // honoured; an engine without this flag reads neither.
+  setCap("tlsCrl", true);
   // setStaticRoute()/clearStaticRoutes() are available.
   setCap("staticRoutes", true);
   // setParamRoute()/clearParamRoutes() are available: one variable path
@@ -1973,6 +2343,18 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   // the engine itself (onWsOpen, never onRequest), with wsGetHeaders()/
   // wsGetQuery()/wsGetRemoteAddress() reading the handshake afterwards.
   setCap("wsAutoUpgrade", true);
+  // A handshake the engine answers itself may sit behind pipelined requests
+  // in a batch: it is upgraded once the onRequestBatch call has returned,
+  // never from inside the response call that completed the request ahead of
+  // it. Engines that report wsAutoUpgrade and batchDispatch without this
+  // flag (1.1.15 to 1.1.21) must not be given both.
+  setCap("wsAutoUpgradeBatch", true);
+  // idleTimeoutMs does not close a connection whose response is still being
+  // written to a peer that is reading it; responseTimeoutMs governs that
+  // (Server::onSweep). Engines without this flag count a response answered
+  // inside a batch as idle from the moment it is framed, so an idle timeout
+  // shorter than a slow download cuts the download.
+  setCap("idleSparesDrainingResponse", true);
   // getBodyType()/getBodyText(): the body's media type, and an all-ASCII
   // body as a heap string.
   setCap("bodyText", true);
@@ -1989,6 +2371,11 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
     set("tls", tls);
   }
   set("notify", str(iso, g_notifyDeferred ? "deferred" : "sync"));
+#if defined(MORO_ENGINE_TEST_FAULTS)
+  // A test build (tools/build.mjs --sanitize): the fault points of src/tls.h
+  // are compiled in. Not a capability, and no shipped binary reports it.
+  set("testFaults", v8::Boolean::New(iso, true));
+#endif
   // I/O transport in use on this host: 'uring' (Linux, io_uring usable) or
   // 'uv' (libuv streams), with the reason when it is not uring.
   set("transport", str(iso, Server::transportName(Server::preferredTransport())));
@@ -2014,8 +2401,8 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
     Local<Object> stats = Object::New(iso);
     for (int i = 0; i < fastcall::kCount; ++i) {
       Local<Object> pair = Object::New(iso);
-      (void)pair->Set(ctx, str(iso, "fast"), Number::New(iso, static_cast<double>(fastcall::g_fastHits[i]))).FromMaybe(false);
-      (void)pair->Set(ctx, str(iso, "slow"), Number::New(iso, static_cast<double>(fastcall::g_slowHits[i]))).FromMaybe(false);
+      (void)pair->Set(ctx, str(iso, "fast"), Number::New(iso, static_cast<double>(fastcall::fastHits()[i]))).FromMaybe(false);
+      (void)pair->Set(ctx, str(iso, "slow"), Number::New(iso, static_cast<double>(fastcall::slowHits()[i]))).FromMaybe(false);
       (void)stats->Set(ctx, str(iso, fastcall::fnName(i)), pair).FromMaybe(false);
     }
     set("fastCallStats", stats);
@@ -2046,8 +2433,11 @@ MORO_FASTDEF(EndWith)
 MORO_FASTDEF(IsAborted)
 #undef MORO_FASTDEF
 #define MORO_FAST(Name) &kFast_##Name, &kFastC_##Name
+static const v8::CFunction kFast_BatchDone = v8::CFunction::Make(&FastBatchDone);
+#define MORO_FAST_BATCH_DONE &kFast_BatchDone, &kFast_BatchDone
 #else
 #define MORO_FAST(Name) nullptr, nullptr
+#define MORO_FAST_BATCH_DONE nullptr, nullptr
 #endif
 
 static const ExportDef kExports[] = {
@@ -2091,6 +2481,8 @@ static const ExportDef kExports[] = {
     {"wsGetRemoteAddress", WsGetRemoteAddress, nullptr, nullptr},
     {"probe", Probe, nullptr, nullptr},
     // Loader-internal (leading underscore: not in NATIVE_API, not typed).
+    {"_batchDone", BatchDone, MORO_FAST_BATCH_DONE},
+    {"_reportCaught", ReportCaught, nullptr, nullptr},
     {"_tlsAgeNoticeOnce", TlsAgeNoticeOnce, nullptr, nullptr},
     {"_tlsCheck", TlsCheck, nullptr, nullptr},
 };
@@ -2101,6 +2493,14 @@ static void Initialize(Local<Object> exports, Local<Value> module,
   // Context::GetIsolate() was removed in V8 14 (Node 26); GetCurrent() is stable
   Isolate* iso = Isolate::GetCurrent();
 
+  // The switches below are process-wide and every thread reads them on its
+  // request path, so they are settled by the first load and never written
+  // again: a worker thread loading the addon later runs this function too,
+  // and by then the main thread may have changed the environment
+  // (process.env writes through to it). Fast calls installed on one thread
+  // rely on deferred notification staying what it was when they went in.
+  static std::once_flag processSwitches;
+  std::call_once(processSwitches, [] {
   // Diagnostics-only: MORO_ENGINE_NOTIFY=sync restores re-entrant
   // onAborted/onWritable delivery (pre-1.1.6 behaviour) for bisecting.
   const char* notifyEnv = std::getenv("MORO_ENGINE_NOTIFY");
@@ -2128,6 +2528,7 @@ static void Initialize(Local<Object> exports, Local<Value> module,
                  : !v8Match        ? "v8-mismatch"
                                    : "ok";
   g_fastInstalled = std::strcmp(g_fastReason, "ok") == 0;
+  });
 
   for (const ExportDef& e : kExports) {
     const v8::CFunction* cf =
@@ -2163,3 +2564,16 @@ NODE_MODULE_CONTEXT_AWARE(moro_engine, moro::engine::Initialize)
 
 }  // namespace engine
 }  // namespace moro
+
+// The same initialiser under the name Node looks up when loading the binary
+// did not run the static registration above. That is the case when the
+// library is still mapped from an earlier load that has been closed since: a
+// worker thread loaded the engine and ended, nothing else in the process
+// holds it, and the platform kept the image (macOS does, for a library with
+// thread-local state). The next thread to load it was refused with "Module
+// did not self-register"; with the symbol it is initialised like the first.
+extern "C" NODE_MODULE_EXPORT void NODE_MODULE_INITIALIZER(v8::Local<v8::Object> exports,
+                                                           v8::Local<v8::Value> module,
+                                                           v8::Local<v8::Context> context) {
+  moro::engine::Initialize(exports, module, context);
+}

@@ -479,6 +479,30 @@ class Ring {
     return n;
   }
 
+  // The same, and each completion comes with a number for the batch it was
+  // reaped in (the batch's end in the completion ring): two completions carry
+  // the same number exactly when one call reaped them both.
+  template <class F>
+  unsigned forEachCqeBatch(F&& f) {
+    uint32_t head = *cqHead_;
+    const uint32_t tail = loadAcquire(cqTail_);
+    unsigned n = 0;
+    while (head != tail) {
+      f(cqes_[head & cqMask_], tail);
+      head++;
+      n++;
+    }
+    if (n) storeRelease(cqHead_, head);
+    return n;
+  }
+  // Every SQE handed out that the kernel has not consumed (its own head says
+  // which those are), oldest first. For a ring that will never be entered
+  // again: what such an SQE asked for has not happened and never will.
+  template <class F>
+  void forEachUnsubmitted(F&& f) {
+    for (uint32_t i = loadAcquire(sqHead_); i != localTail_; i++) f(sqes_[i & sqMask_]);
+  }
+
   unsigned cqReady() const { return loadAcquire(cqTail_) - *cqHead_; }
   uint32_t sqFlags() const { return loadAcquire(sqFlags_); }
   uint32_t sqDropped() const { return loadAcquire(sqDropped_); }
@@ -646,6 +670,14 @@ inline void prepCancelFd(abi::io_uring_sqe* s, int fd) {
   s->cancel_flags = abi::IORING_ASYNC_CANCEL_FD | abi::IORING_ASYNC_CANCEL_ALL;
 }
 
+// Cancel the one request submitted with this user_data, and nothing else on
+// its descriptor: a send in flight on the same socket is left alone.
+inline void prepCancelUserData(abi::io_uring_sqe* s, uint64_t userData) {
+  s->opcode = abi::IORING_OP_ASYNC_CANCEL;
+  s->fd = -1;
+  s->addr = userData;
+}
+
 inline void prepClose(abi::io_uring_sqe* s, int fd) {
   s->opcode = abi::IORING_OP_CLOSE;
   s->fd = fd;
@@ -690,7 +722,7 @@ inline bool hasMore(const abi::io_uring_cqe& c) { return (c.flags & abi::IORING_
 // next to uv_tcp_t, and the Connection is value-initialised (zeroed).
 struct UringConn {
   int fd;               // the accepted socket (owned; closed through the ring)
-  uint8_t state;        // 0 idle, 1 reading, 2 closing (cancel+close issued), 3 closed
+  uint8_t state;        // 0 paced (open; read by the loop, see below), 1 reading, 2 closing (cancel+close issued), 3 closed
   bool sendInflight;    // one SEND SQE outstanding (the head WriteReq)
   bool recvArmed;       // a multishot RECV SQE is outstanding
   bool eofSeen;         // EOF/error already routed once
@@ -698,6 +730,22 @@ struct UringConn {
   size_t pendingBytes;  // queued write bytes the kernel has not accepted
   void* wqHead;         // WriteReq* queue (intrusive, FIFO)
   void* wqTail;
+  void* closingPrev;    // Connection*: the loop's list of connections whose cancel/close
+  void* closingNext;    // completions are still due (Server::UringLoop::closing)
+  bool closingLinked;
+  // Receive pacing (Server::uringCount): what one connection is served per
+  // pass of the loop is bounded. One that goes over the bound is paced
+  // (state 0): its input is read by the loop, one buffer per turn
+  // (Server::uringServePaced).
+  bool recvCancel;      // the cancel of its multishot RECV is in flight
+  bool heldEof;         // (paced) a completion reported EOF or an error behind the held bytes
+  uint32_t seen;        // the batch of completions a receive was last dispatched in for it (Ring::forEachCqeBatch)
+  uint32_t probed;      // `seen` when its socket was last asked for a pending error (Server::uringCheckPeer)
+  uint32_t counted;     // the pass (UringLoop::reap) passBytes belongs to
+  uint32_t countedIn;   // ... and the last batch counted into it
+  uint32_t passBytes;   // received bytes dispatched for it in that pass
+  void* held;           // (paced) std::string*: bytes received and not yet dispatched
+  size_t heldOff;       // ... and how many of them have been
 };
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import {
   loadEngine,
   startFixtureServer,
@@ -475,5 +476,125 @@ describe('@morojs/engine regression conformance', { skip }, () => {
         }
       });
     });
+  });
+
+  // A queued write that is sent at once still completes on the loop, at its
+  // next pass. Made from setImmediate - after this turn's pass - it waits a
+  // turn, and a connection closed in the meantime is freed before that pass
+  // runs: the completion must go with it. What goes wrong otherwise is a read
+  // of freed memory, so it is the sanitizer lanes that fail this test; a
+  // plain build only shows that the shutdown is clean.
+  it('a response queued from setImmediate and the server closed in the same turn', T, async () => {
+    const { default: netMod } = await import('node:net');
+    const pending = [];
+    const sid = engine.serve({ onRequest: (reqId) => pending.push(reqId), onAborted() {}, onWritable() {} });
+    const port = engine.listen(sid, '127.0.0.1', 0);
+    const socks = [];
+    let closed = false;
+    try {
+      for (let i = 0; i < 8; i++) {
+        const s = netMod.connect(port, '127.0.0.1');
+        s.on('error', () => {});
+        await new Promise((resolve) => s.once('connect', resolve));
+        // Two requests: with the second one waiting behind it, the response
+        // to the first takes the queued path.
+        s.write(`GET /a HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}GET /b HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`);
+        socks.push(s);
+      }
+      const deadline = Date.now() + 5000;
+      while (pending.length < socks.length && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+      assert.equal(pending.length, socks.length, 'the first request of every connection reached the handler');
+      await new Promise((resolve) =>
+        setImmediate(() => {
+          for (const reqId of pending) engine.respond(reqId, 200, ['content-type', 'text/plain'], 'x');
+          engine.close(sid);
+          closed = true;
+          resolve();
+        })
+      );
+      // Further loop turns, with new allocations of the size just freed.
+      const more = await startFixtureServer(engine, ok);
+      try {
+        for (let i = 0; i < 8; i++) {
+          const res = parseResponse(await rawRequest(more.port, `GET / HTTP/1.1${CRLF}Host: t${CRLF}Connection: close${CRLF}${CRLF}`, { expectClose: true }));
+          assert.equal(res.status, 200);
+        }
+      } finally {
+        more.close();
+      }
+    } finally {
+      for (const s of socks) s.destroy();
+      if (!closed) engine.close(sid);
+    }
+  });
+});
+
+// Lifecycle calls made where the engine did not expect them. Each runs in a
+// process of its own: what went wrong before was an abort inside libuv, or a
+// loop that never emptied, and neither may take the suite down with it.
+describe('lifecycle calls at an unexpected moment', { skip }, () => {
+  const ENGINE_ENTRY = new URL('../packages/engine/index.mjs', import.meta.url).href;
+  const run = (script) =>
+    spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 20000 });
+
+  // A server has one listener. libuv refuses to bind a bound handle; the
+  // epoll transport set a second listening socket up over the first (the
+  // first port went deaf, and closing the server aborted the process in
+  // libuv's close path), and the io_uring transport accepted on both and
+  // then never finished close().
+  it('a second listen(), and one after stopListening(), is refused with EINVAL', T, () => {
+    const r = run(`
+      import net from 'node:net';
+      const { default: engine } = await import(${JSON.stringify(ENGINE_ENTRY)});
+      const get = (port) => new Promise((resolve) => {
+        const s = net.connect(port, '127.0.0.1', () => s.write('GET / HTTP/1.1\\r\\nHost: t\\r\\nConnection: close\\r\\n\\r\\n'));
+        let b = '';
+        s.on('data', (d) => (b += d));
+        s.on('close', () => resolve(b.slice(9, 12)));
+        s.on('error', () => resolve('error'));
+        s.setTimeout(3000, () => { s.destroy(); resolve('timeout'); });
+      });
+      const sid = engine.serve({ onRequest(reqId) { engine.respond(reqId, 200, null, 'ok'); }, onAborted() {} });
+      const port = engine.listen(sid, '127.0.0.1', 0);
+      const out = { second: 'accepted', afterStop: 'accepted' };
+      try { engine.listen(sid, '127.0.0.1', 0); } catch (e) { out.second = e.code; }
+      out.first = await get(port);
+      engine.stopListening(sid);
+      try { engine.listen(sid, '127.0.0.1', 0); } catch (e) { out.afterStop = e.code; }
+      engine.close(sid);
+      console.log(JSON.stringify(out));
+    `);
+    assert.equal(r.status, 0, `the process ends by itself once the server is closed (signal ${r.signal})\n${r.stderr}`);
+    assert.deepEqual(JSON.parse(r.stdout.trim()), { second: 'EINVAL', afterStop: 'EINVAL', first: '200' });
+  });
+
+  // The engine closes a WebSocket on its own account - here a peer that
+  // stopped reading, at the delivery deadline - and reports it with
+  // onWsClose(1006) from the middle of that teardown. An application that
+  // closes its server there (the last socket of a shutdown has gone) closes
+  // this connection too; the teardown then went on to close it a second
+  // time, which libuv answers with an abort.
+  it('close() from inside the onWsClose of a socket the engine is tearing down', T, () => {
+    const r = run(`
+      import net from 'node:net';
+      const { default: engine } = await import(${JSON.stringify(ENGINE_ENTRY)});
+      const codes = [];
+      const sid = engine.serve({
+        onRequest(reqId) { if (engine.upgradeToWebSocket(reqId) === -1) engine.respond(reqId, 400, null, ''); },
+        onAborted() {},
+        onWsOpen(wsId) { engine.wsSend(wsId, Buffer.alloc(8 << 20, 0x61), true); },
+        onWsMessage() {},
+        onWsClose(wsId, code) { codes.push(code); engine.close(sid); },
+      }, { responseTimeoutMs: 300 });
+      const port = engine.listen(sid, '127.0.0.1', 0);
+      const s = net.connect(port, '127.0.0.1', () => {
+        s.pause();  // never reads what it is sent
+        s.write('GET /ws HTTP/1.1\\r\\nHost: t\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\\r\\nSec-WebSocket-Version: 13\\r\\n\\r\\n');
+      });
+      s.on('error', () => {});
+      process.on('exit', () => console.log(JSON.stringify(codes)));
+    `);
+    assert.equal(r.status, 0, `the process survives and ends by itself (signal ${r.signal})\n${r.stderr}`);
+    assert.deepEqual(JSON.parse(r.stdout.trim()), [1006]);
   });
 });

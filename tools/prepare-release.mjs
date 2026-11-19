@@ -36,6 +36,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { TARGETS } from './build.mjs';
 import { fetchSource, readPin } from './boringssl.mjs';
+import { parseVersion } from './version.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const buildDir = join(root, 'build');
@@ -48,8 +49,10 @@ if (!version || version.startsWith('--')) {
   console.error('usage: node tools/prepare-release.mjs <version> [--check]');
   process.exit(1);
 }
-if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version)) {
-  console.error(`invalid semver version: ${version}`);
+try {
+  parseVersion(version);
+} catch (err) {
+  console.error(err.message);
   process.exit(1);
 }
 

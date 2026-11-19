@@ -53,8 +53,8 @@ jobs:
       to: ${{ steps.roll.outputs.to }}
       commit: ${{ steps.roll.outputs.commit }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
       # Reads upstream's tags; changes nothing. Outputs: changed, from, to, commit.
@@ -81,13 +81,20 @@ jobs:
       ROLL_TO: ${{ needs.plan.outputs.to }}
       ROLL_COMMIT: ${{ needs.plan.outputs.commit }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           token: ${{ secrets.ROLL_TOKEN || github.token }}
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
+      # The release is cut as "the last release on a newer BoringSSL": only
+      # from the commit the gate above ran on, and only when that commit is
+      # the last release itself. Commits waiting for the next release, a
+      # release candidate, or a push made while the gate was running stop the
+      # roll here (and `report` says so) instead of being published with it.
+      - name: Main is the last release, and is what was verified
+        run: node tools/boringssl.mjs releasable --verified="$GITHUB_SHA"
       - name: Commit the new pin and its release note
         run: |
           git config user.name "github-actions[bot]"

@@ -17,6 +17,10 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   loadEngine,
   startFixtureServer,
@@ -27,6 +31,7 @@ import {
   responsesComplete,
   delay,
   waitFor,
+  exchange,
 } from './helpers.mjs';
 
 const engine = await loadEngine();
@@ -329,6 +334,81 @@ describe('@morojs/engine hardening conformance', { skip }, () => {
         }
       }
     );
+  });
+
+
+  // A server listens once. listen() on one that is already listening, has
+  // stopped listening or is closing is refused with EINVAL on every
+  // transport, as libuv's own listener always refused it. The epoll and
+  // io_uring listeners opened a second socket instead: over the first one (it
+  // stopped accepting and was never closed), into a poll handle that was in
+  // the middle of closing (libuv ends the process on that), or behind a
+  // close(), where nothing would ever close it again and the thread could
+  // not end. One child process per order, since ending is what is asserted.
+  it('listen() is refused on a server that is listening, has stopped listening or is closing', T, () => {
+    const orders = {
+      'listen, listen': `
+        const first = engine.listen(sid, '127.0.0.1', 0);
+        tryListen();
+        report.firstPortAnswers = /200 OK/.test(await get(first));
+        engine.close(sid);`,
+      'listen, stopListening, listen': `
+        engine.listen(sid, '127.0.0.1', 0);
+        engine.stopListening(sid);
+        tryListen();
+        await sleep(50);
+        engine.close(sid);`,
+      'close, listen': `
+        engine.close(sid);
+        tryListen();`,
+      'listen, close, listen': `
+        engine.listen(sid, '127.0.0.1', 0);
+        engine.close(sid);
+        tryListen();`,
+      'listen whose host argument closes the server': `
+        try { engine.listen(sid, { toString() { engine.close(sid); return '127.0.0.1'; } }, 0); report.second = 'listening'; } catch (e) { report.second = e.code; }`,
+    };
+    for (const [name, body] of Object.entries(orders)) {
+      // In a worker thread: a listener left behind shows as a thread that
+      // cannot be terminated.
+      const script = `
+        import { Worker, isMainThread, parentPort } from 'node:worker_threads';
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        if (isMainThread) {
+          const w = new Worker(new URL(import.meta.url));
+          const report = await new Promise((resolve, reject) => { w.once('message', resolve); w.once('error', reject); });
+          report.terminated = await Promise.race([w.terminate().then(() => true), sleep(3000).then(() => false)]);
+          console.log(JSON.stringify(report));
+          if (!report.terminated) process.kill(process.pid, 'SIGKILL');  // exiting would wait for the thread
+          process.exit(0);
+        } else {
+          const net = await import('node:net');
+          const { default: engine } = await import(${JSON.stringify(new URL('../packages/engine/index.mjs', import.meta.url).href)});
+          const report = {};
+          const sid = engine.serve({ onRequest(reqId) { engine.respond(reqId, 200, null, 'ok'); }, onAborted() {} });
+          const tryListen = () => { try { engine.listen(sid, '127.0.0.1', 0); report.second = 'listening'; } catch (e) { report.second = e.code; } };
+          const get = (port) => new Promise((resolve) => {
+            const s = net.connect(port, '127.0.0.1', () => s.write('GET / HTTP/1.1\\r\\nHost: t\\r\\nConnection: close\\r\\n\\r\\n'));
+            let b = ''; s.on('data', (d) => (b += d)); s.on('close', () => resolve(b)); s.on('error', () => resolve(b));
+            setTimeout(() => s.destroy(), 1500);
+          });
+          ${body}
+          await sleep(50);
+          parentPort.postMessage(report);
+        }
+      `;
+      const file = path.join(os.tmpdir(), `moro-listen-order-${process.pid}-${Object.keys(orders).indexOf(name)}.mjs`);
+      fs.writeFileSync(file, script);
+      try {
+        const r = spawnSync(process.execPath, [file], { encoding: 'utf8', timeout: 20000 });
+        assert.equal(r.status, 0, `${name}: status ${r.status} signal ${r.signal}\n${r.stdout}${r.stderr.slice(-600)}`);
+        const expected = { second: 'EINVAL', terminated: true };
+        if (name === 'listen, listen') expected.firstPortAnswers = true;
+        assert.deepEqual(JSON.parse(r.stdout.trim()), { ...expected }, name);
+      } finally {
+        fs.rmSync(file, { force: true });
+      }
+    }
   });
 
   // -------------------------------------------------------------------------
@@ -834,5 +914,468 @@ describe('@morojs/engine hardening conformance', { skip }, () => {
         assert.equal(res.body, 'hello');
       }
     );
+  });
+});
+
+describe('responses built from handler input', { skip }, () => {
+  it('a field name or value carrying CR, LF, NUL or another control byte is left out; nothing of it is sent', T, async () => {
+    await withServer((ctx) => {
+      ctx.respond(200, [
+        'x-ok', 'fine',
+        'x-crlf', 'a\r\nInjected: 1',
+        'x-lf', 'a\nInjected: 2',
+        'x-cr', 'a\rInjected: 3',
+        'x-nul', 'a\x00b',
+        'x-vt', 'a\x0bb',
+        'x-del', 'a\x7fb',
+        'x-name\r\nInjected: 4', 'v',
+        'x-name\x00', 'v',
+        'x name', 'v',
+        'x:name', 'v',
+        '', 'v',
+        'set-cookie', 'a=b\r\nSet-Cookie: evil=1',
+        'location', '/x\r\nInjected: 5\r\n\r\n<html>',
+        'x-obj', { toString: () => 'o\r\nInjected: 6' },
+        'x-arr', ['a', 'b\r\nInjected: 7'],
+        'x-wide', 'čĊ', // code units whose low bytes are CR LF
+        'x-tab', 'a\tb',
+      ], 'BODY');
+    }, async (server) => {
+      const r = await exchange(server, get('/') + get('/'));
+      assert.equal(r.responses.length, 2, 'two requests, exactly two responses');
+      assert.ok(!/Injected/i.test(r.raw), 'no injected field');
+      assert.ok(!r.raw.includes('evil=1'));
+      assert.ok(!r.raw.includes('<html>'));
+      assert.ok(!r.raw.includes('\x00') && !r.raw.includes('\x0b') && !r.raw.includes('\x7f'));
+      const names = r.responses[0].rawHeaders.filter((_, i) => i % 2 === 0);
+      assert.deepEqual(names, ['Date', 'x-ok', 'x-wide', 'x-tab', 'Content-Length']);
+      // the wide characters went out as UTF-8, not truncated to their low bytes
+      assert.equal(Buffer.from(r.responses[0].headers['x-wide'], 'latin1').toString('utf8'), 'čĊ');
+      assert.equal(r.responses[0].body, 'BODY');
+    });
+  });
+
+  it('a handler cannot set the framing or hop-by-hop fields the engine writes itself', T, async () => {
+    await withServer((ctx) => {
+      ctx.respond(200, ['Transfer-Encoding', 'chunked', 'TRANSFER-ENCODING', 'gzip', 'Connection', 'close', 'Keep-Alive', 'timeout=5', 'Date', 'yesterday', 'content-length', '-5', 'Content-Length', '1e3', 'content-length', ' 4'], 'BODY');
+    }, async (server) => {
+      const r = await exchange(server, get('/') + get('/'));
+      assert.equal(r.responses.length, 2);
+      const h = r.responses[0].headers;
+      assert.equal(h['content-length'], '4');
+      assert.ok(!('transfer-encoding' in h) && !('connection' in h) && !('keep-alive' in h));
+      assert.notEqual(h.date, 'yesterday');
+      assert.equal(r.closed, false);
+    });
+  });
+
+  it('a Content-Length that disagrees with the body of respond() is replaced by the real length, on HTTP/1.0 too', T, async () => {
+    await withServer((ctx) => ctx.respond(200, ['content-length', ctx.path === '/big' ? '100' : '2'], 'exact-body'), async (server) => {
+      for (const path of ['/big', '/small']) {
+        const r = await exchange(server, get(path) + get(path));
+        assert.equal(r.responses.length, 2);
+        assert.equal(r.responses[0].headers['content-length'], '10');
+        assert.equal(r.responses[0].body, 'exact-body');
+      }
+      const r = await exchange(server, 'GET /big HTTP/1.0\r\n\r\n');
+      assert.equal(r.responses[0].headers['content-length'], '10');
+    });
+  });
+
+  it('a second respond(), and write()/end() after a completed response, change nothing on the wire', T, async () => {
+    await withServer((ctx) => {
+      ctx.respond(200, null, 'one');
+      ctx.respond(500, null, 'two');
+      ctx.write('three');
+      ctx.end('four');
+      ctx.writeHead(404, null);
+    }, async (server) => {
+      const r = await exchange(server, get('/') + get('/'));
+      assert.deepEqual(r.responses.map((x) => x.body), ['one', 'one']);
+      assert.equal(r.responses[1].rest, '');
+    });
+  });
+
+  // respond() once the head is out (writeHead() or write() came first - an
+  // error path that answers 500 for a handler that failed mid-stream): no
+  // second status line may follow the first. Sent as it used to be, the
+  // client read it as body bytes and every later response out of step.
+  const startThenRespond = {
+    'a declared length not yet reached': (ctx) => { ctx.writeHead(200, ['content-length', '400']); ctx.write('part'); ctx.respond(500, null, 'boom'); },
+    'a chunked body': (ctx) => { ctx.writeHead(200, null); ctx.write('part'); ctx.respond(500, null, 'boom'); },
+    'an implicit head (write() first)': (ctx) => { ctx.write('part'); ctx.respond(500, null, 'boom'); },
+    'a later turn': (ctx) => { ctx.writeHead(200, ['content-length', '400']); ctx.write('part'); setTimeout(() => ctx.respond(500, null, 'boom'), 20); },
+    'a prepared response': (ctx, server) => { ctx.writeHead(200, null); ctx.write('part'); engine.respondPrepared(ctx.reqId, engine.prepareResponse(server.serverId, 500, null), 'boom'); },
+  };
+  for (const [name, handler] of Object.entries(startThenRespond)) {
+    for (const method of ['GET', 'HEAD']) {
+      it(`respond() after the head has been sent (${name}, ${method}) ends the response there and closes; no second head is written`, T, async () => {
+        let server;
+        await withServer((ctx) => (ctx.path === '/next' ? ctx.respond(200, null, 'NEXT') : handler(ctx, server)), async (s) => {
+          server = s;
+          const r = await exchange(server, `${method} /first HTTP/1.1\r\nHost: t\r\n\r\n` + get('/next') + get('/next'), { wait: 300 });
+          assert.equal((r.raw.match(/HTTP\/1\.1 /g) || []).length, 1, `one status line on the wire: ${JSON.stringify(r.raw)}`);
+          assert.ok(r.raw.startsWith('HTTP/1.1 200 '));
+          assert.ok(!r.raw.includes('boom') && !r.raw.includes('NEXT'));
+          if (method === 'GET') assert.ok(r.raw.endsWith('part') || r.raw.endsWith('part\r\n'), 'the body stops where the handler left it');
+          assert.equal(r.closed, true, 'the connection is closed behind the unfinished response');
+          assert.equal(server.aborted.length, 0, 'the request was answered, not aborted');
+        });
+      });
+    }
+  }
+});
+
+describe('slow and silent clients', { skip }, () => {
+  const echo = (ctx) => ctx.respond(200, null, ctx.path);
+
+  it('a connection that sends nothing is closed at idleTimeoutMs, with no response', T, async () => {
+    await withServer(echo, { idleTimeoutMs: 400, requestTimeoutMs: 0 }, async (server) => {
+      const c = await openRaw(server.port);
+      const t0 = Date.now();
+      await c.waitClose(4000);
+      const raw = await c.read().catch(() => '');
+      assert.equal(raw, '');
+      assert.ok(Date.now() - t0 >= 200, 'not at once: the sweep runs every 250 ms and closes on the second pass');
+      c.destroy();
+    });
+  });
+
+  it('an idle keep-alive connection is closed at idleTimeoutMs after its last request', T, async () => {
+    await withServer(echo, { idleTimeoutMs: 400 }, async (server) => {
+      const c = await openRaw(server.port);
+      await c.send(get('/one'));
+      assert.equal(parseResponse(await c.read()).status, 200);
+      await c.waitClose(4000);
+      c.destroy();
+    });
+  });
+
+  it('a body that trickles in keeps the connection from idling out but not past requestTimeoutMs (408)', T, async () => {
+    await withServer(echo, { idleTimeoutMs: 400, requestTimeoutMs: 1200 }, async (server) => {
+      const c = await openRaw(server.port);
+      try {
+        await c.send(`POST /p HTTP/1.1${CRLF}Host: t${CRLF}Content-Length: 1000${CRLF}${CRLF}`);
+        const t0 = Date.now();
+        // one byte every 100 ms: always inside the idle window
+        while (!c.closed && Date.now() - t0 < 6000) {
+          await c.send('x').catch(() => {});
+          await delay(100);
+        }
+        const res = parseResponse(await c.read().catch(() => ''));
+        assert.equal(res.status, 408);
+        assert.equal(res.headers.connection, 'close');
+        assert.ok(Date.now() - t0 >= 1000 && Date.now() - t0 < 4000, `closed after ${Date.now() - t0} ms`);
+        assert.equal(server.requests.length, 0);
+      } finally {
+        c.destroy();
+      }
+    });
+  });
+
+  it('with both receive timeouts off a silent connection is kept', T, async () => {
+    await withServer(echo, { idleTimeoutMs: 0, requestTimeoutMs: 0 }, async (server) => {
+      const c = await openRaw(server.port);
+      await c.send('GET / HT');
+      await delay(1500);
+      assert.equal(c.closed, false);
+      c.destroy();
+    });
+  });
+
+  it('the time a handler takes is not counted against either receive timeout', T, async () => {
+    await withServer((ctx) => { setTimeout(() => ctx.respond(200, null, 'late'), 1200); }, { idleTimeoutMs: 400, requestTimeoutMs: 400 }, async (server) => {
+      const res = parseResponse(await rawRequest(server.port, get('/'), { timeout: 5000 }));
+      assert.equal(res.status, 200);
+      assert.equal(res.body, 'late');
+    });
+  });
+});
+
+// idleTimeoutMs is for a connection nobody is using. One whose response is
+// still being written to a peer that is reading it is in use, whether the
+// handler answered later (the request stays active until the last byte is
+// out) or before it returned (the response is complete once framed, with its
+// bytes still queued). How long delivery may take is responseTimeoutMs.
+describe('idle timeout and a response still being delivered', { skip }, () => {
+  // Read `port`'s answer to one GET at about `rate` bytes per second.
+  function slowDownload(port, rate) {
+    return new Promise((resolve) => {
+      let got = 0;
+      let expected = -1;
+      let head = Buffer.alloc(0);
+      const t0 = Date.now();
+      const s = net.connect({ host: '127.0.0.1', port }, () => s.write(get('/big')));
+      s.pause();
+      const slice = Math.ceil(rate / 20);
+      const done = (why) => {
+        clearInterval(pull);
+        clearTimeout(guard);
+        s.destroy();
+        resolve({ got, expected, why, ms: Date.now() - t0 });
+      };
+      const pull = setInterval(() => {
+        const chunk = s.read(slice) ?? s.read();
+        if (!chunk) return;
+        got += chunk.length;
+        if (expected === -1) {
+          head = Buffer.concat([head, chunk]);
+          const headEnd = head.indexOf('\r\n\r\n');
+          if (headEnd !== -1) {
+            const m = /content-length: (\d+)/i.exec(head.subarray(0, headEnd).toString('latin1'));
+            expected = headEnd + 4 + Number(m[1]);
+          }
+        }
+        if (expected > 0 && got >= expected) done('complete');
+      }, 50);
+      const guard = setTimeout(() => done('timeout'), 30000);
+      s.on('close', () => done('closed'));
+      s.on('error', () => {});
+    });
+  }
+
+  it('capabilities.idleSparesDrainingResponse is reported', T, () => {
+    assert.equal(engine.probe().capabilities.idleSparesDrainingResponse, true);
+  });
+
+  const body = Buffer.alloc(8 * 1024 * 1024, 0x64);
+  for (const [name, handler] of [
+    ['answered before the handler returns', (ctx) => ctx.respond(200, null, body)],
+    ['answered later', (ctx) => void setImmediate(() => ctx.respond(200, null, body))],
+  ]) {
+    it(`a large response ${name} reaches a slow reader in full, well past idleTimeoutMs`, { timeout: 60000 }, async () => {
+      await withServer(handler, { idleTimeoutMs: 500, responseTimeoutMs: 5000 }, async ({ port, aborted }) => {
+        const r = await slowDownload(port, 2 * 1024 * 1024); // ~4 s for 8 MiB
+        assert.equal(r.why, 'complete', `the download ended "${r.why}" after ${r.ms} ms with ${r.got} of ${r.expected} bytes`);
+        assert.ok(r.ms > 1500, `the download outlasted the idle timeout several times over (${r.ms} ms)`);
+        assert.equal(aborted.length, 0);
+      });
+    });
+  }
+
+  it('the connection idles out as usual once the response has been delivered', T, async () => {
+    await withServer((ctx) => ctx.respond(200, null, 'small'), { idleTimeoutMs: 500, responseTimeoutMs: 5000 }, async (server) => {
+      const c = await openRaw(server.port);
+      await c.send(get('/one'));
+      assert.equal(parseResponse(await c.read()).status, 200);
+      const t0 = Date.now();
+      await c.waitClose(4000);
+      assert.ok(Date.now() - t0 >= 200, 'not at once');
+      c.destroy();
+    });
+  });
+
+  it('a peer that stops reading is closed by responseTimeoutMs; with that budget off, by idleTimeoutMs',
+    { timeout: 60000, skip: process.platform === 'win32' && 'loopback absorbs the payload; outbound backpressure is not reproducible on Windows' },
+    async () => {
+    // The peer sends its request and then neither reads nor writes for
+    // `quiet` ms; after that it reads whatever the server still lets it have.
+    // A connection the server closed meanwhile ends short of the body.
+    const size = 32 * 1024 * 1024;
+    const stalled = async (options, quiet) => {
+      let got = 0;
+      await withServer((ctx) => ctx.respond(200, null, Buffer.alloc(size, 0x65)), options, async ({ port }) => {
+        const s = net.connect({ host: '127.0.0.1', port }, () => s.write(get('/big')));
+        s.pause();
+        s.on('error', () => {});
+        await delay(quiet);
+        await new Promise((resolve) => {
+          const guard = setTimeout(resolve, 15000);
+          s.on('data', (d) => { got += d.length; });
+          s.on('close', () => { clearTimeout(guard); resolve(); });
+          s.resume();
+        });
+        s.destroy();
+      });
+      return got;
+    };
+    assert.ok((await stalled({ idleTimeoutMs: 60000, responseTimeoutMs: 1000 }, 3000)) < size, 'closed by responseTimeoutMs');
+    assert.ok((await stalled({ idleTimeoutMs: 1000, responseTimeoutMs: 0, requestTimeoutMs: 0 }, 3000)) < size, 'closed by idleTimeoutMs when responseTimeoutMs is off');
+    // and neither budget fires early: the same pause inside both of them costs nothing
+    assert.ok((await stalled({ idleTimeoutMs: 60000, responseTimeoutMs: 60000 }, 1500)) > size, 'a pause inside the budgets loses nothing');
+  });
+});
+
+// A process at its descriptor limit cannot accept. The transports that make
+// the accept call themselves (epoll, io_uring) must then wait for a
+// descriptor, not ask again on every loop turn: an event loop that never
+// sleeps, for as long as peers hold the process at its limit.
+describe('the accept path at the descriptor limit', { skip }, () => {
+  const ENGINE_ENTRY = new URL('../packages/engine/index.mjs', import.meta.url).href;
+  const own = engine && ['epoll', 'uring'].includes(engine.probe().transport);
+  const skipHere = !own && 'the libuv transport leaves accept to libuv';
+
+  // The subject serves under RLIMIT_NOFILE 64 and takes every descriptor
+  // that is left, the way an application at its limit holds them. `order`:
+  //   'listen-first'  it was listening before the descriptors ran out;
+  //   'limit-first'   they ran out first - the transport could not open the
+  //                   spare descriptor it sheds waiting connections with -
+  //                   and it listens with the one that then came back.
+  // On 'measure' it reports the CPU time it used over one second, on 'free'
+  // it gives the descriptors back.
+  const subject = (order) => `
+    import fs from 'node:fs';
+    const { default: engine } = await import(${JSON.stringify(ENGINE_ENTRY)});
+    const sid = engine.serve({ onRequest(reqId) { engine.respond(reqId, 200, null, 'ok'); }, onAborted() {} }, {});
+    const taken = [];
+    const exhaust = () => { try { for (;;) taken.push(fs.openSync('/dev/null', 'r')); } catch {} };
+    let port;
+    if (${JSON.stringify(order)} === 'limit-first') {
+      exhaust();
+      try { engine.listen(sid, '127.0.0.1', 0); } catch {}
+      fs.closeSync(taken.pop());
+      port = engine.listen(sid, '127.0.0.1', 0);
+    } else {
+      port = engine.listen(sid, '127.0.0.1', 0);
+      exhaust();
+    }
+    console.log('PORT ' + port);
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (d) => {
+      if (d.includes('measure')) {
+        const before = process.cpuUsage();
+        setTimeout(() => { const u = process.cpuUsage(before); console.log('CPU ' + Math.round((u.user + u.system) / 1000)); }, 1000);
+      }
+      if (d.includes('free')) { for (const fd of taken.splice(0)) fs.closeSync(fd); console.log('FREED'); }
+      if (d.includes('exit')) { engine.close(sid); process.stdin.destroy(); }
+    });
+  `;
+
+  for (const order of ['listen-first', 'limit-first']) {
+    it(`peers that arrive while no descriptor is free cost no CPU, and are served once one is (${order})`, { ...T, skip: skipHere }, async () => {
+      const child = spawn('sh', ['-c', 'ulimit -n 64; exec "$0" --input-type=module -e "$SUBJECT"', process.execPath], {
+        env: { ...process.env, SUBJECT: subject(order) },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let out = '';
+      let err = '';
+      child.stdout.on('data', (d) => { out += d; });
+      child.stderr.on('data', (d) => { err += d; });
+      const exited = new Promise((resolve) => child.on('exit', resolve));
+      const said = async (re) => {
+        let m;
+        await waitFor(() => (m = re.exec(out)) !== null || child.exitCode !== null, { timeout: 10000 }).catch(() => {});
+        assert.ok(m, `the subject said ${re} (stdout: ${out}; stderr: ${err})`);
+        return m;
+      };
+      const peers = [];
+      try {
+        const port = parseInt((await said(/PORT (\d+)/))[1], 10);
+        for (let i = 0; i < 8; i++) {
+          const s = net.connect(port, '127.0.0.1');
+          s.on('error', () => {});
+          peers.push(s);
+        }
+        await delay(300);
+        child.stdin.write('measure\n');
+        const cpuMs = parseInt((await said(/CPU (\d+)/))[1], 10);
+        assert.ok(cpuMs < 300, `an idle second at the limit, with peers waiting, used ${cpuMs} ms of CPU`);
+        child.stdin.write('free\n');
+        await said(/FREED/);
+        // Accepting starts again within a sweep of the descriptors coming back.
+        const res = parseResponse(await rawRequest(port, get('/', `Connection: close${CRLF}`), { expectClose: true, timeout: 5000 }));
+        assert.equal(res.status, 200);
+      } finally {
+        for (const s of peers) s.destroy();
+        child.stdin.write('exit\n');
+        const guard = setTimeout(() => child.kill('SIGKILL'), 5000);
+        const code = await exited;
+        clearTimeout(guard);
+        assert.equal(code, 0, `the subject ends by itself after close(): ${err}`);
+      }
+    });
+  }
+});
+
+// The same on the libuv transport of a Linux host, where the engine makes
+// the accept call as well. The hard case there is an application that
+// competes for descriptors from other threads: the descriptor the listener
+// gives up for a moment to turn a waiting peer away is taken before the
+// listener has it back, and from then on a waiting connection can be neither
+// accepted nor dropped.
+describe('the libuv accept path at the descriptor limit', { skip }, () => {
+  const ENGINE_ENTRY = new URL('../packages/engine/index.mjs', import.meta.url).href;
+  const here = engine && process.platform === 'linux' && engine.probe().transport === 'uv';
+  const skipHere = !here && 'the libuv transport on Linux only (the engine makes the accept call there)';
+
+  // The subject serves under RLIMIT_NOFILE 64, takes every descriptor that
+  // is left and keeps four pool threads asking for another, the way an
+  // application that opens files does at its limit. 'calm' stops those and
+  // reports how many they got, 'measure' reports the CPU time of one second,
+  // 'free' gives every descriptor back.
+  const subject = `
+    import fs from 'node:fs';
+    const { default: engine } = await import(${JSON.stringify(ENGINE_ENTRY)});
+    const sid = engine.serve({ onRequest(reqId) { engine.respond(reqId, 200, null, 'ok'); }, onAborted() {} }, {});
+    const port = engine.listen(sid, '127.0.0.1', 0);
+    const taken = [];
+    try { for (;;) taken.push(fs.openSync('/dev/null', 'r')); } catch {}
+    const held = taken.length;
+    let asking = true;
+    const ask = () => { if (asking) fs.open('/dev/null', 'r', (err, fd) => { if (!err) taken.push(fd); ask(); }); };
+    for (let i = 0; i < 4; i++) ask();
+    console.log('PORT ' + port);
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (d) => {
+      if (d.includes('calm')) { asking = false; setTimeout(() => console.log('TOOK ' + (taken.length - held)), 100); }
+      if (d.includes('measure')) {
+        const before = process.cpuUsage();
+        setTimeout(() => { const u = process.cpuUsage(before); console.log('CPU ' + Math.round((u.user + u.system) / 1000)); }, 1000);
+      }
+      if (d.includes('free')) { for (const fd of taken.splice(0)) fs.closeSync(fd); console.log('FREED'); }
+      if (d.includes('exit')) { engine.close(sid); process.stdin.destroy(); }
+    });
+  `;
+
+  it('peers that can be neither accepted nor turned away cost no CPU, and service resumes with the descriptors', { ...T, skip: skipHere }, async () => {
+    const child = spawn('sh', ['-c', 'ulimit -n 64; exec "$0" --input-type=module -e "$SUBJECT"', process.execPath], {
+      env: { ...process.env, SUBJECT: subject },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    const exited = new Promise((resolve) => child.on('exit', resolve));
+    const said = async (re) => {
+      let m;
+      await waitFor(() => (m = re.exec(out)) !== null || child.exitCode !== null, { timeout: 10000 }).catch(() => {});
+      assert.ok(m, `the subject said ${re} (stdout: ${out}; stderr: ${err})`);
+      return m;
+    };
+    const peers = [];
+    const knock = (port) =>
+      new Promise((resolve) => {
+        const s = net.connect(port, '127.0.0.1');
+        s.on('error', () => {});
+        s.on('connect', resolve);
+        s.on('close', resolve);
+        peers.push(s);
+      });
+    try {
+      const port = parseInt((await said(/PORT (\d+)/))[1], 10);
+      // Each of these makes the listener lend its spare descriptor once.
+      for (let i = 0; i < 300; i++) await knock(port);
+      child.stdin.write('calm\n');
+      const took = parseInt((await said(/TOOK (\d+)/))[1], 10);
+      for (let i = 0; i < 8; i++) await knock(port);
+      await delay(300);
+      child.stdin.write('measure\n');
+      const cpuMs = parseInt((await said(/CPU (\d+)/))[1], 10);
+      assert.ok(cpuMs < 300, `an idle second at the limit, with peers waiting, used ${cpuMs} ms of CPU (the pool threads took ${took} descriptor(s))`);
+      for (const s of peers.splice(0)) s.destroy();
+      child.stdin.write('free\n');
+      await said(/FREED/);
+      // Accepting starts again within a sweep of the descriptors coming back.
+      const res = parseResponse(await rawRequest(port, get('/', `Connection: close${CRLF}`), { expectClose: true, timeout: 5000 }));
+      assert.equal(res.status, 200);
+    } finally {
+      for (const s of peers) s.destroy();
+      child.stdin.write('exit\n');
+      const guard = setTimeout(() => child.kill('SIGKILL'), 5000);
+      const code = await exited;
+      clearTimeout(guard);
+      assert.equal(code, 0, `the subject ends by itself after close(): ${err}`);
+    }
   });
 });

@@ -35,6 +35,8 @@
 
 #include <cstdint>
 
+#include "thread_state.h"
+
 namespace moro {
 namespace engine {
 namespace fastcall {
@@ -50,11 +52,13 @@ enum Fn : int {
   kCount
 };
 
-// Per-thread hit counters, exposed through probe().fastCallStats when
-// MORO_ENGINE_FASTCALL_STATS=1 (the "Counting" instantiations are installed
-// then). Proof, per ABI, that the fast path is actually taken.
-inline thread_local uint64_t g_fastHits[kCount] = {};
-inline thread_local uint64_t g_slowHits[kCount] = {};
+// Per-thread hit counters (in the thread's ThreadState), exposed through
+// probe().fastCallStats when MORO_ENGINE_FASTCALL_STATS=1 (the "Counting"
+// instantiations are installed then). Proof, per ABI, that the fast path is
+// actually taken.
+static_assert(kCount == ThreadState::kFastFns, "ThreadState holds one counter per fast function");
+inline uint64_t* fastHits() { return threadState().fastHits; }
+inline uint64_t* slowHits() { return threadState().slowHits; }
 
 inline const char* fnName(int i) {
   static const char* const names[kCount] = {
@@ -82,11 +86,11 @@ namespace engine {
 namespace fastcall {
 
 // A FastOneByteString is Latin-1. ASCII passes through untouched (it IS the
-// UTF-8); bytes >= 0x80 are UTF-8-encoded into a per-thread scratch buffer -
-// the exact bytes the slow path's ByteSource produces. The scratch is
-// consumed by the Server call before this function returns (respond/write/end
-// copy into engine-owned buffers), so one buffer per thread suffices.
-inline thread_local std::string g_bodyScratch;
+// UTF-8); bytes >= 0x80 are UTF-8-encoded into a per-thread scratch buffer
+// (ThreadState::fastBodyScratch) - the exact bytes the slow path's ByteSource
+// produces. The scratch is consumed by the Server call before this function
+// returns (respond/write/end copy into engine-owned buffers), so one buffer
+// per thread suffices.
 
 struct Bytes {
   const char* data;
@@ -96,8 +100,9 @@ struct Bytes {
 inline Bytes bytesOf(const v8::FastOneByteString& s) {
   const uint8_t* p = reinterpret_cast<const uint8_t*>(s.data);
   if (text::isAscii(p, s.length)) return Bytes{s.data, s.length};
-  text::latin1ToUtf8(p, s.length, g_bodyScratch);
-  return Bytes{g_bodyScratch.data(), g_bodyScratch.size()};
+  std::string& scratch = threadState().fastBodyScratch;
+  text::latin1ToUtf8(p, s.length, scratch);
+  return Bytes{scratch.data(), scratch.size()};
 }
 
 // The first parameter is the receiver (`this`), which V8 always passes to a
@@ -106,7 +111,7 @@ inline Bytes bytesOf(const v8::FastOneByteString& s) {
 template <bool Counting>
 void RespondPrepared(v8::Local<v8::Value>, uint32_t reqId, uint32_t tplId,
                      const v8::FastOneByteString& body) {
-  if (Counting) ++g_fastHits[kRespondPrepared];
+  if (Counting) ++fastHits()[kRespondPrepared];
   Connection* c = Server::lookup(reqId);
   if (!c) return;
   const Bytes b = bytesOf(body);
@@ -115,7 +120,7 @@ void RespondPrepared(v8::Local<v8::Value>, uint32_t reqId, uint32_t tplId,
 
 template <bool Counting>
 void RespondPreparedEmpty(v8::Local<v8::Value>, uint32_t reqId, uint32_t tplId) {
-  if (Counting) ++g_fastHits[kRespondPreparedEmpty];
+  if (Counting) ++fastHits()[kRespondPreparedEmpty];
   Connection* c = Server::lookup(reqId);
   if (!c) return;
   c->server->respondTemplate(c, tplId, nullptr, 0);
@@ -123,7 +128,7 @@ void RespondPreparedEmpty(v8::Local<v8::Value>, uint32_t reqId, uint32_t tplId) 
 
 template <bool Counting>
 void WriteHeadPrepared(v8::Local<v8::Value>, uint32_t reqId, uint32_t tplId) {
-  if (Counting) ++g_fastHits[kWriteHeadPrepared];
+  if (Counting) ++fastHits()[kWriteHeadPrepared];
   Connection* c = Server::lookup(reqId);
   if (!c) return;
   c->server->writeHeadTemplate(c, tplId);
@@ -131,7 +136,7 @@ void WriteHeadPrepared(v8::Local<v8::Value>, uint32_t reqId, uint32_t tplId) {
 
 template <bool Counting>
 bool Write(v8::Local<v8::Value>, uint32_t reqId, const v8::FastOneByteString& chunk) {
-  if (Counting) ++g_fastHits[kWrite];
+  if (Counting) ++fastHits()[kWrite];
   Connection* c = Server::lookup(reqId);
   if (!c) return false;
   const Bytes b = bytesOf(chunk);
@@ -140,7 +145,7 @@ bool Write(v8::Local<v8::Value>, uint32_t reqId, const v8::FastOneByteString& ch
 
 template <bool Counting>
 void End(v8::Local<v8::Value>, uint32_t reqId) {
-  if (Counting) ++g_fastHits[kEnd];
+  if (Counting) ++fastHits()[kEnd];
   Connection* c = Server::lookup(reqId);
   if (!c) return;
   c->server->end(c, nullptr, 0);
@@ -148,7 +153,7 @@ void End(v8::Local<v8::Value>, uint32_t reqId) {
 
 template <bool Counting>
 void EndWith(v8::Local<v8::Value>, uint32_t reqId, const v8::FastOneByteString& chunk) {
-  if (Counting) ++g_fastHits[kEndWith];
+  if (Counting) ++fastHits()[kEndWith];
   Connection* c = Server::lookup(reqId);
   if (!c) return;
   const Bytes b = bytesOf(chunk);
@@ -157,7 +162,7 @@ void EndWith(v8::Local<v8::Value>, uint32_t reqId, const v8::FastOneByteString& 
 
 template <bool Counting>
 bool IsAborted(v8::Local<v8::Value>, uint32_t reqId) {
-  if (Counting) ++g_fastHits[kIsAborted];
+  if (Counting) ++fastHits()[kIsAborted];
   return Server::lookup(reqId) == nullptr;
 }
 

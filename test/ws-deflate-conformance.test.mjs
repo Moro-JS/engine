@@ -3,8 +3,11 @@
 // Drives the engine over a raw TCP socket, building compressed client frames
 // with node:zlib (raw deflate, RSV1 set, masked). Verifies negotiation,
 // roundtrip both directions, context takeover, the zip-bomb cap (close 1009),
-// invalid UTF-8 after inflate (close 1007), and that RSV1 without negotiation
-// still fails.
+// invalid UTF-8 after inflate (close 1007), bytes that are not a deflate
+// stream (close 1007, not 1009), that nothing behind a message that failed
+// to inflate is delivered, that an offer RFC 7692 section 7 says to decline
+// is declined (the connection opens uncompressed), and that RSV1 without
+// negotiation still fails.
 //
 // Run with: node --test
 
@@ -73,7 +76,10 @@ async function startEcho(options) {
       onAborted() {},
       onWsOpen() {},
       onWsMessage(wsId, data, isBinary) {
-        messages.push({ size: typeof data === 'string' ? Buffer.byteLength(data) : data.byteLength });
+        messages.push({
+          size: typeof data === 'string' ? Buffer.byteLength(data) : data.byteLength,
+          text: typeof data === 'string' ? data : null,
+        });
         engine.wsSend(wsId, data, isBinary);
       },
       onWsClose(wsId, code) {
@@ -88,13 +94,16 @@ async function startEcho(options) {
 
 // offerDeflate: false (no offer), true (bare permessage-deflate offer), or a
 // string used verbatim as the Sec-WebSocket-Extensions value.
+// An array is sent as one Sec-WebSocket-Extensions line per element.
 async function handshake(client, offerDeflate) {
   const key = crypto.randomBytes(16).toString('base64');
   let req =
     `GET / HTTP/1.1${CRLF}Host: t${CRLF}Upgrade: websocket${CRLF}` +
     `Connection: Upgrade${CRLF}Sec-WebSocket-Key: ${key}${CRLF}` +
     `Sec-WebSocket-Version: 13${CRLF}`;
-  if (offerDeflate) {
+  if (Array.isArray(offerDeflate)) {
+    for (const offer of offerDeflate) req += `Sec-WebSocket-Extensions: ${offer}${CRLF}`;
+  } else if (offerDeflate) {
     const offer = typeof offerDeflate === 'string' ? offerDeflate : 'permessage-deflate';
     req += `Sec-WebSocket-Extensions: ${offer}${CRLF}`;
   }
@@ -213,6 +222,131 @@ describe('@morojs/engine permessage-deflate conformance', { skip }, () => {
       assert.equal(f.payload.readUInt16BE(0), 1002, 'unnegotiated RSV1 is a protocol error');
     } finally {
       client.destroy();
+      server.close();
+    }
+  });
+
+  it('closes with 1007, not 1009, when a compressed message is not a deflate stream', T, async () => {
+    // RFC 6455 section 7.4.1: 1009 says the message was too big to process,
+    // 1007 that its data is not consistent with its type. A stream that
+    // cannot be inflated at all is the second.
+    const server = await startEcho({ wsDeflate: { threshold: 1 } });
+    const client = await openRaw(server.port);
+    try {
+      await handshake(client, true);
+      // 0x07: BFINAL=1, BTYPE=3 - the reserved block type, invalid in any stream
+      await client.send(frame({ opcode: OP.BINARY, rsv1: true, payload: Buffer.from([0x07, 0xff, 0xff, 0xff]) }));
+      const raw = await client.read({ expectClose: true });
+      const f = parseServerFrame(raw);
+      assert.equal(f.opcode, OP.CLOSE);
+      assert.equal(f.payload.readUInt16BE(0), 1007, 'corrupt compressed data is invalid payload data');
+      assert.deepEqual(server.closes, [1007]);
+      assert.equal(server.messages.length, 0);
+    } finally {
+      client.destroy();
+      server.close();
+    }
+  });
+
+  for (const [why, bad, code] of [
+    ['inflates past the cap', deflateMessage(Buffer.alloc(4096, 0)), 1009],
+    ['is not a deflate stream', Buffer.from([0x07, 0xff, 0xff, 0xff]), 1007],
+  ]) {
+    it(`after a message that ${why}, the frames behind it in the same read are not delivered`, T, async () => {
+      const server = await startEcho({ wsDeflate: { threshold: 1 << 20, maxDecompressedSize: 1024 } });
+      const client = await openRaw(server.port);
+      try {
+        await handshake(client, true);
+        await client.send(
+          Buffer.concat([
+            frame({ opcode: OP.TEXT, payload: 'before' }),
+            frame({ opcode: OP.BINARY, rsv1: true, payload: bad }),
+            frame({ opcode: OP.TEXT, payload: 'after-1' }),
+            frame({ opcode: OP.TEXT, rsv1: true, payload: deflateMessage('after-2') }),
+          ]).toString('latin1')
+        );
+        const raw = Buffer.from(await client.read({ expectClose: true }), 'latin1');
+        // the echo of "before", then the Close; nothing else
+        const echo = parseServerFrame(raw.toString('latin1'));
+        assert.equal(echo.payload.toString(), 'before');
+        const close = parseServerFrame(raw.subarray(2 + echo.payload.length).toString('latin1'));
+        assert.equal(close.opcode, OP.CLOSE);
+        assert.equal(close.payload.readUInt16BE(0), code);
+        assert.equal(raw.length, 2 + echo.payload.length + 4, 'no frame follows the Close');
+        assert.deepEqual(server.messages.map((m) => m.text), ['before'], 'messages behind the failed one reached onWsMessage');
+        assert.deepEqual(server.closes, [code]);
+      } finally {
+        client.destroy();
+        server.close();
+      }
+    });
+  }
+
+  // RFC 7692 section 7: "A server MUST decline an extension negotiation offer
+  // for this extension if any of the following conditions are met: ... the
+  // negotiation offer has an extension parameter with an invalid value; the
+  // negotiation offer has multiple extension parameters with the same name".
+  // Declined means not negotiated: the 101 carries no extension and the
+  // connection works uncompressed.
+  for (const [what, offer] of [
+    ['server_no_context_takeover twice', 'permessage-deflate; server_no_context_takeover; server_no_context_takeover'],
+    ['client_no_context_takeover twice', 'permessage-deflate; client_no_context_takeover; client_no_context_takeover'],
+    ['client_max_window_bits twice', 'permessage-deflate; client_max_window_bits=10; client_max_window_bits=12'],
+    ['server_max_window_bits twice', 'permessage-deflate; server_max_window_bits=10; server_max_window_bits=12'],
+    ['a value on server_no_context_takeover', 'permessage-deflate; server_no_context_takeover=1'],
+    ['a value on client_no_context_takeover', 'permessage-deflate; client_no_context_takeover=yes'],
+    ['server_max_window_bits with a leading zero', 'permessage-deflate; server_max_window_bits=010'],
+    ['client_max_window_bits with a leading zero', 'permessage-deflate; client_max_window_bits=012'],
+  ]) {
+    it(`declines an offer with ${what}; the connection opens uncompressed`, T, async () => {
+      const server = await startEcho({ wsDeflate: { threshold: 1 } });
+      const client = await openRaw(server.port);
+      try {
+        const head = await handshake(client, offer);
+        assert.match(head, /^HTTP\/1\.1 101 /);
+        assert.doesNotMatch(head, /Sec-WebSocket-Extensions/i, `"${offer}" was accepted`);
+        const text = 'plain '.repeat(40);
+        await client.send(frame({ opcode: OP.TEXT, payload: text }));
+        const f = parseServerFrame(await client.read({ until: (s) => s.length >= 4 + text.length }));
+        assert.equal(f.rsv1, false, 'nothing is compressed on a connection that negotiated no extension');
+        assert.equal(f.payload.toString(), text);
+      } finally {
+        client.destroy();
+        server.close();
+      }
+    });
+  }
+
+  it('a declined offer does not stop a later acceptable one in the same list', T, async () => {
+    const server = await startEcho({ wsDeflate: true });
+    const client = await openRaw(server.port);
+    try {
+      const head = await handshake(client, 'permessage-deflate; server_no_context_takeover=1, permessage-deflate; server_max_window_bits=10');
+      assert.match(head, /Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=10\r\n/i);
+    } finally {
+      client.destroy();
+      server.close();
+    }
+  });
+
+  it('several Sec-WebSocket-Extensions lines are read as one list of offers (RFC 6455 section 9.1)', T, async () => {
+    const server = await startEcho({ wsDeflate: true });
+    try {
+      for (const lines of [
+        ['permessage-deflate', 'x-unknown-extension'],
+        ['x-unknown-extension', 'permessage-deflate; server_max_window_bits=10'],
+        ['x-one', 'permessage-deflate; bogus=1', 'permessage-deflate'],
+      ]) {
+        const client = await openRaw(server.port);
+        try {
+          const head = await handshake(client, lines);
+          assert.match(head, /^HTTP\/1\.1 101 /);
+          assert.match(head, /Sec-WebSocket-Extensions: permessage-deflate/i, `offer lines ${JSON.stringify(lines)}`);
+        } finally {
+          client.destroy();
+        }
+      }
+    } finally {
       server.close();
     }
   });

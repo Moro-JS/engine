@@ -46,9 +46,12 @@ static libraries are built once per snapshot and cached in `build/boringssl/`.
 `npm run test:suites` runs everything against the BoringSSL binary and the
 TLS and HTTP/2 suites again against the OpenSSL one.
 
-New Node ABI runbook: add one line to `TARGETS` in `tools/build.mjs`, add the
-Node version to the smoke matrix in `.github/workflows/build.yml`, ship a
-minor release.
+New Node ABI runbook: add one line to `TARGETS` in `tools/build.mjs`, add one
+entry to `TRAINING_NODES` in `tools/pgo.mjs` (the Node.js release the new ABI's
+profile is trained under, with its checksums; without it the ABI is built from
+the nearest ABI's profile), add the
+Node version to the smoke matrices in `.github/workflows/ci.yml` and
+`release.yml`, ship a minor release.
 
 ## Releases
 
@@ -59,7 +62,7 @@ changed in behaviour, what was added or removed from the API, what was
 measured and how. Then:
 
 ```sh
-node tools/release.mjs patch      # or minor / major / an explicit version
+node tools/release.mjs patch      # or minor / major / an explicit version (1.2.0, 1.2.0-rc.1)
 ```
 
 The script refuses to run without the note and its index line, and refuses
@@ -71,13 +74,42 @@ pushes. Drafting the GitHub Release for that tag with the note as its body
 and clicking Publish starts the CI build and the npm publish; nothing
 publishes from a developer machine.
 
+### Release candidates
+
+A version with a prerelease identifier is a release candidate:
+
+```sh
+node tools/release.mjs 1.2.0-rc.1   # then 1.2.0-rc.2 ..., then 1.2.0
+```
+
+It goes through the same workflow and the same gates, and every package is
+published under the npm dist-tag `next`. `latest` does not move, so a plain
+`npm install @morojs/engine` and every semver range keep getting the last
+release; a candidate is installed with `npm install @morojs/engine@next` or
+by its exact version. The note it carries is that of the release it leads to
+(`changelog/v1.2.0.md`). Mark the GitHub Release as a pre-release
+(`gh release create v1.2.0-rc.1 --prerelease ...`; the workflow sets the mark
+if it is missing).
+
+While `main` is at a candidate, the version is always named in full:
+`patch` / `minor` / `major` are refused, as is any version that is not above
+the current one, and the scheduled BoringSSL release waits (it opens its
+issue instead). The forms are `X.Y.Z-rc.N`, `-beta.N` and `-alpha.N`, with N
+from 1; anything else (`1.2.0-rc1`, `1.2.0-1`, build metadata) is refused by
+the script and by the workflow. After `1.2.0` is released, `next` still names
+the last candidate; `npm dist-tag rm @morojs/engine next` (and the same for
+the platform packages) clears it, or the next candidate replaces it.
+
 ## The bundled TLS library
 
 `tools/boringssl.json` pins the BoringSSL snapshot the published binaries
 carry. Nobody is expected to maintain it by hand:
 `.github/workflows/boringssl-roll.yml` checks upstream every week, runs the
 whole CI gate against a newer snapshot, and on green commits the pin and
-publishes a patch release by itself; on red it opens an issue. To move the pin
+publishes a patch release by itself; on red it opens an issue. It releases
+only when `main` is exactly the last release: with commits for the next
+release on `main` it stops (and opens the issue), and the pin moves with
+that next release. To move the pin
 yourself (`node tools/boringssl.mjs roll`), rebuild and run `npm test` before
 committing. `node tools/boringssl.mjs check` says whether the pin is stale;
 `git config core.hooksPath .githooks` runs that check on every push (it warns,

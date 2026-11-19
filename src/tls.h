@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -82,6 +83,10 @@ struct SslConfig {
   std::string keyPem;
   std::string certPem;
   std::string caPem;
+  // Certificate revocation lists (PEM, one or more) for client-certificate
+  // verification, Node's tls `crl`: with any given, a client certificate
+  // must be cleared by the CRL of each CA in its chain.
+  std::string crlPem;
 
   std::string passphrase;   // decrypts an encrypted private key
   std::string ticketKeys;   // 48-byte session-ticket key material (Node layout)
@@ -93,6 +98,7 @@ struct SslConfig {
   std::string ciphersuites; // TLS 1.3 suites by IANA name, colon-separated
   std::string ecdhCurve;    // key-share groups (SSL_CTX_set1_groups_list); "auto" = default
   int minVersion = TLS1_2_VERSION;
+  int maxVersion = 0;       // protocol ceiling; 0 = the library's newest
   bool requestCert = false;         // ask the client for a certificate
   bool rejectUnauthorized = true;   // fail the handshake when it doesn't verify
   bool alpnH2 = false;              // offer "h2" in ALPN (set once HTTP/2 lands)
@@ -109,8 +115,15 @@ struct SslConfig {
 // the queue whether or not any is in use, three frees each - some fifty calls
 // to release nothing, paid before every read and write. The queue is empty
 // here in all but the rare case, and asking is one thread-local load.
+//
+// BoringSSL needs neither: SSL_do_handshake, SSL_read, SSL_write and
+// SSL_shutdown each empty the queue themselves on entry, as its
+// SSL_get_error contract says they must, and asking first was a second
+// lookup of the thread's error state ahead of every one of those calls.
 inline void clearErrorQueue() {
+#ifndef OPENSSL_IS_BORINGSSL
   if (ERR_peek_error() != 0) ERR_clear_error();
+#endif
 }
 
 // Last OpenSSL error as a human-readable string, prefixed with context.
@@ -175,12 +188,8 @@ class TlsContext {
     passphrase_ = cfg.passphrase;
     alpnH2_ = cfg.alpnH2;
 
-    // Session-ID context is mandatory for resumption on verifying servers:
-    // without a sid-ctx, servers with SSL_VERIFY_PEER fatally reject
-    // session-resumption attempts (SSL_R_SESSION_ID_CONTEXT_UNINITIALIZED)
-    // instead of falling back to a full handshake.
-    SSL_CTX_set_session_id_context(
-        ctx_, reinterpret_cast<const unsigned char*>("moro-engine"), 11);
+    // (The session-ID context is set at the end, from the finished policy:
+    // see setSessionContext.)
 
     // ---- session-ticket keys (Node tls.Server `ticketKeys` contract) ----
     // One 48-byte secret in Node's layout: 16-byte key name, 16-byte HMAC
@@ -229,6 +238,12 @@ class TlsContext {
     // (client-initiated renegotiation is a DoS vector), no TLS-level
     // compression (CRIME), server picks the cipher.
     SSL_CTX_set_min_proto_version(ctx_, cfg.minVersion);
+    if (cfg.maxVersion != 0) {
+      if (cfg.maxVersion < cfg.minVersion) return "ssl.maxVersion is below ssl.minVersion";
+      if (SSL_CTX_set_max_proto_version(ctx_, cfg.maxVersion) != 1) {
+        return sslError("SSL_CTX_set_max_proto_version");
+      }
+    }
     SSL_CTX_set_options(ctx_, SSL_OP_NO_RENEGOTIATION | SSL_OP_NO_COMPRESSION |
                                   SSL_OP_CIPHER_SERVER_PREFERENCE);
     // Release idle buffers between records (~34KB/conn saved when quiet) and
@@ -307,6 +322,12 @@ class TlsContext {
       if (names) SSL_CTX_set_client_CA_list(ctx_, names);
     }
 
+    // ---- CRL(s): client certificates the CA has revoked ----
+    if (!cfg.crlPem.empty()) {
+      std::string err = addCrlPem(cfg.crlPem);
+      if (!err.empty()) return err;
+    }
+
     if (cfg.requestCert) {
       int mode = SSL_VERIFY_PEER;
       if (cfg.rejectUnauthorized) mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
@@ -320,7 +341,7 @@ class TlsContext {
     // proceeds without ALPN and is served HTTP/1.1.
     SSL_CTX_set_alpn_select_cb(ctx_, alpnSelectCb, this);
 
-    return "";
+    return setSessionContext(cfg);
   }
 
  private:
@@ -334,7 +355,13 @@ class TlsContext {
   }
 
   static int verifyAccept(int /*preverifyOk*/, X509_STORE_CTX* /*store*/) {
-    return 1;  // rejectUnauthorized=false: accept regardless of verification
+    // rejectUnauthorized=false: accept regardless of verification. What the
+    // failed check left in the thread's error queue goes with it: the
+    // handshake carries on, and SSL_get_error() reads a queued error as the
+    // failure of whichever call next returns without having finished - with
+    // the client's flight split across reads, the handshake's own.
+    ERR_clear_error();
+    return 1;
   }
 
   // Session-ticket key callback implementing Node's setTicketKeys() layout
@@ -580,6 +607,80 @@ class TlsContext {
   }
 #endif
 
+  // The session-ID context: which sessions this context will resume.
+  //
+  // A session is resumed without repeating what the full handshake decided -
+  // no CertificateRequest, no chain verification, and under TLS 1.2 the
+  // cipher the session was made with. Whoever holds the ticket keys can
+  // resume: every server configured with the same ssl.ticketKeys, and the
+  // contexts before and after an updateSsl(), which carries the keys over.
+  // That is only sound between contexts that would have decided the same, so
+  // the context is a digest of the policy: the protocol floor, the cipher
+  // configuration, and - on a server that asks for client certificates -
+  // whether one is required and the set of CA certificates it is verified
+  // against. A session from a context with another policy (a listener that
+  // asks for no certificate, the CA set before it was replaced, a cipher list
+  // since tightened) is not found, and the client gets a full handshake under
+  // the policy in force. Contexts with the same policy still resume each
+  // other's sessions; the server's own certificate and key are not part of
+  // it, so rotating them keeps sessions alive.
+  //
+  // A context is mandatory on a verifying server in any case: without one,
+  // OpenSSL fails a resumption attempt outright
+  // (SSL_R_SESSION_ID_CONTEXT_UNINITIALIZED) instead of falling back.
+  std::string setSessionContext(const SslConfig& cfg) {
+    EVP_MD_CTX* md = EVP_MD_CTX_new();
+    if (!md) return sslError("EVP_MD_CTX_new");
+    bool ok = EVP_DigestInit_ex(md, EVP_sha256(), nullptr) == 1;
+    auto add = [&](const void* p, size_t n) {
+      const uint64_t len = n;  // length-prefixed: no two field sets share an encoding
+      ok = ok && EVP_DigestUpdate(md, &len, sizeof(len)) == 1 && EVP_DigestUpdate(md, p, n) == 1;
+    };
+    static const char kTag[] = "moro-engine session context 1";
+    add(kTag, sizeof(kTag));
+    const int32_t floor = cfg.minVersion;
+    add(&floor, sizeof(floor));
+    add(cfg.ciphers.data(), cfg.ciphers.size());
+    add(cfg.ciphersuites.data(), cfg.ciphersuites.size());
+    const unsigned char clientCert = cfg.requestCert ? (cfg.rejectUnauthorized ? 2 : 1) : 0;
+    add(&clientCert, 1);
+    if (cfg.requestCert) {
+      // The trust anchors as loaded (inline PEM or file), in an order that
+      // does not depend on how they were listed.
+      std::vector<std::string> anchors;
+      STACK_OF(X509_OBJECT)* objects = X509_STORE_get0_objects(SSL_CTX_get_cert_store(ctx_));
+      for (size_t i = 0; objects && i < static_cast<size_t>(sk_X509_OBJECT_num(objects)); i++) {
+        X509* cert = X509_OBJECT_get0_X509(sk_X509_OBJECT_value(objects, i));
+        if (!cert) continue;  // a CRL
+        unsigned char fp[EVP_MAX_MD_SIZE];
+        unsigned int fpLen = 0;
+        if (X509_digest(cert, EVP_sha256(), fp, &fpLen) != 1) {
+          ok = false;
+          break;
+        }
+        anchors.emplace_back(reinterpret_cast<const char*>(fp), fpLen);
+      }
+      std::sort(anchors.begin(), anchors.end());
+      for (const std::string& fp : anchors) add(fp.data(), fp.size());
+      // The revocation lists are part of who is let in: a session made
+      // before a certificate was revoked must not outlive the CRL that
+      // revokes it.
+      add(cfg.crlPem.data(), cfg.crlPem.size());
+    }
+    const int32_t ceiling = cfg.maxVersion;
+    add(&ceiling, sizeof(ceiling));
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digestLen = 0;
+    ok = ok && EVP_DigestFinal_ex(md, digest, &digestLen) == 1;
+    EVP_MD_CTX_free(md);
+    if (!ok) return sslError("deriving the session-ID context");
+    if (digestLen > SSL_MAX_SID_CTX_LENGTH) digestLen = SSL_MAX_SID_CTX_LENGTH;
+    if (SSL_CTX_set_session_id_context(ctx_, digest, digestLen) != 1) {
+      return sslError("SSL_CTX_set_session_id_context");
+    }
+    return "";
+  }
+
   // Inline PEM: first cert = leaf, remainder = intermediate chain.
   std::string useCertPem(const std::string& pem) {
     BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
@@ -658,6 +759,41 @@ class TlsContext {
     return "";
   }
 
+  // ssl.crl: every CRL in the PEM goes into the verification store, and
+  // revocation checking is switched on for the whole chain (the flags
+  // Node's tls sets for its `crl`): a certificate whose issuer has no CRL
+  // here fails, the same as a revoked one.
+  std::string addCrlPem(const std::string& pem) {
+    BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    if (!bio) return sslError("BIO_new_mem_buf(crl)");
+    X509_STORE* store = SSL_CTX_get_cert_store(ctx_);
+    int added = 0;
+    while (X509_CRL* crl = PEM_read_bio_X509_CRL(bio, nullptr, nullptr, nullptr)) {
+      int ok = X509_STORE_add_crl(store, crl);
+      X509_CRL_free(crl);  // X509_STORE_add_crl up-refs
+      if (ok != 1) {
+        BIO_free(bio);
+        return sslError("X509_STORE_add_crl");
+      }
+      added++;
+    }
+    {
+      unsigned long e = ERR_peek_last_error();
+      if (ERR_GET_LIB(e) == ERR_LIB_PEM && ERR_GET_REASON(e) == PEM_R_NO_START_LINE) {
+        ERR_clear_error();
+      } else {
+        BIO_free(bio);
+        return sslError("parsing crl PEM");
+      }
+    }
+    BIO_free(bio);
+    if (added == 0) return "crl contained no PEM revocation lists";
+    if (X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL) != 1) {
+      return sslError("X509_STORE_set_flags");
+    }
+    return "";
+  }
+
   void reset() {
     if (ctx_) {
       SSL_CTX_free(ctx_);
@@ -716,6 +852,17 @@ class TlsSession {
   }
 
   bool handshakeDone() const { return handshakeDone_; }
+
+  // Ciphertext this session wrote while reading (onCiphertext's cipherOut)
+  // that the caller has queued and the peer has not read yet. The caller
+  // keeps the count and holds it to a bound (Server::tlsAnswer): the session
+  // answers the peer's own records - a KeyUpdate, a refused renegotiation -
+  // one for one, for as long as the peer sends them.
+  size_t answerQueued = 0;
+
+  // Which gathering of small replies this session's plaintext belongs to
+  // (Server::TlsGather); zero when it has none. The caller's.
+  uint32_t gatherTicket = 0;
 
   // Whether ALPN settled on HTTP/2 (meaningful once the handshake is done).
   bool alpnIsH2() const {
@@ -837,7 +984,7 @@ class TlsSession {
   // `more`: further plaintext of the same reply follows in another call (a
   // head ahead of its body). It only matters to a direct outlet, below.
   bool writePlain(const char* data, size_t len, std::string& cipherOut, bool more = false) {
-    if (fatal_ || !handshakeDone_) return false;
+    if (!writable()) return false;
     // Usually called from inside onCiphertext's plainSink (a request answered
     // synchronously): the outer call's target is put back afterwards.
     std::string* const outer = out_;
@@ -869,6 +1016,26 @@ class TlsSession {
       off += static_cast<size_t>(n);
     }
     out_ = outer;
+    return true;
+  }
+
+  // Whether writePlain would encrypt right now: the handshake is done and
+  // the session has not failed. A caller that holds plaintext back to encrypt
+  // it with what follows asks first, so that a reply which cannot be
+  // encrypted fails where it is given and not later.
+  bool writable() {
+    if (fatal_ || !handshakeDone_) return false;
+#if defined(MORO_ENGINE_TEST_FAULTS)
+    // Test builds only (tools/build.mjs --sanitize defines it; no shipped
+    // binary does): an encrypt failure on demand, while the variable is set.
+    // Nothing a peer sends makes SSL_write fail on an established session -
+    // the write BIO always accepts - so without this the teardown behind a
+    // failed encrypt (Server::closeForFailedSend) could not be exercised.
+    if (std::getenv("MORO_ENGINE_TEST_FAIL_TLS_WRITE")) {
+      fatal_ = true;
+      return false;
+    }
+#endif
     return true;
   }
 

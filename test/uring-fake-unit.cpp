@@ -183,6 +183,31 @@ int main() {
     bufs.destroy(ring);
     CHECK(FakeSys::st().bufUnregs.size() == 1 && FakeSys::st().bufUnregs[0] == 7);
   }
+  // ---- forEachUnsubmitted: exactly the SQEs the kernel has not consumed ----
+  {
+    FakeSys::reset();
+    Ring<FakeSys> ring;
+    CHECK(ring.open(8, kSetupFlags, 16) == 0);
+    auto fds = [&ring] {
+      std::vector<int> v;
+      ring.forEachUnsubmitted([&v](const abi::io_uring_sqe& s) { v.push_back(s.fd); });
+      return v;
+    };
+    CHECK(fds().empty());
+    for (int i = 0; i < 5; i++) prepClose(ring.sqe(), 40 + i);
+    CHECK((fds() == std::vector<int>{40, 41, 42, 43, 44}));  // none entered yet
+    FakeSys::st().maxSubmitPerEnter = 2;
+    CHECK(ring.enter(0, 0) == 2);
+    CHECK((fds() == std::vector<int>{42, 43, 44}));  // the kernel took the two oldest
+    FakeSys::st().maxSubmitPerEnter = 1u << 30;
+    CHECK(ring.enter(0, 0) == 3);
+    CHECK(fds().empty());
+    // ... across the wrap of the submission ring
+    for (int i = 0; i < 6; i++) prepClose(ring.sqe(), 60 + i);
+    CHECK((fds() == std::vector<int>{60, 61, 62, 63, 64, 65}));
+    CHECK(ring.enter(0, 0) == 6);
+    CHECK(fds().empty());
+  }
   // ---- SQE builders ----
   {
     abi::io_uring_sqe s;
@@ -202,6 +227,9 @@ int main() {
     std::memset(&s, 0, sizeof(s));
     prepCancelFd(&s, 6);
     CHECK(s.opcode == abi::IORING_OP_ASYNC_CANCEL && s.fd == 6 && s.cancel_flags == (abi::IORING_ASYNC_CANCEL_FD | abi::IORING_ASYNC_CANCEL_ALL));
+    std::memset(&s, 0, sizeof(s));
+    prepCancelUserData(&s, 0xabcdef12345678ull);
+    CHECK(s.opcode == abi::IORING_OP_ASYNC_CANCEL && s.fd == -1 && s.addr == 0xabcdef12345678ull && s.cancel_flags == 0);
     std::memset(&s, 0, sizeof(s));
     prepClose(&s, 6);
     CHECK(s.opcode == abi::IORING_OP_CLOSE && s.fd == 6);

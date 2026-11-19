@@ -1,0 +1,5 @@
+	GET /u HTTP/1.1
+Host: [::1]:8080
+Upgrade: websocket
+Connection: Upgrade, close
+

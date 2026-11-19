@@ -1,11 +1,11 @@
 # Security Policy
 
-`@morojs/engine` is a native HTTP/1.1 + WebSocket engine for
+`@morojs/engine` is a native HTTP/1.1, HTTP/2 and WebSocket engine for
 Node.js (C++ with raw-V8 bindings). Because it parses untrusted bytes off the
 network in hand-written C++, we take security reports seriously and want to make
 them easy to file.
 
-> **Maturity note.** The engine is on its `1.x` line and terminates TLS in-process — see [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)).
+> **Maturity note.** The engine is on its `1.x` line and terminates TLS in-process — see [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 
 ## Supported versions
 
@@ -14,8 +14,9 @@ the **latest published version** only; there is no long-term back-port branch.
 
 | Version | Supported |
 | ------- | --------- |
-| Latest published release | ✅ |
+| Latest published release (npm dist-tag `latest`) | ✅ |
 | Any older release | ❌ (upgrade to the latest) |
+| A release candidate (`X.Y.Z-rc.N`, npm dist-tag `next`) | reports welcome; fixed in the next candidate or the release, not on its own |
 
 If a supported-branch policy is added for a future major line, this table will
 be updated to name the supported major line(s).
@@ -41,8 +42,8 @@ Please include, as far as you can:
 - a description of the flaw and its impact (crash, over-read, request
   desync/smuggling, DoS, memory disclosure, etc.),
 - a minimal reproduction — ideally a raw byte sequence or a fuzz corpus file
-  that can be dropped into `test/fuzz/corpus/{http,ws,tls,pmd}` (see the threat
-  model's reviewer quick-start),
+  that can be dropped into `test/fuzz/corpus/{http,ws,http2,tls,pmd}` (see the
+  threat model's reviewer quick-start),
 - any suggested remediation.
 
 ## What to expect
@@ -120,7 +121,9 @@ A bundled library is fixed only by a release from this repository, so:
 - A scheduled workflow looks for a newer upstream snapshot every week. When
   there is one, the entire CI gate runs against it on every platform, and on
   green a patch release is published to npm with no human step. On red it
-  opens an issue and publishes nothing.
+  opens an issue and publishes nothing. It also publishes nothing while the
+  main branch holds anything but the last release (work for the next one, a
+  release candidate): the new snapshot then ships with that next release.
 - The release script refuses to cut any release while the pinned snapshot is
   more than 21 days old and upstream has a newer one.
 - A server terminating TLS on a snapshot more than 180 days old says so in a

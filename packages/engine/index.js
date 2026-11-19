@@ -4,7 +4,8 @@
 // Resolution order:
 //   1. The matching per-platform package (@morojs/engine-<platform>-<arch>[-libc])
 //      published as an exact-version optionalDependency of this package.
-//   2. A local build/ directory (engine repo development).
+//   2. A local build/ directory, when running from the engine repository
+//      itself (development).
 //
 // Binary naming: moro_engine_<platform>_<arch>[_<libc>]_<abi>[_boringssl].node
 // (libc segment on linux only: gnu | musl)
@@ -17,7 +18,7 @@
 // when the BoringSSL binary cannot be loaded. See tlsPreference() below.
 
 const { existsSync } = require('fs');
-const { join } = require('path');
+const { join, dirname, sep } = require('path');
 
 // The engine version is whatever this package publishes: tools/prepare-release.mjs
 // stamps package.json from the release tag, so reading it here keeps probe() and
@@ -75,11 +76,35 @@ let plannedSsl = null;
 // provider module, a policy file - and the bundled BoringSSL knows none of it.
 const OPENSSL_NODE_FLAGS = ['--enable-fips', '--force-fips', '--openssl-config', '--openssl-shared-config', '--openssl-legacy-provider'];
 
+// The same options given through node's configuration file
+// (--experimental-config-file=<path>, or node.config.json in the working
+// directory with --experimental-default-config-file): they take effect like
+// the flags and appear in neither execArgv nor NODE_OPTIONS.
+function opensslOptionInNodeConfigFile(flags) {
+  let file = null;
+  const named = /--experimental-config-file(?:=|\s+)("[^"]+"|'[^']+'|\S+)/.exec(flags);
+  if (named) file = named[1].replace(/^["']|["']$/g, '');
+  else if (flags.includes('--experimental-default-config-file')) file = 'node.config.json';
+  if (!file) return null;
+  try {
+    const options = JSON.parse(require('fs').readFileSync(file, 'utf8')).nodeOptions || {};
+    for (const flag of OPENSSL_NODE_FLAGS) {
+      const value = options[flag.slice(2)];
+      if (value !== undefined && value !== false) return `${flag} in ${file}`;
+    }
+  } catch {
+    // unreadable here: node has already refused to start on a file it cannot read
+  }
+  return null;
+}
+
 function opensslIsConfigured() {
   const flags = `${process.execArgv.join(' ')} ${process.env.NODE_OPTIONS || ''}`;
   for (const flag of OPENSSL_NODE_FLAGS) {
     if (flags.includes(flag)) return flag;
   }
+  const fromFile = opensslOptionInNodeConfigFile(flags);
+  if (fromFile) return fromFile;
   if (process.env.OPENSSL_CONF) return 'OPENSSL_CONF';
   if (process.env.OPENSSL_MODULES) return 'OPENSSL_MODULES';
   try {
@@ -127,16 +152,26 @@ function loadNamed(name, attempts) {
   // 1. Per-platform npm package
   const pkg = platformPackageName();
   try {
-    return { module: require(require.resolve(`${pkg}/${name}`)), from: pkg };
+    const path = resolveInInstall(pkg, name);
+    const packageVersion = packageVersionAt(dirname(path));
+    // The binaries of another release are not this package's to run: the
+    // two are published together and pinned to each other.
+    if (packageVersion && packageVersion !== ENGINE_VERSION) {
+      throw new Error(`found ${path}, which is ${pkg} ${packageVersion}, not ${ENGINE_VERSION}: not loaded`);
+    }
+    return { module: require(path), from: pkg, path, packageVersion };
   } catch (err) {
     attempts.push(`${pkg}/${name}: ${err.message.split('\n')[0]}`);
   }
 
-  // 2. Engine repo local build (development)
+  // 2. Engine repo local build (development). Only inside the engine
+  //    repository: installed, the same relative path is node_modules/build,
+  //    which belongs to whatever package is called "build".
+  if (!inEngineRepo()) return null;
   const local = join(__dirname, '..', '..', 'build', name);
   if (existsSync(local)) {
     try {
-      return { module: require(local), from: local };
+      return { module: require(local), from: local, path: local };
     } catch (err) {
       attempts.push(`${local}: ${err.message.split('\n')[0]}`);
     }
@@ -144,6 +179,55 @@ function loadNamed(name, attempts) {
     attempts.push(`${local}: not present`);
   }
   return null;
+}
+
+// Where a file of the platform package is, looked for only inside the
+// node_modules tree this package was installed into: the node_modules of each
+// directory from this one up to the outermost node_modules on this file's
+// path. That is every place a package manager puts a dependency of this
+// package (beside it, nested under it, hoisted above it, or linked next to it
+// in a store). Plain module resolution would go on from there to the
+// node_modules of every directory above the application, to NODE_PATH and to
+// the home directory's module folders, and a native binary is not taken from
+// a place the installation does not own. Outside a node_modules tree (the
+// engine repository, a bundle), and under Yarn Plug'n'Play, where resolution
+// is already limited to declared dependencies, it is plain resolution.
+function resolveInInstall(pkg, name) {
+  const request = `${pkg}/${name}`;
+  const marker = `${sep}node_modules${sep}`;
+  const at = `${__dirname}${sep}`.indexOf(marker);
+  if (at === -1 || process.versions.pnp) return require.resolve(request);
+  const top = __dirname.slice(0, at + marker.length - 1); // .../node_modules
+  for (const dir of require.resolve.paths(request) || []) {
+    if (dir !== top && !dir.startsWith(top + sep)) continue;
+    const file = join(dir, pkg, name);
+    if (existsSync(file)) return file;
+  }
+  throw new Error(`not installed in ${top}`);
+}
+
+// The version stamped into the platform package in `dir` (the release
+// assembler writes it; this package pins it exactly in optionalDependencies).
+function packageVersionAt(dir) {
+  try {
+    return String(require(join(dir, 'package.json')).version || '') || null;
+  } catch {
+    return null;
+  }
+}
+
+// Whether this file is running from a checkout of the engine repository
+// (packages/engine under the monorepo root), as opposed to an install.
+let engineRepo;
+function inEngineRepo() {
+  if (engineRepo === undefined) {
+    try {
+      engineRepo = require(join(__dirname, '..', '..', 'package.json')).name === '@morojs/engine-monorepo';
+    } catch {
+      engineRepo = false;
+    }
+  }
+  return engineRepo;
 }
 
 function tryLoad() {
@@ -157,7 +241,7 @@ function tryLoad() {
   const explicit = process.env.MORO_ENGINE_BINARY;
   if (explicit) {
     try {
-      return { module: require(explicit), from: explicit };
+      return { module: require(explicit), from: explicit, path: explicit };
     } catch (err) {
       const error = new Error(`@morojs/engine: MORO_ENGINE_BINARY=${explicit} failed to load: ${err.message}`);
       error.code = 'MORO_ENGINE_BINARY_MISSING';
@@ -179,10 +263,11 @@ function tryLoad() {
     // for - an Ed448 or DSA key, a CCM suite, a brainpool group - worked on
     // node's OpenSSL up to 1.1.19, and keeps working there now.
     if (pref.library === 'boringssl' && !pref.explicit && plannedSsl) {
-      const refused = tlsRefusal(first.module, plannedSsl);
+      const planned = withNodeTlsPolicy(plannedSsl);
+      const refused = tlsRefusal(first.module, planned);
       if (refused) {
         const other = loadNamed(binaryName('openssl'), []);
-        if (other && !tlsRefusal(other.module, plannedSsl)) {
+        if (other && !tlsRefusal(other.module, planned)) {
           return { ...other, tls: { reason: 'fallback', fallbackReason: notAccepted(refused) } };
         }
         // Neither library takes it: the configuration is simply wrong, and
@@ -233,6 +318,14 @@ function loadBinding() {
   return loaded.module;
 }
 
+// probe().binary: the file that was loaded and, when it came from a platform
+// package, that package's version - the release the running code belongs to.
+function binaryInfo() {
+  const info = { path: loaded.path };
+  if (loaded.packageVersion) info.version = loaded.packageVersion;
+  return info;
+}
+
 /**
  * Non-throwing diagnostics: can the engine load here, and what is it?
  * MoroJS's preflight uses this instead of exception-driven detection.
@@ -252,7 +345,7 @@ function probe() {
   // package.json is the source of truth for the version (see ENGINE_VERSION);
   // override the binding's build-time constant so the two can never disagree.
   const native = loaded.module.probe();
-  return { ...native, version: ENGINE_VERSION, tls: tlsInfo(native) };
+  return { ...native, version: ENGINE_VERSION, tls: tlsInfo(native), binary: binaryInfo() };
 }
 
 // `0.YYYYMMDD.N`, BoringSSL's version tags: the day upstream cut the snapshot.
@@ -350,7 +443,7 @@ function warnIfBundledTlsIsOld(binding) {
 let serversCreated = 0;
 const handedOut = new Set();
 
-function serveOnOpenSslInstead(error, self, args) {
+function serveOnOpenSslInstead(error, self, argsFor) {
   if (!loaded.tls || loaded.tls.reason !== 'default') return undefined; // chosen by name, or not BoringSSL
   if (serversCreated > 0 || handedOut.size > 0) {
     error.message += ` [TLS library: the bundled BoringSSL. If node's OpenSSL accepts this configuration, MORO_ENGINE_TLS=openssl selects it.]`;
@@ -360,7 +453,7 @@ function serveOnOpenSslInstead(error, self, args) {
   if (!other) return undefined;
   let serverId;
   try {
-    serverId = other.module.serve.apply(self, args);
+    serverId = other.module.serve.apply(self, argsFor(other.module));
   } catch {
     return undefined; // wrong for both libraries: the first error stands
   }
@@ -370,14 +463,159 @@ function serveOnOpenSslInstead(error, self, args) {
 
 let tlsAgeChecked = false;
 
+// What the operator told node about every TLS server of the process, applied
+// to an ssl options object that does not say otherwise: `node --tls-min-v1.3`
+// (tls.DEFAULT_MIN_VERSION) raises the protocol floor, `node --tls-max-v1.2`
+// (tls.DEFAULT_MAX_VERSION) lowers the ceiling, and
+// `node --tls-cipher-list=...` (tls.DEFAULT_CIPHERS) is the cipher list, its
+// TLS 1.3 suite names going to `ciphersuites` as node itself splits them.
+// node's own servers obey both; a server here that did not would accept what
+// the operator ruled out, and say nothing. The app's own minVersion,
+// maxVersion, ciphers or ciphersuites win, as they do for node. Returns `ssl`
+// itself when there is nothing to add.
+function withNodeTlsPolicy(ssl) {
+  if (!ssl || typeof ssl !== 'object') return ssl;
+  let nodeTls;
+  try {
+    nodeTls = require('tls');
+  } catch {
+    return ssl; // a node built without crypto
+  }
+  let out = ssl;
+  if (ssl.minVersion == null && nodeTls.DEFAULT_MIN_VERSION === 'TLSv1.3') {
+    out = { ...out, minVersion: 'TLSv1.3' };
+  }
+  if (ssl.maxVersion == null && ssl.minVersion !== 'TLSv1.3' && nodeTls.DEFAULT_MAX_VERSION === 'TLSv1.2') {
+    out = { ...out, maxVersion: 'TLSv1.2' };
+  }
+  // A list other than the one compiled into node: the flag was given (or
+  // the app assigned tls.DEFAULT_CIPHERS). Asked this way and not of
+  // execArgv, where a test runner repeats every option with its default.
+  let builtIn;
+  try {
+    builtIn = require('crypto').constants.defaultCoreCipherList;
+  } catch {
+    builtIn = undefined;
+  }
+  const listed = nodeTls.DEFAULT_CIPHERS;
+  if (ssl.ciphers == null && ssl.ciphersuites == null && typeof listed === 'string' && typeof builtIn === 'string' && listed !== builtIn) {
+    const names = listed.split(':').filter(Boolean);
+    const suites = names.filter((name) => name.startsWith('TLS_'));
+    const list = names.filter((name) => !name.startsWith('TLS_'));
+    if (suites.length) out = { ...out, ciphersuites: suites.join(':') };
+    if (list.length) out = { ...out, ciphers: list.join(':') };
+  }
+  return out;
+}
+
+// ---- dispatch trampolines ---------------------------------------------------
+//
+// onRequest, onRequestBatch, onAborted and onWritable reach the engine wrapped
+// in one of the functions below. The engine enters them through
+// node::MakeCallback, which keeps Node's callback scope on the native stack
+// (a scope opened around a plain call is allocated per call), and for that
+// has no exception handler of its own around the call. So the wrapper does
+// what the engine's native handler did: an exception the application's
+// callback throws is reported on stderr (the same line) and goes no further,
+// and the batch wrapper tells the engine that the application has left its
+// loop over the batch before anything queued by the handlers runs. Nothing
+// else changes for the callback: it is called with the same arguments and
+// with `this` the global object, and what a nextTick callback or a microtask
+// it queued throws is the process's uncaught exception, as before. A stack
+// trace taken inside it has this file's frame below it.
+//
+// MORO_ENGINE_DISPATCH=scope turns the wrapping off (diagnostics): the engine
+// then opens the scope and catches natively, as it does for callbacks handed
+// to the binding directly.
+const DISPATCH_TRAMPOLINES = process.env.MORO_ENGINE_DISPATCH !== 'scope';
+const ReflectApply = Reflect.apply;
+const FunctionPrototypeBind = Function.prototype.bind;
+// The callback, called on the global object whatever it is called on.
+const onGlobal = (cb) => ReflectApply(FunctionPrototypeBind, cb, [globalThis]);
+
+function requestTrampoline(cb, report) {
+  const call = onGlobal(cb);
+  return function dispatchRequest(reqId, methodIdx, path) {
+    try {
+      call(reqId, methodIdx, path);
+    } catch (error) {
+      report(0, error);
+    }
+  };
+}
+
+function noticeTrampoline(cb, report) {
+  const call = onGlobal(cb);
+  return function dispatchNotice(reqId) {
+    try {
+      call(reqId);
+    } catch (error) {
+      report(0, error);
+    }
+  };
+}
+
+function batchTrampoline(cb, report, batchDone) {
+  const call = onGlobal(cb);
+  return function dispatchBatch(count) {
+    try {
+      call(count);
+    } catch (error) {
+      batchDone();
+      report(1, error);
+      return;
+    }
+    batchDone();
+  };
+}
+
+// The callbacks object serve() hands to `binding`: each property read once,
+// in the order the binding reads them, the four above wrapped.
+function readCallbacks(callbacks) {
+  return {
+    onRequest: callbacks.onRequest,
+    onRequestBatch: callbacks.onRequestBatch,
+    onAborted: callbacks.onAborted,
+    onWritable: callbacks.onWritable,
+    onWsOpen: callbacks.onWsOpen,
+    onWsMessage: callbacks.onWsMessage,
+    onWsClose: callbacks.onWsClose,
+  };
+}
+function withTrampolines(binding, read) {
+  const report = binding._reportCaught;
+  const batchDone = binding._batchDone;
+  const out = { ...read };
+  if (typeof read.onRequest === 'function') out.onRequest = requestTrampoline(read.onRequest, report);
+  if (typeof read.onRequestBatch === 'function') out.onRequestBatch = batchTrampoline(read.onRequestBatch, report, batchDone);
+  if (typeof read.onAborted === 'function') out.onAborted = noticeTrampoline(read.onAborted, report);
+  if (typeof read.onWritable === 'function') out.onWritable = noticeTrampoline(read.onWritable, report);
+  return out;
+}
+const canTrampoline = (binding) => typeof binding._reportCaught === 'function' && typeof binding._batchDone === 'function';
+
 function serve(callbacks, options) {
   const tls = Boolean(options && options.ssl);
   const binding = loaded.module;
+  const args = Array.prototype.slice.call(arguments);
+  if (tls) {
+    const ssl = withNodeTlsPolicy(options.ssl);
+    if (ssl !== options.ssl) args[1] = { ...options, ssl };
+  }
+  // (A callbacks argument that is not an object goes to the binding as it
+  // is, and is refused there.)
+  const wrap = DISPATCH_TRAMPOLINES && callbacks !== null && (typeof callbacks === 'object' || typeof callbacks === 'function');
+  const read = wrap ? readCallbacks(callbacks) : null;
+  const argsFor = (mod) => {
+    // The third argument says "these are trampolines"; nothing else may.
+    if (!wrap || !canTrampoline(mod)) return args.slice(0, 2);
+    return [withTrampolines(mod, read), args[1], true];
+  };
   let serverId;
   try {
-    serverId = binding.serve.apply(this, arguments);
+    serverId = binding.serve.apply(this, argsFor(binding));
   } catch (error) {
-    serverId = tls ? serveOnOpenSslInstead(error, this, arguments) : undefined;
+    serverId = tls ? serveOnOpenSslInstead(error, this, argsFor) : undefined;
     if (serverId === undefined) throw error;
   }
   serversCreated++;
@@ -386,6 +624,12 @@ function serve(callbacks, options) {
     warnIfBundledTlsIsOld(loaded.module);
   }
   return serverId;
+}
+
+// updateSsl() builds a whole new context from the options it is given, so
+// the process-wide policy above goes into it the same way.
+function updateSsl(serverId, ssl) {
+  return loaded.module.updateSsl(serverId, withNodeTlsPolicy(ssl));
 }
 
 // The native binding's function exports (src/binding.cpp Initialize; mirrored by
@@ -457,7 +701,7 @@ module.exports = new Proxy(
           return serve;
         }
         handedOut.add(prop);
-        const fn = binding[prop];
+        const fn = prop === 'updateSsl' && typeof binding.updateSsl === 'function' ? updateSsl : binding[prop];
         target[prop] = fn;
         return fn;
       }

@@ -29,6 +29,9 @@ export interface EngineCapabilities {
   /** updateSsl() is available: the certificate/key (and policy) of a TLS
    *  server can be replaced for new handshakes without a restart. */
   tlsReload: boolean;
+  /** ssl.crl and ssl.maxVersion are honoured (an engine without this flag
+   *  reads neither). */
+  tlsCrl: boolean;
   /** setStaticRoute() / clearStaticRoutes() are available. */
   staticRoutes: boolean;
   /** setParamRoute() / clearParamRoutes() are available: a route with one
@@ -64,6 +67,21 @@ export interface EngineCapabilities {
    *  exist: the engine can perform valid WebSocket upgrades itself, firing
    *  onWsOpen without the request ever reaching onRequest. */
   wsAutoUpgrade: boolean;
+  /** Engine-side upgrades (setWsAutoUpgrade) are safe together with batched
+   *  dispatch (onRequestBatch). Engines 1.1.15 to 1.1.21 report
+   *  wsAutoUpgrade and batchDispatch without this flag and must not be given
+   *  both: a process abort could occur there with pipelined WebSocket
+   *  handshakes. */
+  wsAutoUpgradeBatch: boolean;
+  /** idleTimeoutMs does not close a connection whose response is still being
+   *  written to a peer that is reading it, whether the handler answered
+   *  before it returned or later; responseTimeoutMs governs delivery (and
+   *  closes a peer that stops reading). Only with responseTimeoutMs set to 0
+   *  does the idle timeout apply to such a connection. Engines without this
+   *  flag (before 1.2.0) count a response given before the handler returned
+   *  as idle from the moment it is framed, so an idle timeout shorter than a
+   *  slow download cuts the download. */
+  idleSparesDrainingResponse: boolean;
   /** getBodyType() and getBodyText() exist. */
   bodyText: boolean;
   /** getBodyLent() exists. */
@@ -107,11 +125,24 @@ export interface EngineTlsInfo {
   fallbackReason?: string;
 }
 
+/** The native binary that was loaded. */
+export interface EngineBinaryInfo {
+  /** The `.node` file. */
+  path: string;
+  /** The version of the platform package it came from: the release the
+   *  running code belongs to, always equal to `EngineProbeResult.version`
+   *  (a platform package of another release is not loaded). Absent for a
+   *  local build and for `MORO_ENGINE_BINARY`. */
+  version?: string;
+}
+
 export interface EngineProbeResult {
   /** True when a native binary loaded for this platform/ABI */
   ok: boolean;
   /** Engine version — the published package version (always set by the loader). */
   version?: string;
+  /** Which binary is loaded, and from which release (`ok: true` only). */
+  binary?: EngineBinaryInfo;
   platform: string;
   arch: string;
   /** Node ABI (process.versions.modules) the binary was built for */
@@ -162,7 +193,11 @@ export interface ServeCallbacks {
    *  that index, or return when it still equals the slot you just dispatched
    *  (that handler is async; the remaining slots are delivered later). A
    *  request that stands alone still arrives here with count 1; onRequest is
-   *  used only when this callback is absent. Return the slots consumed. */
+   *  used only when this callback is absent. Return the slots consumed.
+   *  `control[0]` at or above `count` means the batch is over: every slot was
+   *  answered, the next request is a WebSocket handshake the engine answers
+   *  itself (setWsAutoUpgrade), or the connection was closed from inside the
+   *  loop - in each case, return. */
   onRequestBatch?(count: number): number;
   /** The client disconnected, or the engine tore the request down (write
    *  error, responseBackpressureLimit, timeout, close()), before the response
@@ -186,7 +221,13 @@ export interface ServeCallbacks {
    *  upgradeToWebSocket() call — so a client that pipelines its first frame with
    *  the Upgrade is never dropped. */
   onWsMessage?(wsId: number, data: string | ArrayBuffer, isBinary: boolean): void;
-  /** WebSocket closed (code per RFC 6455 §7.4). */
+  /** WebSocket closed (code per RFC 6455 §7.4): the peer's Close code (1005
+   *  when its Close carried none), 1006 when it went away without one, the
+   *  code of a protocol failure (1002, 1007, 1009), or the code wsClose() was
+   *  called with, as passed. Fires exactly once per socket. Inside it the
+   *  socket is already closing - wsSend() answers false and wsClose() does
+   *  nothing - while wsGetHeaders(), wsGetQuery() and wsGetRemoteAddress()
+   *  still answer. */
   onWsClose?(wsId: number, code: number): void;
 }
 
@@ -195,13 +236,17 @@ export interface ServeOptions {
   maxBodySize?: number;
   /** Close a connection after this many ms with no bytes received while not
    *  running a handler (slowloris defense + keep-alive cap). 0 disables.
-   *  Default 120000. */
+   *  Default 120000. A connection whose response is still being written to
+   *  the peer is not idle: responseTimeoutMs governs it, unless that is 0
+   *  (capabilities.idleSparesDrainingResponse). */
   idleTimeoutMs?: number;
   /** Max simultaneous connections; accepts beyond this are dropped
    *  immediately (connection-flood defense). 0 = unlimited (default). */
   maxConnections?: number;
-  /** Cap on bytes buffered for one connection while its response is in flight
-   *  (pipelined-flood defense). 0 = maxHeadSize + maxBodySize (default). */
+  /** Cap on bytes buffered for one connection while they cannot be
+   *  dispatched: a handler is running, or the responses already given are
+   *  waiting on the peer (pipelined-flood defense). Over it the connection is
+   *  closed. 0 = maxHeadSize + maxBodySize (default). */
   maxPendingBytes?: number;
   /** Budget in ms for receiving one complete request (head + body), measured
    *  from its first byte. Unlike idleTimeoutMs it does NOT reset on activity,
@@ -242,12 +287,22 @@ export interface ServeOptions {
   /** Cap on a complete (reassembled) WebSocket message; larger messages fail
    *  the connection with close code 1009. Must be > 0. Default 16 MiB. */
   wsMaxMessageSize?: number;
-  /** WebSocket send backpressure cap: a slow consumer whose write queue grows
-   *  past this is shed with close code 1013 rather than buffering without
-   *  bound. 0 = unlimited. Default 1 MiB. */
+  /** WebSocket send backpressure cap: a consumer that is not keeping up is
+   *  shed with close code 1013 rather than buffered without bound. A socket
+   *  is shed by a wsSend() that finds bytes of an earlier send still waiting
+   *  and leaves more than this many bytes queued. One message sent to a
+   *  socket with nothing waiting is never shed for its size: it is queued
+   *  whole and the socket stays open; a peer that stops reading with it in
+   *  flight is closed by responseTimeoutMs. A stalled peer can therefore
+   *  hold this many bytes across sends, or the largest single message the
+   *  application sends, whichever is larger - the engine does not cap the
+   *  size of one message, so an application sending very large ones to
+   *  untrusted peers should bound them. 0 = unlimited. Default 1 MiB. */
   wsBackpressureLimit?: number;
   /** Write-queue level above which write()/wsSend() report backpressure
-   *  (false) and onWritable is armed. Must be > 0. Default 262144. */
+   *  (false) and onWritable is armed, and at which no further pipelined
+   *  request is taken from a connection until the peer has read. Must be
+   *  > 0. Default 262144. */
   writeHighWaterMark?: number;
   /** TCP listen backlog handed to the kernel. Must be > 0. Default 512. */
   backlog?: number;
@@ -263,15 +318,30 @@ export interface ServeOptions {
     key?: string | ArrayBuffer | Uint8Array;
     cert?: string | ArrayBuffer | Uint8Array;
     ca?: string | ArrayBuffer | Uint8Array;
+    /** Certificate revocation lists (PEM, one or more) for client
+     *  certificates, as Node's tls `crl` (feature-detect via
+     *  probe().capabilities.tlsCrl). With any given, a client certificate is
+     *  accepted only when the CRL of every CA in its chain is here and does
+     *  not list it. */
+    crl?: string | ArrayBuffer | Uint8Array;
     /** Decrypts an encrypted private key */
     passphrase?: string;
     /** Session-ticket keys, Node tls.Server-compatible: exactly 48 bytes
      *  (16-byte key name + 16-byte HMAC secret + 16-byte AES key). Share the
      *  same buffer across reusePort workers / processes so TLS sessions
-     *  resume across all of them. Rotation is the caller's job. */
+     *  resume across all of them. Rotation is the caller's job. A session
+     *  is resumed only by a server with the same policy as the one that
+     *  issued it - minVersion, ciphers, ciphersuites, and requestCert /
+     *  rejectUnauthorized / the CA certificates: sharing the keys with a
+     *  listener that asks for no client certificate does not let its
+     *  sessions into one that requires them. */
     ticketKeys?: string | ArrayBuffer | Uint8Array;
-    /** Protocol floor. Default 'TLSv1.2'. */
+    /** Protocol floor. Default 'TLSv1.2' - or 'TLSv1.3' when node was
+     *  started with --tls-min-v1.3 (tls.DEFAULT_MIN_VERSION). */
     minVersion?: 'TLSv1.2' | 'TLSv1.3';
+    /** Protocol ceiling. Default: the newest the TLS library has - or
+     *  'TLSv1.2' when node was started with --tls-max-v1.2. */
+    maxVersion?: 'TLSv1.2' | 'TLSv1.3';
     /** Request a client certificate (mutual TLS) */
     requestCert?: boolean;
     /** Fail the handshake when the client cert doesn't verify (default true) */
@@ -279,7 +349,10 @@ export interface ServeOptions {
     /** Explicit cipher/group policy for compliance baselines (PCI/FIPS/hardened
      *  profiles; feature-detect via probe().capabilities.tlsPolicy). Same
      *  semantics as Node's tls.createSecureContext; invalid values THROW from
-     *  serve(). Unset: the TLS library's own set of ciphers, AES-128-GCM ahead
+     *  serve(). A value of the wrong type throws too, here and for every
+     *  other policy option (`requestCert: 1` is an error, not "off").
+     *  Unset: the list node was started with (--tls-cipher-list), else the
+     *  TLS library's own set of ciphers, AES-128-GCM ahead
      *  of AES-256-GCM, ChaCha20 for a client that lists it first. With the
      *  bundled BoringSSL (probe().tls.library) `ciphersuites` can name
      *  TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and
@@ -318,8 +391,11 @@ export interface ServeOptions {
     | {
         serverNoContextTakeover?: boolean;
         clientNoContextTakeover?: boolean;
-        serverMaxWindowBits?: number; // 8..15
-        clientMaxWindowBits?: number; // 8..15
+        /** 9..15. An 8-bit window is never negotiated: zlib's raw deflate
+         *  has none, so an offer asking for one is declined. */
+        serverMaxWindowBits?: number;
+        /** 9..15 (see serverMaxWindowBits). */
+        clientMaxWindowBits?: number;
         /** Min message bytes before a send is compressed. Default 1024. */
         threshold?: number;
         /** Hard cap on an inflated message (zip-bomb defense).
@@ -341,7 +417,9 @@ type BodyInit = string | ArrayBuffer | Uint8Array | Buffer;
 
 /** Register callbacks and create a server. Sockets open only at listen(). */
 export function serve(callbacks: ServeCallbacks, options?: ServeOptions): number;
-/** Bind + listen; returns the actual bound port (supports port 0). Throws on failure. */
+/** Bind + listen; returns the actual bound port (supports port 0). Throws on
+ *  failure, with a libuv-style `code`. A server listens once: EINVAL for one
+ *  that is already listening, has stopped listening or is closing. */
 export function listen(serverId: number, host: string, port: number): number;
 /** Tear down the server: stop accepting AND close every live connection
  *  (in-flight requests get onAborted). For a graceful shutdown, call
@@ -354,7 +432,9 @@ export function stopListening(serverId: number): void;
  *  handshake from now on, without restarting the listener (feature-detect via
  *  probe().capabilities.tlsReload). `ssl` is the full ServeOptions.ssl shape,
  *  not a diff; ticketKeys carry over when omitted so session resumption
- *  survives a rotation. Established connections keep the context they
+ *  survives a rotation of the certificate (an update that changes the
+ *  policy - minVersion, ciphers, the client-certificate settings or CAs -
+ *  ends it: those clients get a full handshake). Established connections keep the context they
  *  handshaked with. Throws (leaving the current context in place) on invalid
  *  material, and for a server that was not started with ssl. */
 export function updateSsl(serverId: number, ssl: NonNullable<ServeOptions['ssl']>): void;
@@ -398,7 +478,14 @@ export function getBodyText(reqId: number): string | null;
  *  rate out of back-to-back full collections. For a handler that relays,
  *  hashes or echoes a body and keeps none of it. Code that keeps the body
  *  past the response reads it with getBody (a copy, during a loan) or
- *  transfers the lent buffer. Null when there is no body. */
+ *  transfers the lent buffer. Null when there is no body.
+ *
+ *  "Keeps none of it" includes work in progress. An asynchronous operation
+ *  that was handed the bytes - fs.write, a socket or stream write that did
+ *  not go out at once, a zlib or crypto job - keeps a pointer to the memory,
+ *  not the buffer: if the response is completed before it has finished, it
+ *  reads memory that is free or already holds another request's body. Wait
+ *  for it before responding, or read the body with getBody. */
 export function getBodyLent(reqId: number): ArrayBuffer | null;
 export function getRemoteAddress(reqId: number): string;
 export function isAborted(reqId: number): boolean;
@@ -495,17 +582,37 @@ export function endWith(reqId: number, chunk: BodyInit): void;
 // ---- WebSocket (RFC 6455) ----
 /** Upgrade the request's connection; returns wsId, or -1 if not a valid upgrade.
  *  onWsOpen (and any early frames pipelined in the handshake's TCP segment, via
- *  onWsMessage) fire SYNCHRONOUSLY during this call, before it returns. */
+ *  onWsMessage) fire SYNCHRONOUSLY during this call, before it returns.
+ *  A valid upgrade (RFC 6455 §4.2.1) is a GET over HTTP/1.1 with
+ *  `Upgrade: websocket`, `Connection: Upgrade`, exactly one Sec-WebSocket-Key
+ *  (16 bytes, base64) and exactly one `Sec-WebSocket-Version: 13`. After -1
+ *  the request is still open and the caller answers it (a handshake whose
+ *  only fault is its version is owed a 426 with `Sec-WebSocket-Version: 13`,
+ *  which setWsAutoUpgrade sends by itself). */
 export function upgradeToWebSocket(reqId: number): number;
-/** Send a frame; returns false on backpressure. */
+/** Send a frame. false when it did not go out - the socket is gone or
+ *  closing, or `data` is not a string or bytes - and on backpressure (the
+ *  frame is queued, the write queue is over writeHighWaterMark). */
 export function wsSend(wsId: number, data: string | ArrayBuffer | Uint8Array | Buffer, isBinary: boolean): boolean;
-/** Send a Close frame and close the connection. */
+/** Send a Close frame (code 1000 unless given) and end the connection: the
+ *  server half-closes and reads until the peer has closed too (at most two
+ *  seconds), so the peer receives the Close even while it is still sending;
+ *  a TLS connection is closed after its close_notify. The frame is legal
+ *  whatever is passed: a `code` that may not appear on the wire (RFC 6455
+ *  §7.4) is replaced - 1005 by a Close without a status, any other
+ *  (1004, 1006, 1015, below 1000, 1016-2999, 5000 and up) by 1011 - and
+ *  `reason` is cut to 123 bytes of UTF-8 at a character boundary. onWsClose
+ *  reports `code` as passed. */
 export function wsClose(wsId: number, code?: number, reason?: string): void;
 /** With `on`, every valid WebSocket handshake is answered by the engine itself:
  *  the 101 goes out, onWsOpen fires (and any frames pipelined with the
- *  handshake reach onWsMessage), and onRequest is never called for it. An
- *  invalid handshake is surfaced to onRequest as any other request. Applies
- *  to this server only; register it again after close() + serve(). */
+ *  handshake reach onWsMessage), and onRequest is never called for it. A
+ *  handshake that is valid except for its Sec-WebSocket-Version is answered
+ *  too: 426 with `Sec-WebSocket-Version: 13` (RFC 6455 §4.4). Any other
+ *  request - not a GET, HTTP/1.0, a missing or repeated key - is surfaced to
+ *  onRequest as an ordinary request. Applies to this server only; register
+ *  it again after close() + serve(). Together with onRequestBatch only on an
+ *  engine that reports capabilities.wsAutoUpgradeBatch. */
 export function setWsAutoUpgrade(serverId: number, on: boolean): void;
 /** The handshake request's headers, flat [name, value, ...] with names
  *  lowercased (the shape getHeaders() gives), kept for the socket's lifetime;

@@ -9,6 +9,7 @@
 # fuzzers in parallel (fuzz.yml):
 #   sh test/fuzz/run.sh          # all targets
 #   sh test/fuzz/run.sh http     # HTTP/1.1 parser
+#   sh test/fuzz/run.sh httpdiff # HTTP/1.1 parser, its three parse paths against each other
 #   sh test/fuzz/run.sh ws       # WebSocket parser
 #   sh test/fuzz/run.sh tls      # TLS transform (needs OpenSSL dev headers:
 #                                #   apt install libssl-dev / brew install openssl)
@@ -36,7 +37,7 @@ TARGET="${1:-all}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 FLAGS="-std=c++20 -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all"
 
-# run_target <name> <source.cc> [extra link flags]
+# run_target <name> <source.cc> [extra link flags] [extra libFuzzer flags]
 # Seed corpora: libFuzzer treats a positional directory as the corpus (it
 # replays every file in it, then mutates and writes new coverage-expanding
 # inputs back into it). mkdir -p keeps this working when a corpus dir is
@@ -45,6 +46,7 @@ run_target() {
   name="$1"
   src="$2"
   extra="${3:-}"
+  fuzzflags="${4:-}"
   corpus="$DIR/corpus/$name"
   mkdir -p "$corpus"
   echo "Building fuzz_$name with $CXX ..."
@@ -64,12 +66,19 @@ run_target() {
     return
   fi
   echo "Fuzzing $name for ${FUZZ_SECONDS}s (corpus: $corpus) ..."
-  "/tmp/moro_fuzz_$name" "$corpus" -max_total_time="$FUZZ_SECONDS" -timeout=5 -rss_limit_mb=2048 -print_final_stats=1
+  # shellcheck disable=SC2086
+  "/tmp/moro_fuzz_$name" "$corpus" -max_total_time="$FUZZ_SECONDS" -timeout=5 -rss_limit_mb=2048 -print_final_stats=1 $fuzzflags
 }
 
 ran=0
 if [ "$TARGET" = all ] || [ "$TARGET" = http ]; then
   run_target http fuzz_http_parser.cc
+  ran=1
+fi
+if [ "$TARGET" = all ] || [ "$TARGET" = httpdiff ]; then
+  # Inputs up to 20 KB: larger than the head limit the harness sets and than
+  # one chunk-size line, so the limits and the paths past them are reached.
+  run_target httpdiff fuzz_http_diff.cc "" "-max_len=20000"
   ran=1
 fi
 if [ "$TARGET" = all ] || [ "$TARGET" = ws ]; then
@@ -101,7 +110,7 @@ if [ "$TARGET" = all ] || [ "$TARGET" = uring ]; then
 fi
 
 if [ "$ran" = 0 ]; then
-  echo "unknown fuzz target: $TARGET (expected http|ws|http2|tls|pmd|uring|all)" >&2
+  echo "unknown fuzz target: $TARGET (expected http|httpdiff|ws|http2|tls|pmd|uring|all)" >&2
   exit 2
 fi
 

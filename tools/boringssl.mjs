@@ -25,6 +25,9 @@
 //                                                # rewrite tools/boringssl.json;
 //                                                # --note also writes the release
 //                                                # note for the next patch version
+//   node tools/boringssl.mjs releasable [--verified=<sha>]
+//                                                # may the scheduled roll release
+//                                                # from this checkout? (exit 4: no)
 //   node tools/boringssl.mjs build [--arch=A]    # fetch + build the static libraries
 //
 // Upstream tags are dated snapshots, `0.YYYYMMDD.N`, cut every two to three
@@ -34,7 +37,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import os from 'node:os';
@@ -166,6 +169,38 @@ function libcTag() {
   return existsSync('/etc/alpine-release') ? '-musl' : '-gnu';
 }
 
+// An LLVM binutil that reads what a clang writes: the one of the same LLVM
+// release. Looked for under the compiler's version suffix (Debian's
+// clang++-18 goes with llvm-ar-18), beside the real compiler (Homebrew,
+// Alpine, /usr/lib/llvm-N/bin), where the compiler looks for its own
+// programs, and on PATH - and taken only if it reports the compiler's major
+// version. null for Apple's clang, whose bitcode only Apple's tools read.
+export function llvmTool(cxx, tool) {
+  const text = (bin, args) => {
+    try {
+      return execFileSync(bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch {
+      return '';
+    }
+  };
+  const version = text(cxx, ['--version']);
+  const major = /clang version (\d+)\./.exec(version)?.[1];
+  if (!major || /Apple/.test(version)) return null;
+  const candidates = [];
+  const suffix = /clang\+\+(-\d+)$/.exec(cxx)?.[1];
+  if (suffix) candidates.push(`${tool}${suffix}`);
+  try {
+    candidates.push(join(dirname(realpathSync(text('which', [cxx]).trim().split('\n')[0])), tool));
+  } catch {
+    // not on PATH under that name
+  }
+  candidates.push(text(cxx, [`-print-prog-name=${tool}`]).trim(), tool);
+  for (const c of candidates) {
+    if (c && new RegExp(`LLVM version ${major}\\.`).test(text(c, ['--version']))) return c;
+  }
+  return null;
+}
+
 // The C compiler that goes with a C++ compiler: clang++-18 -> clang-18,
 // g++ -> gcc, /opt/homebrew/opt/llvm/bin/clang++ -> .../clang.
 function cCompilerFor(cxx) {
@@ -181,7 +216,7 @@ function cCompilerFor(cxx) {
  * the engine, never to the OpenSSL symbols of the same names that the host
  * `node` exports, and the addon exports none of them.
  */
-export function ensureBoringSsl({ arch, cxx = null } = {}) {
+export function ensureBoringSsl({ arch, cxx = null, lto = false, pgo = '', pgoDir = '', pgoProfile = '' } = {}) {
   const pin = readPin();
   if (!has('git')) throw new Error('boringssl: git is required to fetch the pinned source');
   if (!has('cmake')) {
@@ -200,8 +235,41 @@ export function ensureBoringSsl({ arch, cxx = null } = {}) {
     if (!has('nasm', ['-v'])) throw new Error('boringssl: nasm is required on Windows x64 (choco install nasm)');
     config.push('-DCMAKE_C_COMPILER=cl', '-DCMAKE_CXX_COMPILER=cl', '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded');
   } else {
-    const hidden = '-fvisibility=hidden -ffunction-sections -fdata-sections';
+    // The same stack protector and fortified libc calls as the engine's own
+    // code (tools/build.mjs): upstream's build sets neither, and of the
+    // release toolchains only Alpine's turns them on by default. -U first:
+    // upstream compiles with -Werror, and a toolchain that predefines
+    // _FORTIFY_SOURCE would otherwise fail on the redefinition.
+    const hardening = '-fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2';
+    // lto (tools/build.mjs asks for it, clang only): the objects are LLVM
+    // bitcode, so the engine's link optimises the library's C and C++
+    // together with the engine (the assembly is untouched), and the archives
+    // need LLVM's ar to get a symbol table.
+    // What tools/build.mjs asks for on top (clang only). lto: the objects are
+    // LLVM bitcode, so a later link optimises the library's C and C++ as one
+    // (the assembly is untouched), and the archives need LLVM's ar to get a
+    // symbol table. pgo: the instrumented library for a training run, or the
+    // library compiled from that run's profile (upstream compiles with
+    // -Werror, hence the same three -Wno- as the engine's own profile build).
+    const extra = [];
+    if (lto) extra.push('-flto');
+    if (pgo === 'generate') extra.push(`-fprofile-generate=${pgoDir}`);
+    if (pgo === 'use') extra.push(`-fprofile-use=${pgoProfile}`, '-Wno-profile-instr-out-of-date', '-Wno-profile-instr-unprofiled', '-Wno-backend-plugin');
+    const hidden = ['-fvisibility=hidden -ffunction-sections -fdata-sections', hardening, ...extra].join(' ');
     config.push(`-DCMAKE_C_FLAGS=${hidden}`, `-DCMAKE_CXX_FLAGS=${hidden} -fvisibility-inlines-hidden`);
+    if (lto) {
+      if (!cxx) throw new Error('boringssl: an LTO build needs the compiler it is for (cxx)');
+      for (const [variable, tool] of [['CMAKE_AR', 'llvm-ar'], ['CMAKE_RANLIB', 'llvm-ranlib']]) {
+        const found = llvmTool(cxx, tool);
+        if (!found) throw new Error(`boringssl: ${tool} (the one that goes with ${cxx}) is needed for the LTO build of the bundled TLS library`);
+        config.push(`-D${variable}=${found}`);
+      }
+    }
+    // Only ssl and crypto are built, so upstream's tests are not configured
+    // either: their dependencies probe the compiler at -O0 with -Werror, and
+    // glibc 2.28 (the linux-gnu build image) warns about _FORTIFY_SOURCE
+    // without optimisation. The two libraries come out byte-identical.
+    config.push('-DBUILD_TESTING=OFF');
     if (cxx) {
       config.push(`-DCMAKE_CXX_COMPILER=${cxx}`);
       const cc = cCompilerFor(cxx);
@@ -219,8 +287,12 @@ export function ensureBoringSsl({ arch, cxx = null } = {}) {
 
   // One build directory per distinct configuration: a different compiler or
   // flag set never reuses another's objects.
-  const key = createHash('sha256').update(JSON.stringify([pin.commit, platform, arch, libcTag(), config])).digest('hex').slice(0, 12);
-  const out = join(cacheDir, `${pin.tag}-${platform}-${arch}${libcTag()}-${key}`);
+  // A profile build is named as one (`-pgo-generate`, `-pgo-use`): it belongs
+  // to one PGO cycle, which removes it (tools/pgo.mjs), and its key covers the
+  // profile's content, not only its path.
+  const profile = pgo === 'use' ? createHash('sha256').update(readFileSync(pgoProfile)).digest('hex') : '';
+  const key = createHash('sha256').update(JSON.stringify([pin.commit, platform, arch, libcTag(), config, profile])).digest('hex').slice(0, 12);
+  const out = join(cacheDir, `${pin.tag}-${platform}-${arch}${libcTag()}-${key}${pgo ? `-pgo-${pgo}` : ''}`);
   const lib = name => (platform === 'win32' ? join(out, `${name}.lib`) : join(out, `lib${name}.a`));
   const result = { tag: pin.tag, date: pin.date, commit: pin.commit, includeDir: join(src, 'include'), libs: [lib('ssl'), lib('crypto')] };
   const stamp = join(out, '.moro-built');
@@ -250,6 +322,50 @@ export function ensureBoringSsl({ arch, cxx = null } = {}) {
   return result;
 }
 
+/**
+ * The library with libssl compiled from a profile (tools/pgo.mjs trains it:
+ * the TLS and HTTP/2 groups, on a build whose library is instrumented), as
+ * one archive to link in place of the two.
+ *
+ * libssl - the record layer, the handshake state machine, everything the
+ * engine calls on each request - comes from the profile build; libcrypto from
+ * the plain LTO build, because the profile makes its handshake arithmetic
+ * (X25519, SHA-2 glue) slower, not faster. The two are then linked into one
+ * relocatable object, which is where their link-time optimisation happens:
+ * on their own, not in the engine's link. Optimised in the engine's link, a
+ * profiled library changes what the engine's own code is compiled to (its
+ * header parsing lost 4%), and the link accepts only one profile for
+ * everything in it, so the library would be compiled again for every ABI.
+ * This way it is built once per platform and the engine's code is what it is
+ * without it.
+ */
+export function prelinkBoringSsl({ arch, cxx, profile }) {
+  const plain = ensureBoringSsl({ arch, cxx, lto: true });
+  const tuned = ensureBoringSsl({ arch, cxx, lto: true, pgo: 'use', pgoProfile: profile });
+  const dir = dirname(tuned.libs[0]);
+  const archive = join(dir, 'libmoro-boringssl.a');
+  if (!existsSync(archive)) {
+    const object = join(dir, 'moro-boringssl.o');
+    const [ssl, crypto] = [tuned.libs[0], plain.libs[1]];
+    const args = ['-r', '-nostdlib', '-flto', '-O3', '-o', object];
+    if (platform === 'darwin') {
+      const sdk = execFileSync('xcrun', ['--show-sdk-path'], { encoding: 'utf8' }).trim();
+      // -keep_private_externs: the library's symbols are hidden, and ld -r
+      // would otherwise make them local to the object.
+      args.push('-target', `${arch === 'arm64' ? 'arm64' : 'x86_64'}-apple-macos12`, '-isysroot', sdk, '-Wl,-keep_private_externs', '-Wl,-all_load', ssl, crypto);
+    } else {
+      args.push('-fuse-ld=lld', '-ffunction-sections', '-fdata-sections', '-Wl,--whole-archive', ssl, crypto, '-Wl,--no-whole-archive');
+    }
+    console.log(`  boringssl: libssl from the profile, linked with libcrypto -> ${archive}`);
+    execFileSync(cxx, args, { stdio: 'inherit' });
+    // An archive again, so that what applies to archives applies to it
+    // (-Wl,--exclude-libs,ALL keeps its symbols out of the dynamic table).
+    execFileSync(llvmTool(cxx, 'llvm-ar'), ['rcs', archive, object], { stdio: 'inherit' });
+    rmSync(object);
+  }
+  return { ...plain, libs: [archive] };
+}
+
 // ---- the release note of a roll --------------------------------------------
 
 // A roll is released on its own, as the next patch version: the note says what
@@ -257,8 +373,17 @@ export function ensureBoringSsl({ arch, cxx = null } = {}) {
 // script expects it (changelog/vX.Y.Z.md, indexed at the top of CHANGELOG.md).
 export function writeRollNote(from, to) {
   const current = JSON.parse(readFileSync(join(root, 'packages', 'engine', 'package.json'), 'utf8')).version;
+  // "The next patch version" exists only after a plain X.Y.Z: after a
+  // prerelease (1.2.0-rc.1) there is no patch to add one to.
+  if (!/^\d+\.\d+\.\d+$/.test(current)) {
+    throw new Error(`the tree is at ${current}, not a released X.Y.Z: a roll has no patch version to release as`);
+  }
   const [major, minor, patch] = current.split('.').map(n => parseInt(n, 10));
   const version = `${major}.${minor}.${patch + 1}`;
+  // A note already there was written by hand, for a release in preparation.
+  if (existsSync(join(root, 'changelog', `v${version}.md`))) {
+    throw new Error(`changelog/v${version}.md already exists: ${version} is a release in preparation, and its note is not the roll's to replace`);
+  }
   const note = `# @morojs/engine ${version}
 
 Scheduled update of the bundled TLS library: BoringSSL ${from.tag} -> ${to.tag}
@@ -287,6 +412,45 @@ weeks, whether or not anyone announced it. Updating is \`npm update @morojs/engi
   if (at === -1) throw new Error('CHANGELOG.md: no release list to add to');
   writeFileSync(indexPath, index.slice(0, at) + line + index.slice(at));
   return version;
+}
+
+// ---- may the scheduled roll release? ----------------------------------------
+
+/**
+ * The scheduled roll publishes by itself, as "the last release on a newer
+ * BoringSSL, no engine code changed". That sentence has to be true of the
+ * checkout it releases from:
+ *   - the tree is a released X.Y.Z, not a prerelease;
+ *   - HEAD is the commit the gate ran on (`verified`), so nothing pushed while
+ *     the gate was running rides along untested;
+ *   - HEAD is the commit origin's tag v<version> names, so nothing committed
+ *     since the last release - work for the next one - is published with it.
+ * Anything else is left for a person: the roll stops, the workflow reports it,
+ * and tools/release.mjs still refuses the next release on a stale pin.
+ */
+export function rollReleasable({ verified = null } = {}) {
+  const version = JSON.parse(readFileSync(join(root, 'packages', 'engine', 'package.json'), 'utf8')).version;
+  if (!/^\d+\.\d+\.\d+$/.test(version)) {
+    return { ok: false, reason: `the tree is at ${version}, a prerelease: the roll releases patch versions of a released X.Y.Z only` };
+  }
+  const head = git(['rev-parse', 'HEAD'], { cwd: root });
+  if (verified && head !== verified) {
+    return { ok: false, reason: `the branch moved while the gate was running: it verified ${verified}, the checkout is ${head}` };
+  }
+  // Asked of origin, not of the local tags: a CI checkout has none.
+  const ref = `refs/tags/v${version}`;
+  const out = git(['ls-remote', 'origin', ref, `${ref}^{}`], { cwd: root, timeout: 60_000 });
+  let tagged = null;
+  for (const line of out.split('\n')) {
+    const [sha, name] = line.split('\t');
+    // An annotated tag lists twice; the `^{}` line is the commit.
+    if (name === `${ref}^{}` || (name === ref && !tagged)) tagged = sha;
+  }
+  if (!tagged) return { ok: false, reason: `origin has no tag v${version}: ${version} was never released from this repository` };
+  if (tagged !== head) {
+    return { ok: false, reason: `the branch (${head}) is not the commit v${version} was released from (${tagged}): it carries commits that are not released yet` };
+  }
+  return { ok: true, version, head };
 }
 
 // ---- CLI -------------------------------------------------------------------
@@ -337,20 +501,30 @@ function main(argv) {
       return;
     }
     if (!flag(argv, 'dry-run')) {
-      writeFileSync(pinPath, JSON.stringify({ repository: pin.repository, tag: target.tag, commit: target.commit }, null, 2) + '\n');
+      // The note first: it can refuse, and then the pin stays as it was.
       if (flag(argv, 'note')) {
         const version = writeRollNote(pin, target);
         output({ version });
         console.log(`boringssl: release note written for ${version}`);
       }
+      writeFileSync(pinPath, JSON.stringify({ repository: pin.repository, tag: target.tag, commit: target.commit }, null, 2) + '\n');
     }
     console.log(`boringssl: ${pin.tag} -> ${target.tag} (${target.commit})${flag(argv, 'dry-run') ? '  (dry run)' : ''}`);
+  } else if (cmd === 'releasable') {
+    const verified = flag(argv, 'verified');
+    const r = rollReleasable({ verified: typeof verified === 'string' ? verified : null });
+    if (!r.ok) {
+      console.error(`boringssl: not releasing - ${r.reason}`);
+      // 4: distinct from 1 (the check itself failed) and 3 (stale).
+      process.exit(4);
+    }
+    console.log(`boringssl: ${r.head.slice(0, 12)} is v${r.version} as released and as verified - a roll can release from it`);
   } else if (cmd === 'build') {
     const arch = flag(argv, 'arch', os.arch() === 'arm64' ? 'arm64' : 'x64');
     const r = ensureBoringSsl({ arch, cxx: process.env.CXX || null });
     console.log(JSON.stringify(r, null, 2));
   } else {
-    console.error('usage: node tools/boringssl.mjs <pin|latest|check|roll|build> [options]');
+    console.error('usage: node tools/boringssl.mjs <pin|latest|check|roll|releasable|build> [options]');
     process.exit(2);
   }
 }

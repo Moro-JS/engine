@@ -42,10 +42,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   // the zero-copy receive path); libFuzzer's input is const, so feed from a
   // copy, exactly like the server feeds from its own read buffer.
   std::vector<uint8_t> wire(body, body + bodyLen);
+  // Bit 1 of the second byte: the caller takes the buffer of every other
+  // buffered message (as the server does for a large binary one), and the
+  // parser must carry on with the string it is left.
+  const bool takes = (data[1] & 2) != 0;
+  size_t offered = 0;
+  auto onBuffer = [&](std::string& message, bool, bool) {
+    if (!takes || (offered++ & 1) != 0) return false;
+    std::string mine;
+    mine.swap(message);
+    volatile size_t s = mine.size() + (parser.moreInRead() ? 1 : 0);
+    (void)s;
+    return true;
+  };
   size_t off = 0;
   while (off < bodyLen) {
     size_t n = chunk < (bodyLen - off) ? chunk : (bodyLen - off);
-    bool ok = parser.consume(wire.data() + off, n, onMessage, onControl);
+    bool ok = parser.consume(wire.data() + off, n, onMessage, onControl, onBuffer);
     off += n;
     if (!ok) break;  // failed connection: a real server stops feeding it
   }

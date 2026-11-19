@@ -86,6 +86,10 @@ updated** the way you keep Node.js updated; a TLS server on a build more than
 Node ABIs: 115/127/131/137/141/147 (Node 20/22/23/24/25/26). Any other
 platform/ABI falls back to Node's `http` server via MoroJS.
 
+The glibc packages need glibc 2.28 or later, the same floor as Node.js's own
+Linux binaries: RHEL, Rocky and Alma Linux 8 and later, Amazon Linux 2023,
+Debian 10 and later, Ubuntu 20.04 and later.
+
 ## I/O transport
 
 On Linux the engine runs its own socket path on libuv's epoll by default

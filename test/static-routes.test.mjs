@@ -127,3 +127,66 @@ test('re-registering replaces, and clearStaticRoutes restores JS routing', async
 
   engine.close(sid);
 });
+
+// A request to an engine route is recognised at its request line and answered
+// when it is complete. A body that arrives in a later read leaves room for the
+// route table to change in between: the answer must come from the table as it
+// is then, never from what the lookup found before the change.
+test('route table changed while a request to an engine route is half received', async () => {
+  const H = ['content-type', 'text/plain'];
+  for (const reRegister of [false, true]) {
+    let jsHits = 0;
+    const sid = engine.serve({
+      onRequest(reqId) {
+        jsHits++;
+        engine.respond(reqId, 200, null, 'from-js');
+      },
+      onAborted() {},
+      onWritable() {},
+    });
+    engine.setStaticRoute(sid, POST, '/s', 200, H, 'first-body');
+    engine.setParamRoute(sid, POST, '/p/', '', 200, H);
+    const port = engine.listen(sid, '127.0.0.1', 0);
+    try {
+      for (const target of ['/s', '/p/segment']) {
+        const sock = net.connect(port, '127.0.0.1');
+        let out = '';
+        sock.on('data', (d) => (out += d));
+        sock.on('error', () => {});
+        await new Promise((r) => sock.once('connect', r));
+        sock.write(`POST ${target} HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n01234`);
+        await new Promise((r) => setTimeout(r, 60));
+        // Both tables are emptied and refilled: the entries the lookup found are gone.
+        engine.clearStaticRoutes(sid);
+        engine.clearParamRoutes(sid);
+        for (let i = 0; i < 64; i++) engine.setStaticRoute(sid, POST, '/other' + i, 200, H, 'OTHER'.repeat(16));
+        for (let i = 0; i < 16; i++) engine.setParamRoute(sid, POST, '/q' + i + '/', '', 200, H);
+        if (reRegister) {
+          engine.setStaticRoute(sid, POST, '/s', 201, H, 'second-body');
+          engine.setParamRoute(sid, POST, '/p/', '', 201, H);
+        }
+        sock.write('56789');
+        await new Promise((r) => setTimeout(r, 150));
+        sock.destroy();
+        const status = out.split('\r\n')[0];
+        const body = out.split('\r\n\r\n')[1];
+        if (reRegister) {
+          assert.strictEqual(status, 'HTTP/1.1 201 Created');
+          assert.strictEqual(body, target === '/s' ? 'second-body' : 'segment');
+        } else {
+          // The route is gone and the request's headers were never kept for JS.
+          assert.strictEqual(status, 'HTTP/1.1 500 Internal Server Error');
+          assert.strictEqual(body, '');
+        }
+        // Back to the starting tables for the next target.
+        engine.clearStaticRoutes(sid);
+        engine.clearParamRoutes(sid);
+        engine.setStaticRoute(sid, POST, '/s', 200, H, 'first-body');
+        engine.setParamRoute(sid, POST, '/p/', '', 200, H);
+      }
+      assert.strictEqual(jsHits, 0);
+    } finally {
+      engine.close(sid);
+    }
+  }
+});

@@ -5,6 +5,7 @@
 // not implemented yet — and the conformance suite skips itself cleanly.
 
 import net from 'node:net';
+import assert from 'node:assert/strict';
 
 // Mirror of the engine's method index table (docs/API.md).
 export const METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', 'OTHER'];
@@ -452,4 +453,61 @@ export async function waitFor(predicate, { timeout = 2000, interval = 10, messag
   }
   if (predicate()) return;
   throw new Error(message);
+}
+
+/** A request body (ctx.body()) as a latin1 string; '' when there is none. */
+export function bodyText(ctx) {
+  const b = ctx.body();
+  return b ? Buffer.from(b).toString('latin1') : '';
+}
+
+/**
+ * One connection's worth of traffic against a fixture server: write `bytes`
+ * (or `parts`, one write each with a pause between them), collect what comes
+ * back until the line goes quiet, and report
+ *   { raw, responses, statuses, closed, handled }
+ * where `handled` is how many requests reached the handler meanwhile.
+ */
+export async function exchange(server, bytes, { wait = 200, parts = null, gap = 40 } = {}) {
+  const before = server.requests.length;
+  const c = await openRaw(server.port);
+  try {
+    if (parts) {
+      for (const p of parts) {
+        await c.send(p).catch(() => {});
+        await delay(gap);
+      }
+    } else {
+      await c.send(bytes).catch(() => {});
+    }
+    let raw = '';
+    try {
+      raw = await c.read({ quiescence: wait, timeout: 2500 });
+    } catch {
+      raw = '';
+    }
+    await delay(30);
+    const responses = parseResponses(raw);
+    return {
+      raw,
+      responses,
+      statuses: responses.map((r) => r.status),
+      closed: c.closed,
+      handled: server.requests.length - before,
+    };
+  } finally {
+    c.destroy();
+  }
+}
+
+/**
+ * A rejected request: exactly one response with `status` and
+ * Connection: close, the socket closed by the server, the handler not run.
+ */
+export async function expectRejected(server, bytes, status, label, opts) {
+  const r = await exchange(server, bytes, opts);
+  assert.deepEqual(r.statuses, [status], `${label}: statuses`);
+  assert.equal(r.responses[0].headers.connection, 'close', `${label}: Connection: close`);
+  assert.equal(r.closed, true, `${label}: connection closed`);
+  assert.equal(r.handled, 0, `${label}: handler not invoked`);
 }

@@ -16,10 +16,27 @@
 #include <string_view>
 #include <vector>
 
+#include <cstdlib>
+#include <new>
+
 #include "../src/sha1.h"
 #include "../src/websocket.h"
 
 using namespace moro::engine;
+
+// Every allocation of this binary is seen here, so a test can ask how much
+// the parser set aside for the bytes it was given (testDeclaredLengthReserve).
+static size_t gLargestAlloc = 0;
+static size_t gLargeAllocs = 0;  // allocations of 64 KiB and more
+void* operator new(size_t n) {
+  if (n > gLargestAlloc) gLargestAlloc = n;
+  if (n >= 65536) ++gLargeAllocs;
+  void* p = std::malloc(n ? n : 1);
+  if (!p) throw std::bad_alloc();
+  return p;
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
 
 static int gChecks = 0;
 #define CHECK(cond)      \
@@ -350,6 +367,74 @@ static void testClosePayload() {
   // §7.1.5: an empty close payload means close code 1005.
   CHECK(parseCloseCode("") == 1005);
   std::printf("ok  close payload helpers (code 1005 on empty, section 7.1.5)\n");
+}
+
+// ---------------------------------------------------------------------------
+// The Close frame the server sends for wsClose(code, reason) (§5.5, §7.4)
+// ---------------------------------------------------------------------------
+
+static void testCloseFramePayload() {
+  // §7.4.1 / §7.4.2: the codes a Close frame may carry.
+  for (int code : {1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 3000, 4000, 4999})
+    CHECK(isWireCloseCode(code));
+  for (int code : {-1, 0, 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000, 65535, 65536, 70000})
+    CHECK(!isWireCloseCode(code));
+
+  // A code that may be sent goes out as given, reason included.
+  {
+    std::string body;
+    closeFramePayload(body, 4001, "policy");
+    CHECK(parseCloseCode(body) == 4001);
+    CHECK(body.substr(2) == "policy");
+  }
+  // 1005 is "no status code was present": an empty body, the reason dropped.
+  {
+    std::string body;
+    closeFramePayload(body, 1005, "never sent");
+    CHECK(body.empty());
+  }
+  // Anything else that may not be sent goes out as 1011, never truncated to
+  // sixteen bits (70000 would read as 4464).
+  for (int code : {-1, 0, 999, 1004, 1006, 1015, 1016, 2999, 5000, 65535, 65536, 70000}) {
+    std::string body;
+    closeFramePayload(body, code, "why");
+    CHECK(body.size() == 5);
+    CHECK(parseCloseCode(body) == 1011);
+    CHECK(body.substr(2) == "why");
+  }
+
+  // §5.5: a control frame payload is at most 125 bytes, so a reason has 123.
+  CHECK(truncateCloseReason("").empty());
+  CHECK(truncateCloseReason(std::string(123, 'r')).size() == 123);
+  CHECK(truncateCloseReason(std::string(124, 'r')).size() == 123);
+  CHECK(truncateCloseReason(std::string(5000, 'r')).size() == 123);
+  // The cut never splits a character (§5.5.1: the reason is UTF-8): with the
+  // limit falling inside a 2-, 3- or 4-byte sequence, the whole sequence goes.
+  const std::string two = "\xC3\xA9";           // U+00E9
+  const std::string three = "\xE2\x82\xAC";     // U+20AC
+  const std::string four = "\xF0\x9D\x84\x9E";  // U+1D11E
+  for (const std::string& ch : {two, three, four}) {
+    for (size_t lead = 123 - ch.size() + 1; lead <= 122; ++lead) {
+      const std::string reason = std::string(lead, 'r') + ch + ch + "tail";
+      const std::string_view cut = truncateCloseReason(reason);
+      CHECK(cut == std::string(lead, 'r'));
+      CHECK(isValidUtf8(cut));
+    }
+    // ...and one that ends exactly at the limit is kept whole.
+    const std::string fits = std::string(123 - ch.size(), 'r') + ch + "tail";
+    CHECK(truncateCloseReason(fits) == std::string(123 - ch.size(), 'r') + ch);
+  }
+  // The frame built from the longest reason is a legal control frame, and a
+  // parser takes it.
+  {
+    std::string body, wire;
+    closeFramePayload(body, 1000, std::string(200, 'r'));
+    CHECK(body.size() == 125);
+    encodeFrame(wire, WsOpcode::Close, body);
+    CHECK(wire.size() == 2 + 125);
+    CHECK((uint8_t(wire[1]) & 0x7F) == 125);
+  }
+  std::printf("ok  server Close payload (legal codes only, reason cut to 123 bytes)\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -912,7 +997,288 @@ static void testIncrementalUtf8() {
     CHECK(ev.items.empty());
   }
 
+  // The validator answers at the FIRST byte no suffix can repair, not when
+  // the sequence completes. After four lead bytes the first continuation
+  // byte has a narrower range (RFC 3629 §4): E0 A0..BF, ED 80..9F,
+  // F0 90..BF, F4 80..8F; C0, C1 and F5..FF start nothing at all.
+  {
+    struct Case {
+      const char* bytes;  // a prefix of a sequence
+      size_t len;
+      bool ok;
+    };
+    const Case cases[] = {
+        {"\xF4\x90", 2, false},      // above U+10FFFF
+        {"\xF4\x8F", 2, true},       // U+10FFxx
+        {"\xF4\xBF", 2, false},
+        {"\xF0\x8F", 2, false},      // overlong four-byte form
+        {"\xF0\x90", 2, true},       // U+10000..
+        {"\xE0\x9F", 2, false},      // overlong three-byte form
+        {"\xE0\xA0", 2, true},       // U+0800..
+        {"\xED\xA0", 2, false},      // a surrogate, U+D800..
+        {"\xED\x9F", 2, true},       // U+D7C0..
+        {"\xC0", 1, false},           // only ever an overlong form
+        {"\xC1", 1, false},
+        {"\xC2", 1, true},
+        {"\xF5", 1, false},           // nothing at or below U+10FFFF
+        {"\xF7", 1, false},
+        {"\xF4", 1, true},
+        {"\xE1\x80", 2, true},       // the general range stays 80..BF
+        {"\xE1\x7F", 2, false},
+        {"\xF1\x80\x80", 3, true},
+        {"\xF4\x8F\xC0", 3, false},  // the second continuation is 80..BF again
+    };
+    for (const Case& c : cases) {
+      Utf8Validator v;
+      CHECK(v.accept(std::string_view(c.bytes, c.len)) == c.ok);
+      // one byte at a time gives the same answer, at the same byte
+      Utf8Validator w;
+      bool ok = true;
+      for (size_t i = 0; i < c.len && ok; ++i) ok = w.accept(std::string_view(c.bytes + i, 1));
+      CHECK(ok == c.ok);
+    }
+    // The narrowed range applies to the byte after the lead only: the next
+    // sequence starts from the general range again.
+    Utf8Validator v;
+    CHECK(v.accept("\xF4\x8F\xBF\xBF\xF0\x90\x80\x80\xE0\xA0\x80\xED\x9F\xBF\xC2\x80"));
+    CHECK(v.complete());
+  }
+  // Through the parser: a text message whose second fragment makes the
+  // sequence invalid fails at that fragment, with the rest never sent.
+  {
+    WsParser p;
+    Events ev;
+    CHECK(feed(p, clientFrame(WsOpcode::Text, "ok\xF4", /*fin=*/false), ev));
+    CHECK(!feed(p, clientFrame(WsOpcode::Continuation, "\x90", /*fin=*/false), ev));
+    CHECK(p.failCode() == 1007);
+    CHECK(ev.items.empty());
+  }
+  // The validator and the one-shot check agree on every two-byte prefix.
+  for (int a = 0x80; a <= 0xFF; ++a) {
+    for (int b = 0; b <= 0xFF; ++b) {
+      const char two[2] = {char(a), char(b)};
+      Utf8Validator v;
+      const bool streaming = v.accept(std::string_view(two, 2));
+      // a prefix is acceptable exactly when some completion of it is valid
+      bool completable = false;
+      for (const char* tail : {"", "\x80", "\x80\x80", "\xBF", "\xBF\xBF"}) {
+        if (isValidUtf8(std::string(two, 2) + tail)) completable = true;
+      }
+      CHECK(streaming == completable);
+    }
+  }
+
+  // ASCII is taken thirty-two and eight bytes at a time between sequences. Whatever stands
+  // at whatever offset among it, valid or not, and wherever the input is cut
+  // in two, the answer is the one-shot check's.
+  {
+    const char* const pieces[] = {
+        "\xC2\x80", "\xDF\xBF", "\xE0\xA0\x80", "\xED\x9F\xBF", "\xEF\xBF\xBF", "\xF0\x90\x80\x80", "\xF4\x8F\xBF\xBF",
+        "\x80", "\xBF", "\xC0\x80", "\xC2", "\xE0\x9F\x80", "\xED\xA0\x80", "\xE1\x80", "\xF0\x8F\x80\x80",
+        "\xF4\x90\x80\x80", "\xF1\x80\x80", "\xF8", "\xFF", "\xC2\x41", "\xE1\x80\x41", "\x7F",
+    };
+    for (const char* piece : pieces) {
+      for (size_t before = 0; before <= 41; ++before) {
+        for (size_t after : {size_t(0), size_t(1), size_t(7), size_t(8), size_t(9), size_t(16), size_t(31), size_t(32), size_t(40)}) {
+          const std::string s = std::string(before, 'a') + piece + std::string(after, 'z');
+          const bool valid = isValidUtf8(s);
+          Utf8Validator whole;
+          CHECK((whole.accept(s) && whole.complete()) == valid);
+          for (size_t cut = 0; cut <= s.size(); ++cut) {
+            Utf8Validator v;
+            const bool ok = v.accept(std::string_view(s).substr(0, cut)) && v.accept(std::string_view(s).substr(cut)) && v.complete();
+            CHECK(ok == valid);
+          }
+        }
+      }
+    }
+    // Long runs of ASCII on either side of one character, at every alignment.
+    for (size_t shift = 0; shift < 8; ++shift) {
+      const std::string s = std::string(64 + shift, 'a') + "\xE2\x82\xAC" + std::string(64, 'z');
+      Utf8Validator v;
+      CHECK(v.accept(std::string_view(s).substr(shift)) && v.complete());
+      std::string bad = s;
+      bad[64 + shift + 1] = 'x';  // the character's second byte is not a continuation
+      Utf8Validator w;
+      CHECK(!w.accept(std::string_view(bad).substr(shift)));
+    }
+  }
+
   std::printf("ok  incremental UTF-8 (fail-fast 1007, split sequences)\n");
+}
+
+// ---------------------------------------------------------------------------
+// The buffer for a large frame follows what has arrived, not what the frame
+// header declares
+// ---------------------------------------------------------------------------
+
+static void testDeclaredLengthReserve() {
+  const size_t kSize = 16 * 1024 * 1024;  // the default message limit
+  std::string payload(kSize, '\0');
+  for (size_t i = 0; i < kSize; ++i) payload[i] = char('a' + i % 23);
+  std::string wire = clientFrame(WsOpcode::Binary, payload);
+  const size_t head = wire.size() - kSize;  // 2 + 8 length bytes + 4 mask bytes
+  CHECK(head == 14);
+
+  WsParser p;
+  size_t delivered = 0;
+  bool intact = false;
+  auto onMessage = [&](std::string_view m, bool, bool) {
+    ++delivered;
+    intact = m == payload;
+  };
+  auto onControl = [](WsOpcode, std::string_view) {};
+  uint8_t* bytes = reinterpret_cast<uint8_t*>(wire.data());
+
+  // The header and one payload byte: nothing near the declared 16 MiB is
+  // allocated for a peer that has sent fifteen bytes.
+  gLargestAlloc = 0;
+  CHECK(p.consume(bytes, head + 1, onMessage, onControl));
+  CHECK(gLargestAlloc < 4096);
+
+  // Up to a sixteenth of the message the buffer stays within a small
+  // multiple of what was received (a string's own growth).
+  size_t off = head + 1;
+  const size_t kChunk = 16 * 1024;
+  bool accepted = true, proportionate = true;
+  while (off - head + kChunk < kSize / 16) {
+    accepted = accepted && p.consume(bytes + off, kChunk, onMessage, onControl);
+    off += kChunk;
+    proportionate = proportionate && gLargestAlloc <= 4 * (off - head) + 4096;
+  }
+  CHECK(accepted);
+  CHECK(proportionate);
+
+  // From there the rest is reserved once: no further growth, however many
+  // reads the message takes.
+  CHECK(p.consume(bytes + off, kChunk, onMessage, onControl));
+  off += kChunk;
+  CHECK(gLargestAlloc >= kSize);
+  gLargeAllocs = 0;
+  while (off < wire.size()) {
+    const size_t n = std::min(kChunk, wire.size() - off);
+    accepted = accepted && p.consume(bytes + off, n, onMessage, onControl);
+    off += n;
+  }
+  CHECK(accepted);
+  CHECK(gLargeAllocs == 0);
+  CHECK(delivered == 1 && intact);
+
+  // A frame that fits in sixteen reads is reserved at its first read, as
+  // before: one allocation for the whole message.
+  {
+    const size_t kSmall = 512 * 1024;
+    const std::string body(kSmall, 'q');
+    std::string w = clientFrame(WsOpcode::Binary, body);
+    WsParser q;
+    size_t got = 0;
+    auto onMsg = [&](std::string_view m, bool, bool) { got = m.size(); };
+    gLargeAllocs = 0;
+    uint8_t* b = reinterpret_cast<uint8_t*>(w.data());
+    bool ok = true;
+    for (size_t o = 0; o < w.size(); o += 65536) {
+      ok = ok && q.consume(b + o, std::min<size_t>(65536, w.size() - o), onMsg, onControl);
+    }
+    CHECK(ok && got == kSmall);
+    CHECK(gLargeAllocs == 1);
+  }
+
+  std::printf("ok  a large frame's buffer follows the bytes received, not the declared length\n");
+}
+
+// ---------------------------------------------------------------------------
+// A buffered message can be taken, buffer and all, by the caller; and inside
+// a callback the parser says whether the read holds more behind the frame
+// ---------------------------------------------------------------------------
+
+static void testBufferHandOver() {
+  auto pattern = [](size_t n, char seed) {
+    std::string b(n, '\0');
+    for (size_t i = 0; i < n; i++) b[i] = char(seed + i % 59);
+    return b;
+  };
+  const std::string big = pattern(200000, 'a');
+  const std::string frag1 = pattern(70000, 'k'), frag2 = pattern(30000, 'm');
+  std::string wire;
+  wire += clientFrame(WsOpcode::Binary, "in place");                    // whole, in one read
+  wire += clientFrame(WsOpcode::Binary, big);                           // one frame over several reads
+  wire += clientFrame(WsOpcode::Text, "between");
+  wire += clientFrame(WsOpcode::Binary, frag1, /*fin=*/false);          // reassembled
+  wire += clientFrame(WsOpcode::Ping, "p");
+  wire += clientFrame(WsOpcode::Continuation, frag2, /*fin=*/true);
+  wire += clientFrame(WsOpcode::Binary, big);                           // again: the parser has a buffer again
+  wire += clientFrame(WsOpcode::Text, std::string(40000, 't'));         // buffered text: offered, declined
+  wire += clientFrame(WsOpcode::Binary, "last");
+
+  for (const bool take : {true, false}) {
+    WsParser p;
+    std::vector<std::string> views;       // messages delivered as views
+    std::vector<std::string> taken;       // messages whose buffer was taken
+    std::vector<std::string> offered;     // every buffer offered, taken or not
+    int pings = 0;
+    auto onMessage = [&](std::string_view m, bool, bool) { views.emplace_back(m); };
+    auto onControl = [&](WsOpcode op, std::string_view) { pings += op == WsOpcode::Ping; };
+    auto onBuffer = [&](std::string& m, bool isBinary, bool compressed) {
+      CHECK(!compressed);
+      offered.push_back(m);
+      if (!take || !isBinary) return false;
+      taken.emplace_back();
+      taken.back().swap(m);  // the parser is left with an empty string
+      return true;
+    };
+    uint8_t* bytes = reinterpret_cast<uint8_t*>(wire.data());
+    std::string copy = wire;  // consume() unmasks in place: a fresh copy per pass
+    bytes = reinterpret_cast<uint8_t*>(copy.data());
+    bool ok = true;
+    for (size_t off = 0; ok && off < copy.size(); off += 16384)
+      ok = p.consume(bytes + off, std::min<size_t>(16384, copy.size() - off), onMessage, onControl, onBuffer);
+    CHECK(ok);
+    CHECK(pings == 1);
+    // Offered: the four buffered messages, never the ones delivered in place.
+    CHECK(offered.size() == 4);
+    if (offered.size() == 4) {
+      CHECK(offered[0] == big && offered[1] == frag1 + frag2 && offered[2] == big);
+      CHECK(offered[3] == std::string(40000, 't'));
+    }
+    if (take) {
+      CHECK(taken.size() == 3 && views.size() == 4);
+      if (taken.size() == 3) CHECK(taken[0] == big && taken[1] == frag1 + frag2 && taken[2] == big);
+      if (views.size() == 4)
+        CHECK(views[0] == "in place" && views[1] == "between" && views[2] == std::string(40000, 't') && views[3] == "last");
+    } else {
+      CHECK(taken.empty() && views.size() == 7);
+      if (views.size() == 7) CHECK(views[1] == big && views[3] == frag1 + frag2 && views[4] == big);
+    }
+  }
+
+  // moreInRead(): true while the buffer holds anything behind the frame
+  // being delivered, false for the last frame of a read.
+  {
+    WsParser p;
+    std::vector<bool> more;
+    auto onMessage = [&](std::string_view, bool, bool) { more.push_back(p.moreInRead()); };
+    auto onControl = [&](WsOpcode, std::string_view) { more.push_back(p.moreInRead()); };
+    std::string w = clientFrame(WsOpcode::Text, "one") + clientFrame(WsOpcode::Ping, "") +
+                    clientFrame(WsOpcode::Text, "") + clientFrame(WsOpcode::Text, "four");
+    CHECK(p.consume(reinterpret_cast<uint8_t*>(w.data()), w.size(), onMessage, onControl));
+    CHECK(more == (std::vector<bool>{true, true, true, false}));
+    more.clear();
+    // One frame and the first byte of the next: something is behind it.
+    std::string x = clientFrame(WsOpcode::Text, "alone") + clientFrame(WsOpcode::Text, "next");
+    const size_t first = x.size() - clientFrame(WsOpcode::Text, "next").size();
+    CHECK(p.consume(reinterpret_cast<uint8_t*>(x.data()), first + 1, onMessage, onControl));
+    CHECK(more == (std::vector<bool>{true}));
+    more.clear();
+    CHECK(p.consume(reinterpret_cast<uint8_t*>(x.data()) + first + 1, x.size() - first - 1, onMessage, onControl));
+    CHECK(more == (std::vector<bool>{false}));
+    // A message that ends a read after arriving over two of them.
+    more.clear();
+    std::string y = clientFrame(WsOpcode::Binary, std::string(300, 'y'));
+    CHECK(p.consume(reinterpret_cast<uint8_t*>(y.data()), 100, onMessage, onControl));
+    CHECK(p.consume(reinterpret_cast<uint8_t*>(y.data()) + 100, y.size() - 100, onMessage, onControl));
+    CHECK(more == (std::vector<bool>{false}));
+  }
+  std::printf("ok  buffered messages can be taken whole; moreInRead()\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -926,6 +1292,7 @@ int main() {
   testKnownMaskedVector();
   testRoundTrips();
   testClosePayload();
+  testCloseFramePayload();
   testFragmentationWithInterleavedPing();
   testByteAtATimeConversation();
   testErrors();
@@ -935,6 +1302,8 @@ int main() {
   testFastPathBatchedFrames();
   testInterleavedPingSingleBuffer();
   testIncrementalUtf8();
+  testDeclaredLengthReserve();
+  testBufferHandOver();
   std::printf("\nall websocket unit tests passed (%d checks)\n", gChecks);
   return 0;
 }

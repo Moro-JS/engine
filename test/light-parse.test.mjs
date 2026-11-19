@@ -285,3 +285,91 @@ test('repeated requests on a keep-alive connection follow the route table and th
     engine.close(sid);
   }
 });
+
+// A request line that matched an engine route, with the rest of the head in
+// a later read: the application may change its routes in between (a route
+// registered once the server is up, the tables cleared and filled again when
+// middleware is added or removed). The request is answered from the tables
+// as they are when its head completes, never from the match made at its
+// request line, which by then may point at a route that was moved or freed.
+test('a route-table change between a request line and the end of its head', async () => {
+  const seen = [];
+  const sid = engine.serve({
+    onRequest(reqId, _m, path) {
+      seen.push(path);
+      engine.respond(reqId, 200, null, `js:${path}`);
+    },
+    onAborted() {},
+  });
+  const port = engine.listen(sid, '127.0.0.1', 0);
+  const pad = 'p'.repeat(200);
+  // The request line alone, `change()` once the server has read it, then the rest.
+  const split = async (target, change) => {
+    const s = await open(port);
+    let buf = '';
+    s.on('data', (d) => (buf += d.toString('latin1')));
+    const closed = new Promise((resolve) => s.on('close', () => resolve(true)));
+    s.write(`GET ${target} HTTP/1.1${CRLF}`);
+    await new Promise((res) => setTimeout(res, 60));
+    change();
+    s.write(`Host: t${CRLF}${CRLF}`);
+    const wasClosed = await Promise.race([closed, new Promise((res) => setTimeout(() => res(false), 300))]);
+    s.destroy();
+    return { buf, closed: wasClosed };
+  };
+  try {
+    // The parameter table grows (its storage moves): same route, same reply.
+    engine.setParamRoute(sid, GET, '/user/', '', 200, ['x-route', 'user']);
+    let r = await split('/user/abc', () => {
+      for (let k = 0; k < 64; k++) engine.setParamRoute(sid, GET, `/grow${k}/`, '', 200, ['x-pad', pad]);
+    });
+    assert.deepStrictEqual(statuses(r.buf), [200]);
+    assert.match(r.buf, /\r\nx-route: user\r\n/);
+    assert.deepStrictEqual(bodies(r.buf), ['abc']);
+
+    // A second method registered for the path (the path's routes move).
+    engine.setStaticRoute(sid, GET, '/s', 200, ['x-route', 's'], 'static-get');
+    r = await split('/s', () => {
+      for (let m = 1; m < 7; m++) engine.setStaticRoute(sid, m, '/s', 200, ['x-pad', pad], pad);
+    });
+    assert.deepStrictEqual(statuses(r.buf), [200]);
+    assert.match(r.buf, /\r\nx-route: s\r\n/);
+    assert.deepStrictEqual(bodies(r.buf), ['static-get']);
+
+    // Cleared and filled again with the route in it: the new reply.
+    r = await split('/s', () => {
+      engine.clearStaticRoutes(sid);
+      for (let k = 0; k < 64; k++) engine.setStaticRoute(sid, GET, `/other${k}`, 200, ['x-pad', pad], pad);
+      engine.setStaticRoute(sid, GET, '/s', 200, ['x-route', 's2'], 'static-again');
+    });
+    assert.deepStrictEqual(statuses(r.buf), [200]);
+    assert.match(r.buf, /\r\nx-route: s2\r\n/);
+    assert.deepStrictEqual(bodies(r.buf), ['static-again']);
+
+    // Cleared and filled again without it: its headers were never stored, so
+    // it cannot be handed to JS, and no other route's reply is its answer.
+    r = await split('/s', () => {
+      engine.clearStaticRoutes(sid);
+      for (let k = 0; k < 64; k++) engine.setStaticRoute(sid, GET, `/other${k}`, 200, ['x-pad', pad], pad);
+    });
+    assert.deepStrictEqual(statuses(r.buf), [500]);
+    assert.ok(!r.buf.includes(pad), 'answered with another route\'s reply');
+    assert.strictEqual(r.closed, true);
+
+    // Every route gone: the same.
+    engine.setStaticRoute(sid, GET, '/s', 200, null, 'static');
+    r = await split('/s', () => {
+      engine.clearStaticRoutes(sid);
+      engine.clearParamRoutes(sid);
+    });
+    assert.deepStrictEqual(statuses(r.buf), [500]);
+    assert.strictEqual(r.closed, true);
+
+    assert.deepStrictEqual(seen, [], 'none of them reached JS without its headers');
+    // A request that starts after the change is routed by the new tables.
+    r = await exchange(port, `GET /s HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`);
+    assert.deepStrictEqual(bodies(r.buf), ['js:/s']);
+  } finally {
+    engine.close(sid);
+  }
+});

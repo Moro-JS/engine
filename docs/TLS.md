@@ -33,7 +33,9 @@ The choice is made once per thread, when the binding is first loaded (the first
 3. Otherwise, `auto`: BoringSSL, **unless node's OpenSSL has been configured** —
    the process was started with `--enable-fips`, `--force-fips`,
    `--openssl-config`, `--openssl-shared-config` or `--openssl-legacy-provider`
-   (on the command line or in `NODE_OPTIONS`), `OPENSSL_CONF` or
+   (on the command line, in `NODE_OPTIONS`, or as `nodeOptions` of the file
+   named by `--experimental-config-file` / the `node.config.json` that
+   `--experimental-default-config-file` reads), `OPENSSL_CONF` or
    `OPENSSL_MODULES` is set, or `crypto.getFips()` reports FIPS mode. An
    operator who set any of those expects TLS to go through that library, and
    it does, with nothing to change. `reason` names what was found.
@@ -74,6 +76,18 @@ lacks — in practice a TLS 1.2 client with no ECDHE support. Set
 `MORO_ENGINE_BINARY` (a path to one specific `.node`, for builds and A/B runs)
 bypasses all of the above.
 
+### node's own TLS flags
+
+`node --tls-min-v1.3`, `--tls-max-v1.2` and `--tls-cipher-list=...` set the
+defaults of every TLS server node creates (`tls.DEFAULT_MIN_VERSION`,
+`tls.DEFAULT_MAX_VERSION`, `tls.DEFAULT_CIPHERS`). They are the defaults of a
+server here as well, on either library: an `ssl` object that names no
+`minVersion`, no `maxVersion`, or neither `ciphers` nor `ciphersuites` gets
+node's, at `serve()` and at `updateSsl()`. What the app names itself wins, as
+it does for node's servers. A cipher list BoringSSL cannot honour is handled
+like one the app wrote: served by the OpenSSL binary, or refused when
+BoringSSL was asked for by name.
+
 ## What differs between the two
 
 Everything in `ServeOptions.ssl` works on both. The differences:
@@ -81,10 +95,10 @@ Everything in `ServeOptions.ssl` works on both. The differences:
 | | BoringSSL (bundled) | OpenSSL (node's) |
 | --- | --- | --- |
 | TLS 1.3 suites (`ssl.ciphersuites`) | `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`. Naming any other throws from `serve()`. | whatever that OpenSSL has (adds the CCM suites) |
-| TLS ≤ 1.2 ciphers (`ssl.ciphers`) | ECDHE and RSA key exchange with AES-GCM, ChaCha20-Poly1305 and the legacy AES-CBC suites. No DHE, CCM, ARIA or Camellia. | whatever that OpenSSL has |
+| TLS ≤ 1.2 ciphers (`ssl.ciphers`) | ECDHE and RSA key exchange with AES-GCM, ChaCha20-Poly1305 and the legacy AES-CBC suites. No DHE, CCM, ARIA or Camellia. | whatever that OpenSSL has, except DHE: the engine sets no DH parameters, so a DHE suite is never chosen and a list of DHE suites alone fails every TLS 1.2 handshake |
 | FIPS mode, OpenSSL providers and engines, `openssl.cnf`, a distribution's crypto policy | not consulted | honoured |
 | Session tickets (TLS 1.3) | sent with the first response (one packet instead of two) | sent right after the handshake |
-| Resumption across servers sharing `ssl.ticketKeys` | between servers on the same library | between servers on the same library |
+| Resumption across servers sharing `ssl.ticketKeys` | between servers on the same library and with the same policy (below) | between servers on the same library and with the same policy (below) |
 | Security fixes arrive with | an engine release | a Node.js release |
 
 The default policy is the same on both: TLS 1.2 or later, no renegotiation, no
@@ -93,6 +107,19 @@ and ChaCha20-Poly1305 for a client that lists it first. (On a machine without
 AES instructions the BoringSSL binary leads with ChaCha20, which is the faster
 and safer choice there.) A ticket minted by one library is not understood by
 the other; a client holding one simply gets a full handshake.
+
+A resumed session skips what the full handshake decided: the client is not
+asked for a certificate again and its chain is not verified again, and under
+TLS 1.2 the cipher is the session's. So a session is resumed only by a context
+with the same policy as the one that issued it - the same `minVersion`,
+`ciphers` and `ciphersuites`, and on a server with `requestCert` the same
+`rejectUnauthorized` and the same set of CA certificates. Shared `ticketKeys`
+carry sessions between workers and servers configured alike, and across an
+`updateSsl()` that rotates the certificate; they do not carry a session from a
+listener that asks for no client certificate into one that requires it, or
+past an `updateSsl()` that replaced the client CA or tightened the cipher
+list. A client whose session is not taken gets a full handshake under the
+policy in force.
 
 ## Why bundle a TLS library
 

@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -159,6 +160,75 @@ int main() {
       if (step % 10000 == 0) CHECK(sameContents(m, ref));
     }
     CHECK(sameContents(m, ref));
+  }
+
+  // --- insertNew: binds a key that is free, refuses one that is bound ---
+  {
+    FlatMap<int*> m;
+    std::unordered_map<uint32_t, int*> ref;
+    CHECK(!m.insertNew(0, val(1)));  // the empty-slot marker is never a key
+    CHECK(m.size() == 0);
+    CHECK(m.insertNew(7, val(7)));
+    CHECK(m.find(7) == val(7));
+    CHECK(!m.insertNew(7, val(8)));  // already bound: refused ...
+    CHECK(m.find(7) == val(7));      // ... and the binding is the one it had
+    CHECK(m.size() == 1);
+    m.erase(7);
+    CHECK(m.insertNew(7, val(8)));   // free again after erase
+    CHECK(m.find(7) == val(8));
+    m.erase(7);
+    // Through growth and long probe chains, mirrored against the reference:
+    // a key is accepted exactly when the reference does not hold it.
+    for (int step = 0; step < 60000; ++step) {
+      uint32_t k = 1 + (rng() % 20000);
+      if (rng() % 3 == 0) {
+        m.erase(k);
+        ref.erase(k);
+      } else {
+        const bool fresh = ref.find(k) == ref.end();
+        CHECK(m.insertNew(k, val(k + step)) == fresh);
+        if (fresh) ref[k] = val(k + step);
+      }
+      if (step % 5000 == 0) CHECK(sameContents(m, ref));
+    }
+    CHECK(sameContents(m, ref));
+  }
+
+  // StringMap: every key found by a view of it, absent keys not found,
+  // through the in-order scan of a small table and the hashed one past it;
+  // keys of every length up to 40, many of them alike but for a few bytes.
+  {
+    moro::engine::StringMap<uint32_t> m;
+    std::vector<std::string> keys;
+    for (uint32_t i = 0; i < 512; ++i) keys.push_back("/nope" + std::to_string(i));
+    for (size_t n = 0; n <= 40; ++n) keys.push_back(std::string(n, 'k') + std::to_string(n));
+    bool found = true, absent = true;
+    for (uint32_t i = 0; i < keys.size(); ++i) {
+      absent = absent && m.find(keys[i]) == nullptr;
+      m.insert(keys[i], i);
+      for (uint32_t j = 0; j <= i; j += 1 + i / 16) {
+        const std::string copy = keys[j];  // a different buffer, the same bytes
+        const uint32_t* v = m.find(std::string_view(copy));
+        found = found && v != nullptr && *v == j;
+      }
+      found = found && m.find("/nope") == nullptr && m.find("/nope5120") == nullptr && m.find("") == nullptr;
+    }
+    CHECK(found);
+    CHECK(absent);
+    CHECK(m.size() == keys.size());
+  }
+
+  // KeyHash spreads keys that differ in a few bytes over the low bits that
+  // choose a slot (a table of 1024 slots holding 512 such keys).
+  {
+    std::vector<bool> used(1024, false);
+    size_t distinct = 0;
+    for (uint32_t i = 0; i < 512; ++i) {
+      const size_t slot = moro::text::KeyHash{}("/nope" + std::to_string(i)) & 1023;
+      if (!used[slot]) ++distinct;
+      used[slot] = true;
+    }
+    CHECK(distinct >= 350);  // a random function gives about 403
   }
 
   std::printf("all flat-map unit tests passed (%d checks)\n", tests);

@@ -114,3 +114,90 @@ test('a peer that never closes is cut at the linger deadline', async () => {
     engine.close(sid);
   }
 });
+
+// A request the server has rejected ends the connection's HTTP input, from
+// the moment the error response is written or queued - not only once it has
+// been flushed and the connection is lingering. The response may sit behind
+// earlier ones the peer has not read yet; whatever the peer sends in that
+// window is dropped like the input of a lingering connection, and never read
+// as the rest of the rejected request or as a new one.
+const BIG = Buffer.alloc(4 * 1024 * 1024, 0x61);
+const getReq = (path) => `GET ${path} HTTP/1.1\r\nHost: t\r\n\r\n`;
+
+function serveLogged(options) {
+  const paths = [];
+  const sid = engine.serve({
+    onRequest(reqId, _m, path) {
+      paths.push(path);
+      engine.respond(reqId, 200, null, path === '/big' ? BIG : 'small');
+    },
+    onAborted() {},
+  }, options);
+  return { sid, port: engine.listen(sid, '127.0.0.1', 0), paths };
+}
+
+// Two ways for the error response to end up behind unread ones: with the
+// default write high-water mark the requests behind the first large response
+// wait for the peer to read, and the rejection is found then, together with
+// whatever arrived meanwhile; with a mark far above the responses nothing
+// waits, and the error response is queued at once.
+const MARKS = [
+  ['default write high-water mark', undefined],
+  ['high-water mark above the queued responses', { writeHighWaterMark: 64 * 1024 * 1024 }],
+];
+
+// Send `first` without reading anything, then `later` (`times` times), then
+// read to the end: the status codes received, in order.
+async function unreadThenRead(port, first, later, times = 1) {
+  const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const s = net.connect({ host: '127.0.0.1', port });
+  await new Promise((resolve) => s.once('connect', resolve));
+  s.pause();
+  s.on('error', () => {});
+  s.write(Buffer.from(first, 'latin1'));
+  await pause(250);
+  for (let i = 0; i < times; i++) {
+    s.write(Buffer.from(later, 'latin1'));
+    await pause(60);
+  }
+  await pause(150);
+  const chunks = [];
+  s.on('data', (d) => chunks.push(d));
+  s.resume();
+  await new Promise((resolve) => {
+    s.on('close', resolve);
+    setTimeout(resolve, 8000).unref();
+  });
+  s.destroy();
+  const raw = Buffer.concat(chunks).toString('latin1');
+  // Status lines only: the bodies here are runs of 'a' and cannot contain one.
+  return [...raw.matchAll(/HTTP\/1\.1 (\d{3}) [^\r\n]*\r\n/g)].map((m) => Number(m[1]));
+}
+
+for (const [label, options] of MARKS) {
+  test(`a request answered 400 for its missing Host is not completed by a Host line sent afterwards (${label})`, async () => {
+    const { sid, port, paths } = serveLogged(options);
+    try {
+      const statuses = await unreadThenRead(
+        port,
+        getReq('/big') + getReq('/big') + 'GET /rejected HTTP/1.1\r\nX-A: b\r\n\r\n',
+        'Host: t\r\n\r\n'
+      );
+      assert.deepStrictEqual(statuses, [200, 200, 400]);
+      assert.ok(!paths.includes('/rejected'), 'the handler ran for a request the client was told is rejected');
+    } finally {
+      engine.close(sid);
+    }
+  });
+
+  test(`one error response, however much the peer sends after it (${label})`, async () => {
+    const { sid, port, paths } = serveLogged(options);
+    try {
+      const statuses = await unreadThenRead(port, getReq('/big') + getReq('/big') + 'BAD LINE\r\n\r\n', getReq('/after'), 5);
+      assert.deepStrictEqual(statuses, [200, 200, 400]);
+      assert.ok(!paths.includes('/after'));
+    } finally {
+      engine.close(sid);
+    }
+  });
+}

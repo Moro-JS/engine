@@ -10,6 +10,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import net from 'node:net';
 import {
   loadEngine,
   startFixtureServer,
@@ -20,6 +21,8 @@ import {
   responsesComplete,
   waitFor,
   delay,
+  exchange,
+  bodyText,
 } from './helpers.mjs';
 
 const engine = await loadEngine();
@@ -411,6 +414,262 @@ describe('@morojs/engine HTTP/1.1 conformance', { skip }, () => {
       } finally {
         client.destroy();
       }
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Request boundaries on a connection that carries several requests, and
+// clients that go away part-way.
+// ---------------------------------------------------------------------------
+
+const H = 'Host: t\r\n';
+const post = (extra, body = '', path = '/p') => `POST ${path} HTTP/1.1\r\n${H}${extra}\r\n${body}`;
+const chunked = (body, path = '/c') => post('Transfer-Encoding: chunked\r\n', body, path);
+const echo = (ctx) => ctx.respond(200, null, `${ctx.method}|${ctx.path}|${bodyText(ctx)}`);
+
+describe('pipelining and errors', { skip }, () => {
+  const cases = [
+    ['a malformed request line', 'BAD LINE\r\n\r\n', 400],
+    ['a field name with a space', `GET /two HTTP/1.1\r\n${H}X A: b\r\n\r\n`, 400],
+    ['an unsupported version', `GET /two HTTP/2.0\r\n${H}\r\n`, 505],
+    ['Content-Length with Transfer-Encoding', `POST /two HTTP/1.1\r\n${H}Content-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\nabc`, 400],
+    ['a body over the limit', `POST /two HTTP/1.1\r\n${H}Content-Length: 99999999999\r\n\r\n`, 413],
+    ['a missing Host', 'GET /two HTTP/1.1\r\n\r\n', 400],
+  ];
+  for (const [label, bad, status] of cases) {
+    it(`a good request, then ${label}, then a good request: answered 200, ${status}, closed; the third is never parsed`, T, async () => {
+      await withServer(echo, async (server) => {
+        const r = await exchange(server, get('/one') + bad + get('/three'));
+        assert.deepEqual(r.statuses, [200, status]);
+        assert.equal(r.responses[1].headers.connection, 'close');
+        assert.equal(r.closed, true);
+        assert.deepEqual(server.requests.map((q) => q.path), ['/one']);
+      });
+    });
+  }
+
+  it('the same with an asynchronous first handler: the error waits its turn, then closes', T, async () => {
+    await withServer((ctx) => { setTimeout(() => ctx.respond(200, null, 'late'), 80); }, async (server) => {
+      const r = await exchange(server, get('/one') + 'BAD\r\n\r\n' + get('/three'), { wait: 400 });
+      assert.deepEqual(r.statuses, [200, 400]);
+      assert.equal(r.responses[0].body, 'late');
+      assert.equal(r.closed, true);
+      assert.equal(server.requests.length, 1);
+    });
+  });
+
+  it('bytes sent after an error response are discarded, not parsed (no second response)', T, async () => {
+    await withServer(echo, async (server) => {
+      const c = await openRaw(server.port);
+      try {
+        await c.send('BAD\r\n\r\n');
+        await delay(40);
+        await c.send(get('/after-error')).catch(() => {});
+        await delay(40);
+        await c.send(get('/after-error-2')).catch(() => {});
+        const raw = await c.read({ expectClose: true, timeout: 4000 });
+        assert.deepEqual(parseResponses(raw).map((r) => r.status), [400]);
+        assert.equal(server.requests.length, 0);
+      } finally {
+        c.destroy();
+      }
+    });
+  });
+
+  it('nothing after a Connection: close request, or after an HTTP/1.0 request, is served', T, async () => {
+    await withServer(echo, async (server) => {
+      let r = await exchange(server, get('/one', 'Connection: close\r\n') + get('/two'));
+      assert.deepEqual(r.statuses, [200]);
+      assert.equal(r.closed, true);
+      r = await exchange(server, 'GET /one HTTP/1.0\r\n\r\n' + get('/two'));
+      assert.deepEqual(r.statuses, [200]);
+      assert.equal(r.closed, true);
+      assert.deepEqual(server.requests.map((q) => q.path), ['/one', '/one']);
+    });
+  });
+
+  it('a body the handler never reads is still consumed: the next request starts after it', T, async () => {
+    await withServer((ctx) => ctx.respond(200, null, ctx.path), async (server) => {
+      const r = await exchange(server, post('Content-Length: 10\r\n', '0123456789', '/unread') + chunked('5\r\nGET /\r\n0\r\n\r\n', '/unread2') + get('/next'));
+      assert.deepEqual(r.responses.map((x) => x.body), ['/unread', '/unread2', '/next']);
+    });
+  });
+
+  it('a request is surfaced only once its whole body has arrived, so no response can precede the body', T, async () => {
+    await withServer((ctx) => ctx.respond(200, null, `${ctx.path}:${bodyText(ctx).length}`), async (server) => {
+      const c = await openRaw(server.port);
+      try {
+        await c.send(post('Content-Length: 10\r\n', 'abc', '/early'));
+        await delay(150);
+        assert.equal(server.requests.length, 0);
+        await c.send('defghij' + get('/next'));
+        const raw = await c.read({ until: responsesComplete(2) });
+        assert.deepEqual(parseResponses(raw).map((x) => x.body), ['/early:10', '/next:0']);
+      } finally {
+        c.destroy();
+      }
+    });
+  });
+
+  it('a short body is not completed by the bytes of a following request line', T, async () => {
+    await withServer(echo, async (server) => {
+      const c = await openRaw(server.port);
+      try {
+        // 40 bytes declared; the "next request" (28 bytes) is body, and the request stays incomplete
+        await c.send(post('Content-Length: 40\r\n', get('/x')));
+        await delay(200);
+        assert.equal(server.requests.length, 0);
+        await c.send('0123456789ab');
+        const res = parseResponse(await c.read());
+        assert.equal(res.status, 200);
+        assert.equal(res.body, 'POST|/p|' + get('/x') + '0123456789ab');
+      } finally {
+        c.destroy();
+      }
+    });
+  });
+
+  it('40 pipelined requests with asynchronous handlers are answered in request order', T, async () => {
+    let n = 0;
+    await withServer((ctx) => { const id = n++; setTimeout(() => ctx.respond(200, null, `${id}:${ctx.path}`), (40 - id) % 7); }, async (server) => {
+      const c = await openRaw(server.port);
+      try {
+        await c.send(Array.from({ length: 40 }, (_, i) => get(`/r${i}`)).join(''));
+        const raw = await c.read({ until: responsesComplete(40), timeout: 10000 });
+        assert.deepEqual(parseResponses(raw).map((x) => x.body), Array.from({ length: 40 }, (_, i) => `${i}:/r${i}`));
+      } finally {
+        c.destroy();
+      }
+    });
+  });
+});
+
+describe('clients that disappear', { skip }, () => {
+  const rst = (port, bytes, afterMs = 20) => new Promise((resolve) => {
+    const s = net.connect({ host: '127.0.0.1', port }, () => {
+      s.write(Buffer.from(bytes, 'latin1'), () => setTimeout(() => { s.resetAndDestroy(); resolve(); }, afterMs));
+    });
+    s.on('error', () => resolve());
+  });
+  const stillServes = async (server) => {
+    const res = parseResponse(await rawRequest(server.port, get('/alive')));
+    assert.equal(res.status, 200);
+  };
+
+  it('mid request line, mid field, mid Content-Length body, mid chunk, mid trailer: no handler, no abort callback, server serves on', T, async () => {
+    await withServer((ctx) => ctx.respond(200, null, 'ok'), async (server) => {
+      const partials = [
+        'GET /par',
+        `GET / HTTP/1.1\r\nHost: t\r\nX-Half: va`,
+        post('Content-Length: 100\r\n', 'only-some'),
+        chunked('64\r\nonly-some'),
+        chunked('3\r\nabc\r\n0\r\nX-T: unfinished'),
+        post('Expect: 100-continue\r\nContent-Length: 100\r\n'),
+      ];
+      for (const p of partials) {
+        await rst(server.port, p);
+        const c = await openRaw(server.port);
+        await c.send(p);
+        await delay(20);
+        c.destroy(); // FIN this time
+      }
+      await delay(100);
+      assert.equal(server.requests.length, 0);
+      assert.equal(server.aborted.length, 0);
+      await stillServes(server);
+    });
+  });
+
+  it('while the handler runs: one abort callback per request, every later call on that request is a no-op', T, async () => {
+    const late = [];
+    await withServer((ctx) => {
+      if (ctx.path === '/alive') return ctx.respond(200, null, 'ok');
+      setTimeout(() => {
+        late.push([
+          ctx.isAborted(),
+          ctx.headers().length,
+          ctx.body(),
+          ctx.query(),
+          ctx.remoteAddress() ?? null,
+          ctx.write('x'),
+        ]);
+        ctx.writeHead(200, ['x-a', 'b']);
+        ctx.write('late');
+        ctx.end('later');
+        ctx.respond(200, null, 'latest');
+      }, 150);
+    }, async (server) => {
+      for (let i = 0; i < 20; i++) await rst(server.port, post('Content-Length: 3\r\n', 'abc', '/run'), 10);
+      await waitFor(() => late.length === 20, { timeout: 4000 });
+      assert.equal(server.aborted.length, 20);
+      assert.equal(new Set(server.aborted).size, 20, 'each request aborted once');
+      for (const l of late) assert.deepEqual(l, [true, 0, null, '', null, false]);
+      await stillServes(server);
+    });
+  });
+
+  it('mid response: a large single response and a stream under backpressure, reader gone', T, async () => {
+    const big = Buffer.alloc(16 * 1024 * 1024, 0x61);
+    let streams = 0;
+    await withServer(async (ctx) => {
+      if (ctx.path === '/alive') return ctx.respond(200, null, 'ok');
+      if (ctx.path === '/big') return ctx.respond(200, null, big);
+      streams++;
+      ctx.writeHead(200, null);
+      const piece = Buffer.alloc(256 * 1024, 0x62);
+      for (let i = 0; i < 200 && !ctx.isAborted(); i++) {
+        if (!ctx.write(piece)) await ctx.waitWritable();
+      }
+      ctx.end();
+    }, async (server) => {
+      for (let i = 0; i < 10; i++) {
+        for (const path of ['/big', '/stream']) {
+          await new Promise((resolve) => {
+            const s = net.connect({ host: '127.0.0.1', port: server.port }, () => s.write(get(path)));
+            s.once('data', () => { if (i % 2) s.resetAndDestroy(); else s.destroy(); resolve(); });
+            s.on('error', () => resolve());
+          });
+        }
+      }
+      await delay(300);
+      assert.equal(streams, 10);
+      await stillServes(server);
+    });
+  });
+
+  it('during a pipelined batch: answered ones stay answered, the rest are dropped, server serves on', T, async () => {
+    let surfaced = 0;
+    await withServer((ctx) => {
+      if (ctx.path === '/alive') return ctx.respond(200, null, 'ok');
+      surfaced++;
+      if (ctx.path === '/sync') return ctx.respond(200, null, 'sync');
+      setTimeout(() => ctx.respond(200, null, 'async'), 30);
+    }, async (server) => {
+      for (let i = 0; i < 20; i++) {
+        const batch = (get('/sync') + get('/async')).repeat(16) + (i % 2 ? 'BAD\r\n\r\n' : post('Content-Length: 50\r\n', 'partial'));
+        await new Promise((resolve) => {
+          const s = net.connect({ host: '127.0.0.1', port: server.port }, () => s.write(batch));
+          s.once('data', () => { if (i % 3 === 0) s.resetAndDestroy(); else s.destroy(); resolve(); });
+          s.on('error', () => resolve());
+        });
+      }
+      await delay(400);
+      assert.ok(surfaced >= 20);
+      await stillServes(server);
+    });
+  });
+
+  it('a client that half-closes after its request still gets the response of a synchronous handler', T, async () => {
+    await withServer(echo, async (server) => {
+      const raw = await new Promise((resolve) => {
+        let buf = '';
+        const s = net.connect({ host: '127.0.0.1', port: server.port, allowHalfOpen: true }, () => s.end(get('/half')));
+        s.on('data', (d) => (buf += d.toString('latin1')));
+        s.on('close', () => resolve(buf));
+        s.on('error', () => resolve(buf));
+      });
+      assert.equal(parseResponse(raw).body, 'GET|/half|');
     });
   });
 });

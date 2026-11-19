@@ -108,10 +108,11 @@ Ongoing / recommended:
 
 Binaries build locally for darwin/arm64 across all 6 ABIs. The CI matrix
 (`.github/workflows/ci.yml`, mirrored by `release.yml`) covers darwin
-x64+arm64, linux gnu x64+arm64 (clang-18 + lld, PGO-trained in the release
-lane), linux musl x64+arm64, and win32 x64 (MSVC), with a Node 20–26 smoke
-matrix on every flavour, full conformance legs on Linux/macOS/Windows, ASan/
-UBSan lanes, an in-repo h1spec job, and a strict PGO cycle.
+x64+arm64, linux gnu x64+arm64 (clang-18 + lld in a glibc 2.28 image, so
+they load on glibc 2.28 and later; PGO-trained in the release lane), linux
+musl x64+arm64, and win32 x64 (MSVC), with a Node 20–26 smoke matrix on every
+flavour, full conformance legs on Linux/macOS/Windows, ASan/UBSan lanes, an
+in-repo h1spec job, and a strict PGO cycle.
 
 ## Transports: where they stand
 

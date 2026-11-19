@@ -226,6 +226,90 @@ int main() {
     CHECK(n == 0);
   }
   ::close(sv[1]);
+
+  // Cancel by user_data: the multishot recv ends with -ECANCELED and nothing
+  // else on the socket is touched - a send waiting for room in the same
+  // socket goes on to complete, and the socket can be read again, by a plain
+  // recv() and by a new multishot recv.
+  {
+    int pv[2];
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pv) == 0);
+    alignas(8) static char recvTag2, sendTag2, cancelTag2;
+    s = ring.sqe();
+    prepRecv(s, pv[0], kBufGroup, true);
+    s->user_data = tag(&recvTag2, kTagRecv);
+    // A send larger than the socket takes: its first completion is short,
+    // and the one issued for the rest waits for the peer to read.
+    int tiny = 4096;
+    ::setsockopt(pv[0], SOL_SOCKET, SO_SNDBUF, &tiny, sizeof(tiny));
+    static char big[1 << 20];
+    std::memset(big, 'y', sizeof(big));
+    s = ring.sqe();
+    prepSend(s, pv[0], big, sizeof(big), MSG_NOSIGNAL);
+    s->user_data = tag(&sendTag2, kTagSend);
+    int first = -1;
+    reapUntil(ring, 1, [&](const abi::io_uring_cqe& c) {
+      if (tagOf(c.user_data) == kTagSend) first = c.res;
+    });
+    CHECK(first > 0 && first < static_cast<int>(sizeof(big)));
+    s = ring.sqe();
+    prepSend(s, pv[0], big, 512, MSG_NOSIGNAL);  // blocked behind what the peer has not read
+    s->user_data = tag(&sendTag2, kTagSend);
+    ring.enter(0, 0);
+    s = ring.sqe();
+    prepCancelUserData(s, tag(&recvTag2, kTagRecv));
+    s->user_data = tag(&cancelTag2, kTagCancel);
+    int cancelRes = 1, recvRes = 1;
+    bool recvMore = true, sendDone = false;
+    reapUntil(ring, 2, [&](const abi::io_uring_cqe& c) {
+      switch (tagOf(c.user_data)) {
+        case kTagCancel: cancelRes = c.res; break;
+        case kTagRecv: recvRes = c.res; recvMore = hasMore(c); break;
+        case kTagSend: sendDone = true; break;
+        default: break;
+      }
+    });
+    CHECK(cancelRes == 0);
+    CHECK(recvRes == -ECANCELED && !recvMore);
+    CHECK(!sendDone);  // the send was not cancelled with it
+    // The peer reads: the blocked send completes in full.
+    static char drain[64 * 1024];
+    size_t drained = 0;
+    int sendRes = -1;
+    for (int spin = 0; spin < 200 && sendRes < 0; spin++) {
+      ssize_t n = ::read(pv[1], drain, sizeof(drain));
+      if (n > 0) drained += static_cast<size_t>(n);
+      ring.enter(0, abi::IORING_ENTER_GETEVENTS);
+      ring.forEachCqe([&](const abi::io_uring_cqe& c) {
+        if (tagOf(c.user_data) == kTagSend) sendRes = c.res;
+      });
+    }
+    CHECK(sendRes == 512);
+    // The socket is still open for reading: directly ...
+    CHECK(::write(pv[1], "direct", 6) == 6);
+    char got[16];
+    ssize_t n = -1;
+    for (int spin = 0; spin < 100 && n < 0; spin++) n = ::recv(pv[0], got, sizeof(got), MSG_DONTWAIT);
+    CHECK(n == 6 && std::memcmp(got, "direct", 6) == 0);
+    // ... and through a new multishot recv.
+    s = ring.sqe();
+    prepRecv(s, pv[0], kBufGroup, true);
+    s->user_data = tag(&recvTag2, kTagRecv);
+    ring.enter(0, 0);
+    CHECK(::write(pv[1], "again", 5) == 5);
+    int again = -1;
+    reapUntil(ring, 1, [&](const abi::io_uring_cqe& c) {
+      if (tagOf(c.user_data) == kTagRecv && c.res > 0 && hasBuffer(c)) {
+        again = c.res;
+        CHECK(std::memcmp(bufs.at(bufferId(c)), "again", 5) == 0);
+        bufs.recycle(bufferId(c));
+      }
+    });
+    CHECK(again == 5);
+    ::close(pv[0]);
+    ::close(pv[1]);
+  }
+
   bufs.destroy(ring);
   ring.close();
 

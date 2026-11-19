@@ -5,6 +5,16 @@
 //   node tools/release.mjs minor          # 1.0.0 -> 1.1.0
 //   node tools/release.mjs major          # 1.0.0 -> 2.0.0
 //   node tools/release.mjs 1.2.3          # explicit version
+//   node tools/release.mjs 1.2.0-rc.1     # a release candidate (also -beta.N, -alpha.N)
+//
+// A release candidate is published to npm under the dist-tag `next`: a plain
+// `npm install @morojs/engine` and every semver range keep resolving to
+// `latest`, which does not move. It is always named in full; so is whatever
+// follows one (the next candidate, or the release itself):
+//   1.1.21 -> 1.2.0-rc.1 -> 1.2.0-rc.2 -> 1.2.0
+// patch / minor / major are refused while the tree is at a candidate, and a
+// version that is not above the current one is refused always. A candidate
+// uses the note of the release it is a candidate for (changelog/v1.2.0.md).
 //
 // Flags:
 //   --dry-run       show everything that WOULD happen, change nothing
@@ -37,6 +47,7 @@ import { readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkPin } from './boringssl.mjs';
+import { parseVersion, compareVersions } from './version.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const args = process.argv.slice(2);
@@ -61,20 +72,50 @@ function run(cmd) {
 // ---- compute the next version ----
 const metaPath = join(root, 'packages/engine/package.json');
 const current = JSON.parse(readFileSync(metaPath, 'utf8')).version;
+const usage = `usage: node tools/release.mjs <patch|minor|major|x.y.z|x.y.z-rc.n> [--dry-run] [--no-push] [--skip-checks]\n  current version: ${current}`;
+let cur;
+try {
+  cur = parseVersion(current);
+} catch (err) {
+  die(`packages/engine/package.json: ${err.message}`);
+}
 let next;
-if (/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(bumpArg ?? '')) {
-  next = bumpArg;
-} else if (['patch', 'minor', 'major'].includes(bumpArg ?? '')) {
-  const [ma, mi, pa] = current.split('.').map(n => parseInt(n, 10));
+if (['patch', 'minor', 'major'].includes(bumpArg ?? '')) {
+  // "The next patch" of a candidate could mean the next candidate, the
+  // release it leads to, or the patch after that: it is named instead.
+  if (cur.prerelease) {
+    die(
+      `the tree is at ${current}, a release candidate: "${bumpArg}" does not say what comes next. Name it:\n` +
+        `  node tools/release.mjs ${cur.core}-${cur.pre.stage}.${cur.pre.n + 1}    # another candidate (npm dist-tag next)\n` +
+        `  node tools/release.mjs ${cur.core}    # the release itself (npm dist-tag latest)`
+    );
+  }
+  const { major: ma, minor: mi, patch: pa } = cur;
   next =
     bumpArg === 'major' ? `${ma + 1}.0.0` :
     bumpArg === 'minor' ? `${ma}.${mi + 1}.0` :
     `${ma}.${mi}.${pa + 1}`;
+} else if (/^\d/.test(bumpArg ?? '')) {
+  try {
+    next = parseVersion(bumpArg).version;
+  } catch (err) {
+    die(`${err.message}\n${usage}`);
+  }
 } else {
-  die(`usage: node tools/release.mjs <patch|minor|major|x.y.z> [--dry-run] [--no-push] [--skip-checks]\n  current version: ${current}`);
+  die(usage);
 }
+const nextVersion = parseVersion(next);
+// Releases are cut from main, in order. A version at or below the current one
+// would put older code under a newer name, or move `latest` backwards.
+if (compareVersions(nextVersion, cur) <= 0) {
+  die(`${next} is not above the current version ${current}`);
+}
+const distTag = nextVersion.distTag;
 
-console.log(`\n@morojs/engine release: ${current} -> ${next}${dryRun ? '  (DRY RUN)' : ''}\n`);
+console.log(
+  `\n@morojs/engine release: ${current} -> ${next}${dryRun ? '  (DRY RUN)' : ''}\n` +
+    (nextVersion.prerelease ? `release candidate: npm dist-tag "${distTag}", latest does not move\n` : '')
+);
 
 // ---- safety gates ----
 const dirty = sh('git status --porcelain');
@@ -86,10 +127,12 @@ if (branch !== 'main') die(`on branch '${branch}' - releases cut from main`);
 if (sh(`git tag -l v${next}`)) die(`tag v${next} already exists`);
 // The release note is written before the release, not after: it is the
 // GitHub Release body, and CHANGELOG.md is the index users land on.
-const notesPath = join(root, 'changelog', `v${next}.md`);
-if (!existsSync(notesPath)) die(`changelog/v${next}.md is missing - write the release note first`);
-if (!readFileSync(join(root, 'CHANGELOG.md'), 'utf8').includes(`changelog/v${next}.md`))
-  die(`CHANGELOG.md has no entry for v${next} - add its line at the top of the list`);
+// A candidate carries the note of the release it is a candidate for.
+const noteName = `v${nextVersion.core}.md`;
+const notesPath = join(root, 'changelog', noteName);
+if (!existsSync(notesPath)) die(`changelog/${noteName} is missing - write the release note first`);
+if (!readFileSync(join(root, 'CHANGELOG.md'), 'utf8').includes(`changelog/${noteName}`))
+  die(`CHANGELOG.md has no entry for v${nextVersion.core} - add its line at the top of the list`);
 
 // A release ships BoringSSL inside half its binaries, and that copy is the
 // only one its users get: no release goes out on a pin that upstream has
@@ -166,7 +209,13 @@ if (noPush) {
   run(`git push origin main v${next}`);
   console.log(`\ntag v${next} pushed. npm publish fires when you publish the GitHub Release:`);
   console.log(`  1. open  https://github.com/Moro-JS/engine/releases/new?tag=v${next}`);
-  console.log(`  2. paste changelog/v${next}.md as the body (or: gh release create v${next} --title v${next} --notes-file changelog/v${next}.md)`);
-  console.log(`  3. click "Publish release" - that click starts the build + npm publish`);
+  if (nextVersion.prerelease) {
+    console.log(`  2. paste changelog/${noteName} as the body and tick "Set as a pre-release" (or: gh release create v${next} --prerelease --title v${next} --notes-file changelog/${noteName})`);
+    console.log(`  3. click "Publish release" - that click starts the build + npm publish under the dist-tag "${distTag}"`);
+    console.log(`     (install it with: npm install @morojs/engine@${distTag}; "latest" stays where it is)`);
+  } else {
+    console.log(`  2. paste changelog/v${next}.md as the body (or: gh release create v${next} --title v${next} --notes-file changelog/v${next}.md)`);
+    console.log(`  3. click "Publish release" - that click starts the build + npm publish`);
+  }
   console.log(`watch it: https://github.com/Moro-JS/engine/actions`);
 }

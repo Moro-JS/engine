@@ -16,7 +16,10 @@
 
 #include <zlib.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -46,7 +49,13 @@ inline std::string_view pmdTrim(std::string_view s) {
 // acceptable permessage-deflate offer, return the negotiated params bounded by
 // the server's PmdOptions. Returns nullopt when no offer is acceptable (the
 // extension is then simply not negotiated - a valid outcome). Only the FIRST
-// acceptable permessage-deflate offer is honored (RFC 7692 §5.1).
+// acceptable permessage-deflate offer is honored (RFC 7692 §5.1). An offer is
+// declined (RFC 7692 §7) when it carries a parameter that is not defined for
+// an offer, a parameter with an invalid value - a value on one of the two
+// no_context_takeover flags, window bits outside 9..15 or written with a
+// leading zero - or the same parameter twice. `header` is the whole offer
+// list: a request with several Sec-WebSocket-Extensions lines hands them over
+// joined with commas (RFC 6455 §9.1).
 inline std::optional<PmdParams> parsePmdOffer(std::string_view header,
                                               const PmdOptions& opt) {
   if (!opt.enabled) return std::nullopt;
@@ -73,6 +82,10 @@ inline std::optional<PmdParams> parsePmdOffer(std::string_view header,
     // §7.1.2.2: client_max_window_bits may appear in the response only when
     // the client's offer contained the parameter.
     bool sawClientMaxWindowBits = false;
+    // §7: an offer that names a parameter twice MUST be declined.
+    bool sawClientNoContextTakeover = false;
+    bool sawServerNoContextTakeover = false;
+    bool sawServerMaxWindowBits = false;
 
     size_t j = (semi == std::string_view::npos) ? offer.size() : semi + 1;
     while (j < offer.size() && ok) {
@@ -83,15 +96,17 @@ inline std::optional<PmdParams> parsePmdOffer(std::string_view header,
       if (param.empty()) continue;
 
       size_t eq = param.find('=');
+      const bool hasValue = eq != std::string_view::npos;
       std::string_view key = pmdTrim(param.substr(0, eq));
-      std::string_view val =
-          eq == std::string_view::npos ? std::string_view{} : pmdTrim(param.substr(eq + 1));
+      std::string_view val = hasValue ? pmdTrim(param.substr(eq + 1)) : std::string_view{};
       // Values may be quoted.
       if (val.size() >= 2 && val.front() == '"' && val.back() == '"')
         val = val.substr(1, val.size() - 2);
 
+      // §7.1.2.1 / §7.1.2.2: "a decimal integer value without leading zeroes".
       auto toInt = [](std::string_view v, int& out) -> bool {
         if (v.empty()) return false;
+        if (v.size() > 1 && v.front() == '0') return false;
         int n = 0;
         for (char c : v) {
           if (c < '0' || c > '9') return false;
@@ -105,13 +120,20 @@ inline std::optional<PmdParams> parsePmdOffer(std::string_view header,
       };
 
       if (key == "client_no_context_takeover") {
+        // §7.1.1.2: the parameter has no value.
+        if (hasValue || sawClientNoContextTakeover) ok = false;
+        sawClientNoContextTakeover = true;
         p.clientNoContextTakeover = true;  // client offers to reset its context
       } else if (key == "server_no_context_takeover") {
+        // §7.1.1.1: the parameter has no value.
+        if (hasValue || sawServerNoContextTakeover) ok = false;
+        sawServerNoContextTakeover = true;
         p.serverNoContextTakeover = true;  // client requires us to reset ours
       } else if (key == "client_max_window_bits") {
         // May be a bare flag (client supports the param) or a value.
+        if (sawClientMaxWindowBits) ok = false;
         sawClientMaxWindowBits = true;
-        if (eq != std::string_view::npos) {
+        if (hasValue) {
           int bits;
           // Acceptable range is 9..15: zlib's raw deflate cannot produce an
           // 8-bit window, and answering 9 to an offer of 8 exceeds the offer
@@ -124,6 +146,8 @@ inline std::optional<PmdParams> parsePmdOffer(std::string_view header,
         }
       } else if (key == "server_max_window_bits") {
         int bits;
+        if (sawServerMaxWindowBits) ok = false;
+        sawServerMaxWindowBits = true;
         // 9..15 only, same constraint as client_max_window_bits (§7.1.2.1).
         if (!toInt(val, bits) || bits < 9 || bits > 15) {
           ok = false;
@@ -172,19 +196,36 @@ inline std::string buildPmdResponse(const PmdParams& p) {
 // stream with this stream's params; Z_SYNC_FLUSH's empty stored block can run
 // at most ~5 bytes past it (incompressible input), so the reserve saves the
 // append loop's reallocation in all but that worst case.
-inline bool pmdDeflateMessage(z_stream& zs, std::string_view in, std::string& out) {
+//
+// zlib counts its input in 32 bits (z_stream::avail_in), so the message is
+// handed over in pieces of at most `maxPiece` bytes, every one but the last
+// without a flush: given whole, a message of 4 GiB or more had its length
+// cut to the low 32 bits and only that much of it was sent. (`maxPiece` is a
+// parameter for the unit test, which cannot allocate a message that size.)
+inline constexpr size_t kPmdMaxPiece = size_t(1) << 30;
+inline bool pmdDeflateMessage(z_stream& zs, std::string_view in, std::string& out,
+                              size_t maxPiece = kPmdMaxPiece) {
   out.clear();
-  out.reserve(deflateBound(&zs, static_cast<uLong>(in.size())));
-  zs.next_in = reinterpret_cast<unsigned char*>(const_cast<char*>(in.data()));
-  zs.avail_in = static_cast<uInt>(in.size());
+  // deflateBound takes a uLong, which is 32 bits on some platforms: the
+  // reserve is skipped for a length that does not fit, never taken short.
+  if (in.size() <= std::numeric_limits<uLong>::max())
+    out.reserve(deflateBound(&zs, static_cast<uLong>(in.size())));
   unsigned char buf[16384];
+  size_t off = 0;
   do {
-    zs.next_out = buf;
-    zs.avail_out = sizeof(buf);
-    int r = deflate(&zs, Z_SYNC_FLUSH);
-    if (r != Z_OK && r != Z_BUF_ERROR) return false;
-    out.append(reinterpret_cast<char*>(buf), sizeof(buf) - zs.avail_out);
-  } while (zs.avail_out == 0);
+    const size_t piece = std::min(in.size() - off, maxPiece);
+    zs.next_in = reinterpret_cast<unsigned char*>(const_cast<char*>(in.data() + off));
+    zs.avail_in = static_cast<uInt>(piece);
+    off += piece;
+    const int flush = off == in.size() ? Z_SYNC_FLUSH : Z_NO_FLUSH;
+    do {
+      zs.next_out = buf;
+      zs.avail_out = sizeof(buf);
+      int r = deflate(&zs, flush);
+      if (r != Z_OK && r != Z_BUF_ERROR) return false;
+      out.append(reinterpret_cast<char*>(buf), sizeof(buf) - zs.avail_out);
+    } while (zs.avail_out == 0);
+  } while (off < in.size());
 
   // Strip the 4-byte empty-block tail that Z_SYNC_FLUSH appends.
   if (out.size() >= 4) out.resize(out.size() - 4);
@@ -234,8 +275,13 @@ class PmdContext {
   // Inflate a received compressed message payload (RFC 7692 §7.2.2: append the
   // 4-byte 0x00 0x00 0xFF 0xFF tail before inflating). Returns false on a
   // corrupt stream OR when the output would exceed maxDecompressed_ (zip-bomb
-  // defense); out holds the decompressed bytes on success.
-  bool inflateMessage(std::string_view in, std::string& out) {
+  // defense); out holds the decompressed bytes on success. After a false,
+  // inflateOverCap() tells the two apart: the message was too big (close
+  // code 1009), or its bytes were not a deflate stream (1007).
+  // The input goes to zlib in pieces of at most `maxPiece` bytes, for the
+  // reason pmdDeflateMessage gives.
+  bool inflateMessage(std::string_view in, std::string& out, size_t maxPiece = kPmdMaxPiece) {
+    overCap_ = false;
     if (!inflateOk_) return false;
     out.clear();
     // Typical text ratios are 3-5x; a modest up-front reserve avoids repeated
@@ -258,7 +304,10 @@ class PmdContext {
         int r = inflate(&inflate_, flush);
         if (r != Z_OK && r != Z_BUF_ERROR && r != Z_STREAM_END) return false;
         size_t produced = sizeof(buf) - inflate_.avail_out;
-        if (out.size() + produced > maxDecompressed_) return false;
+        if (out.size() + produced > maxDecompressed_) {
+          overCap_ = true;
+          return false;
+        }
         out.append(reinterpret_cast<char*>(buf), produced);
         if (r == Z_STREAM_END) {
           // BFINAL=1 put the stream in DONE; reset - otherwise every later
@@ -276,9 +325,13 @@ class PmdContext {
       }
     };
 
-    if (!in.empty() &&
-        !run(reinterpret_cast<const unsigned char*>(in.data()), in.size(), Z_NO_FLUSH))
-      return false;
+    for (size_t off = 0; off < in.size();) {
+      const size_t piece = std::min(in.size() - off, maxPiece);
+      streamEnded = false;  // only the end of the last piece is the end of the message
+      if (!run(reinterpret_cast<const unsigned char*>(in.data()) + off, piece, Z_NO_FLUSH))
+        return false;
+      off += piece;
+    }
     // §7.2.2's appended tail completes the empty stored block a stripped
     // Z_SYNC_FLUSH left open. When the message ended its stream outright
     // (BFINAL=1) no block is open: on the reset stream the 4 tail bytes would
@@ -300,6 +353,10 @@ class PmdContext {
     return true;
   }
 
+  // Why the last inflateMessage() returned false: true when the output
+  // passed maxDecompressed_, false when the input was not valid deflate data.
+  bool inflateOverCap() const { return overCap_; }
+
   size_t threshold() const { return threshold_; }
   void setThreshold(size_t t) { threshold_ = t; }
 
@@ -312,6 +369,7 @@ class PmdContext {
   z_stream deflate_{};
   bool inflateOk_ = false;
   bool deflateOk_ = false;
+  bool overCap_ = false;
 };
 
 // One server-owned deflate stream shared across ALL permessage-deflate
@@ -348,16 +406,42 @@ class SharedDeflator {
   // UNCONDITIONAL deflateReset (the no-context-takeover semantics). Reset
   // even when the deflate loop failed, so one bad message cannot poison the
   // stream for every other connection's next send.
+  //
+  // Every message starts from the same stream state (that reset), so the
+  // same bytes always deflate to the same bytes: the last message and its
+  // output are kept, and a message sent to many sockets one after another -
+  // a broadcast, which is what a shared compressor is configured for - is
+  // deflated once and copied for the rest. The comparison is of the bytes
+  // themselves. A message over kMemoMax is not kept.
   bool deflateMessage(std::string_view in, std::string& out) {
     if (!ok_) return false;
+    if (memo_ && in.size() == lastIn_.size() &&
+        (in.empty() || memcmp(in.data(), lastIn_.data(), in.size()) == 0)) {
+      out.assign(lastOut_);
+      return true;
+    }
     bool produced = pmdDeflateMessage(deflate_, in, out);
     if (deflateReset(&deflate_) != Z_OK) ok_ = false;
+    memo_ = produced && ok_ && in.size() <= kMemoMax;
+    if (memo_) {
+      lastIn_.assign(in.data(), in.size());
+      lastOut_.assign(out);
+    } else if (lastIn_.capacity() != 0) {
+      std::string().swap(lastIn_);
+      std::string().swap(lastOut_);
+    }
     return produced && ok_;
   }
+
+  // The largest message whose output is kept for the next send.
+  static constexpr size_t kMemoMax = 256 * 1024;
 
  private:
   z_stream deflate_{};
   bool ok_ = false;
+  bool memo_ = false;
+  std::string lastIn_;
+  std::string lastOut_;
 };
 
 }  // namespace engine

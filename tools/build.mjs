@@ -9,7 +9,7 @@
 // Usage:
 //   node tools/build.mjs                 # build for the running Node's ABI only
 //   node tools/build.mjs --all           # build every ABI in TARGETS
-//   node tools/build.mjs --abi 137       # build one specific ABI
+//   node tools/build.mjs --abi 137       # build one specific ABI (or several: --abi 137,147)
 //   node tools/build.mjs --arch x64      # cross-target arch (darwin only)
 //   node tools/build.mjs --sanitize      # ASan/UBSan debug build (CI sanitizer job)
 //   node tools/build.mjs --tls=openssl   # only the binary that links Node's OpenSSL
@@ -21,7 +21,8 @@
 // fetched, built once per platform and cached) and is what the loader prefers.
 //
 // Raw-V8 bindings are ABI-specific by design (maximum perf), so a
-// new Node release = one line added to TARGETS + a CI run.
+// new Node release = one line added to TARGETS + a CI run (and one entry in
+// TRAINING_NODES, tools/pgo.mjs, so that the new ABI is trained on its own).
 
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'child_process';
@@ -31,7 +32,7 @@ import { get } from 'https';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import os from 'os';
-import { ensureBoringSsl } from './boringssl.mjs';
+import { ensureBoringSsl, prelinkBoringSsl, llvmTool } from './boringssl.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const buildDir = join(root, 'build');
@@ -52,6 +53,22 @@ export const TARGETS = [
   { node: 'v25.0.0', abi: 141, fastApiSha256: 'a4377dddfabf15668b14234a7b8a894ee6f9cd98cae3f39fd7d049c52aef7c0a' },
   { node: 'v26.0.0', abi: 147, fastApiSha256: '507a4e27c3e20e02f21f9155dfa0c808c5af1dc08fcf83039735b05b4e34a1a5' },
 ];
+
+// What nodejs.org serves for each TARGETS version, pinned here: the sha256 of
+// the headers tarball and of the Windows import library (win-x64/node.lib).
+// Both are compiled or linked into the binaries, and the SHASUMS256.txt beside
+// them comes from the same server over the same connection - it catches a bad
+// transfer, not a changed file. A release line is immutable once published, so
+// these change only when a line is added to TARGETS: take them from that
+// version's SHASUMS256.txt (its signature: github.com/nodejs/release-keys).
+const NODE_DIST_SHA256 = {
+  'v20.11.0': { headers: 'c456d00c993b3d60d29c50e3389edc4f181145934b4ed38ad2fd047938440f22', 'win-x64/node.lib': '53a982d490cb9fcc4b231a8b95147de423b36186bc6f4ba5697b20117fdcbd5d' },
+  'v22.0.0': { headers: 'd33e48f25ba714a69c920c584710892f4a77dce90c9bba23a228c5c1136f7a53', 'win-x64/node.lib': '8ded03c4ad28e5a64be37cd4c4278094c96a512569a8fa68a20bccbcc960339f' },
+  'v23.0.0': { headers: 'ac1328fb5d5d1a58b7591a230dc63f46f1d3ec0e10fa371edbef3a67b45f1a58', 'win-x64/node.lib': 'd86a8d40cb8a3c23b1e7f1d5756d719da4c40f9998c5eb106eb9ae92fe00296b' },
+  'v24.0.0': { headers: '4605ee37eef345568f43de8c1843f3f7a243865654c1e942c50584de6bd59bb5', 'win-x64/node.lib': '34882ca2bb450431047f2dd3bae1c3b8c1cd2b4cffd5c1a0bf079948846d2b83' },
+  'v25.0.0': { headers: '860bfee03c9cfc34fca14d5c1a670df8aac3940e1412aa1aa5a9d9efb7b74522', 'win-x64/node.lib': '829cfd9cfdc9dc1ed13273d746949b19a3fb9d1616fa1db4ff00c033df8fb305' },
+  'v26.0.0': { headers: 'cefe207f1f02075ed0e72dac1799188841b5d1e50eea83074feaea3d26960b11', 'win-x64/node.lib': 'f870fc3af0b3d8c6e79b5d10f5872e472beefc6e4051b97eb825a801bc00eb52' },
+};
 
 const platform = os.platform(); // darwin | linux | win32
 const hostArch = os.arch() === 'arm64' ? 'arm64' : 'x64';
@@ -87,6 +104,12 @@ function parseArgs(argv) {
     pgo: process.env.MORO_PGO || '',
     pgoDir: process.env.MORO_PGO_DIR || join(buildDir, 'pgo'),
     pgoProfile: process.env.MORO_PGO_PROFILE || '',
+    // The bundled TLS library in the cycle (tools/pgo.mjs; see
+    // boringSslBuild below):
+    //   --pgo=generate --pgo-library   the library is instrumented as well
+    //   --pgo-library-profile=F        libssl is built from that run's profile
+    pgoLibrary: false,
+    pgoLibraryProfile: '',
     // --out-dir: write binaries somewhere other than build/ (an instrumented
     // build must not replace the shippable one; the loader can be pointed at
     // it with MORO_ENGINE_BINARY).
@@ -100,13 +123,15 @@ function parseArgs(argv) {
     const key = eq === -1 ? a : a.slice(0, eq);
     const val = eq === -1 ? null : a.slice(eq + 1);
     if (key === '--all') args.all = true;
-    else if (key === '--abi') args.abi = parseInt(val ?? argv[++i], 10);
+    else if (key === '--abi') args.abi = String(val ?? argv[++i]).split(',').map(n => parseInt(n, 10));
     else if (key === '--arch') args.arch = val ?? argv[++i];
     else if (key === '--sanitize') args.sanitize = true;
     else if (key === '--no-fast-api') args.fastApi = false;
     else if (key === '--pgo') args.pgo = val ?? argv[++i];
     else if (key === '--pgo-dir') args.pgoDir = val ?? argv[++i];
     else if (key === '--pgo-profile') args.pgoProfile = val ?? argv[++i];
+    else if (key === '--pgo-library') args.pgoLibrary = true;
+    else if (key === '--pgo-library-profile') args.pgoLibraryProfile = val ?? argv[++i];
     else if (key === '--out-dir') args.outDir = val ?? argv[++i];
     else if (key === '--tls') args.tls = val ?? argv[++i];
     else throw new Error(`unknown argument: ${a}`);
@@ -128,7 +153,7 @@ function parseArgs(argv) {
   return args;
 }
 
-function download(url, dest) {
+export function download(url, dest) {
   return new Promise((resolve, reject) => {
     get(url, res => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
@@ -145,9 +170,12 @@ function download(url, dest) {
   });
 }
 
-// Verify the headers tarball against the SHASUMS256.txt published alongside it
-// on nodejs.org, so a tampered or corrupted download can't feed the compiler.
-function verifyChecksum(tarball, shasumsFile, entryName) {
+// Verify a download against the SHASUMS256.txt published alongside it on
+// nodejs.org (a corrupted transfer) and against the sha256 pinned in
+// NODE_DIST_SHA256 (a file that was changed on the server), so
+// neither can feed the compiler. `pinned` is undefined only for a file no
+// published binary is built from (win-arm64).
+function verifyChecksum(tarball, shasumsFile, entryName, pinned) {
   const shasums = readFileSync(shasumsFile, 'utf8');
   const line = shasums.split('\n').find(l => l.trim().endsWith(entryName));
   if (!line) {
@@ -157,6 +185,9 @@ function verifyChecksum(tarball, shasumsFile, entryName) {
   const actual = createHash('sha256').update(readFileSync(tarball)).digest('hex');
   if (actual !== expected) {
     throw new Error(`checksum mismatch for ${entryName}: expected ${expected}, got ${actual}`);
+  }
+  if (pinned && actual !== pinned) {
+    throw new Error(`checksum mismatch for ${entryName}: tools/build.mjs pins ${pinned}, nodejs.org served ${actual}`);
   }
 }
 
@@ -178,7 +209,7 @@ async function fetchWinLib(nodeVersion, arch) {
   console.log(`  fetching ${base}/${entryName}`);
   await download(`${base}/${entryName}`, tmp);
   await download(`${base}/SHASUMS256.txt`, shasumsFile);
-  verifyChecksum(tmp, shasumsFile, entryName);
+  verifyChecksum(tmp, shasumsFile, entryName, NODE_DIST_SHA256[nodeVersion]?.[entryName]);
   rmSync(shasumsFile);
   renameSync(tmp, libFile);
   return libFile;
@@ -223,7 +254,9 @@ async function fetchHeaders(nodeVersion) {
   console.log(`  fetching ${base}/${entryName}`);
   await download(`${base}/${entryName}`, tarball);
   await download(`${base}/SHASUMS256.txt`, shasumsFile);
-  verifyChecksum(tarball, shasumsFile, entryName);
+  const pinned = NODE_DIST_SHA256[nodeVersion]?.headers;
+  if (!pinned) throw new Error(`no pinned sha256 for the ${nodeVersion} headers (NODE_DIST_SHA256 in tools/build.mjs)`);
+  verifyChecksum(tarball, shasumsFile, entryName, pinned);
   execFileSync('tar', ['-xzf', tarball, '-C', dir]);
   rmSync(tarball);
   rmSync(shasumsFile);
@@ -261,7 +294,20 @@ function toolchain() {
   if (isClang && platform === 'linux') {
     lld = !!(which('ld.lld') || which('lld'));
   }
-  toolchainCache = { cxx, isClang, lld };
+  // Linux arm64, clang before 19: -fno-plt marks every call to a function that
+  // is defined elsewhere, but the AArch64 backend acts on the mark only when
+  // asked to (from 19 on it does so by itself, and the switch is gone). Asked
+  // of the compiler rather than read from its version number.
+  let aarch64NonLazyBind = false;
+  if (isClang && platform === 'linux' && hostArch === 'arm64') {
+    try {
+      execFileSync(cxx, ['-mllvm', '-aarch64-enable-nonlazybind', '-x', 'c++', '-fsyntax-only', '/dev/null'], { stdio: 'ignore' });
+      aarch64NonLazyBind = true;
+    } catch {
+      // not this compiler
+    }
+  }
+  toolchainCache = { cxx, isClang, lld, aarch64NonLazyBind };
   return toolchainCache;
 }
 
@@ -322,6 +368,10 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null, fastApi = fa
         // The engine has no class hierarchy of its own for the check to guard.
         '-fno-sanitize=vptr',
         '-fno-sanitize-recover=all',
+        // The fault points (src/tls.h): failures no peer can provoke, switched
+        // on by a test through an environment variable. This build is the
+        // only one that has them; probe().testFaults says so.
+        '-DMORO_ENGINE_TEST_FAULTS=1',
       ]
     : [
         '-O3',
@@ -348,10 +398,23 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null, fastApi = fa
     // stay exactly as-is.
     ...(!sanitize && arch === 'x64' ? ['-march=x86-64-v2'] : []),
     ...(!sanitize && arch === 'arm64' ? ['-march=armv8.2-a'] : []),
+    // Linux arm64: no frame pointer. clang keeps one in every non-leaf
+    // function on AArch64 Linux unless told otherwise; on x86-64 it already
+    // omits it at this optimisation level. Unwind tables are still emitted,
+    // so crash backtraces and DWARF-based profiling work as before; only
+    // frame-pointer unwinding through engine frames is given up.
+    ...(!sanitize && platform === 'linux' && arch === 'arm64' ? ['-fomit-frame-pointer'] : []),
     // Linux: call libc/libstdc++ through the GOT directly instead of PLT
     // stubs. The addon is linked -z now (no lazy binding), so the stubs buy
     // nothing, and memchr/memcpy/memcmp run on every request.
     ...(!sanitize && platform === 'linux' ? ['-fno-plt'] : []),
+    // On arm64 clang 18 (the linux-gnu release compiler) needs the backend
+    // switch as well, or the flag above changes nothing: a plain GET then
+    // runs 55 PLT stubs, four instructions each. With -flto the code is
+    // generated by the linker, so the switch goes to both.
+    ...(!sanitize && platform === 'linux' && arch === 'arm64' && tc.aarch64NonLazyBind
+      ? ['-mllvm', '-aarch64-enable-nonlazybind', ...(tc.lld ? ['-Wl,-mllvm,-aarch64-enable-nonlazybind'] : [])]
+      : []),
     '-fvisibility=hidden',
     // BoringSSL's <openssl/...> must be found before the copies of OpenSSL's
     // headers that sit in the Node include directory.
@@ -405,6 +468,11 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null, fastApi = fa
       // Linker hardening: read-only relocations, immediate binding, NX stack.
       '-Wl,-z,relro,-z,now',
       '-Wl,-z,noexecstack',
+      // Nothing that comes from a static archive is exported: without this
+      // the binary on node's OpenSSL lists all of the static libstdc++
+      // (operator new included) in its dynamic symbol table, where each
+      // symbol is open to being bound to another module's definition.
+      '-Wl,--exclude-libs,ALL',
       // BoringSSL inside the addon. --exclude-libs keeps every symbol of the
       // archives out of the dynamic symbol table: the host node exports
       // OpenSSL under the same names, and a reference that went through the
@@ -482,18 +550,44 @@ function compile({ includeDir, abi, arch, sanitize, libFile = null, fastApi = fa
   return output;
 }
 
+// Whether the bundled TLS library can be compiled for link-time optimisation
+// here: the release toolchain (clang, and a linker that takes LLVM bitcode)
+// and the llvm-ar that goes with it. MORO_BORINGSSL_LTO=0 turns it off
+// (bisecting; a faster local build).
+export function boringSslLto(sanitize = false) {
+  const tc = toolchain();
+  const able = !sanitize && platform !== 'win32' && tc.isClang && (platform === 'darwin' || tc.lld);
+  return able && process.env.MORO_BORINGSSL_LTO !== '0' && !!llvmTool(tc.cxx, 'llvm-ar') && !!llvmTool(tc.cxx, 'llvm-ranlib');
+}
+
+// The bundled TLS library for one build, beyond what tools/boringssl.mjs
+// always does. Where it can be (boringSslLto), its C and C++ are compiled for
+// link-time optimisation, like the engine's own code: the engine's link then
+// inlines across the library's files and across the boundary to the engine,
+// and a keep-alive HTTPS GET runs a seventh fewer instructions. The
+// handwritten assembly (AES-GCM, SHA-2, the P-256 field) is as upstream ships
+// it either way. In a PGO cycle the library is instrumented for one training
+// run (--pgo-library) and libssl is then built from that run's profile
+// (--pgo-library-profile, see prelinkBoringSsl): a fifth fewer.
+function boringSslBuild(args) {
+  const cxx = platform === 'win32' ? null : toolchain().cxx;
+  const lto = boringSslLto(args.sanitize);
+  if (lto && args.pgoLibraryProfile) return prelinkBoringSsl({ arch: args.arch, cxx, profile: args.pgoLibraryProfile });
+  return ensureBoringSsl({ arch: args.arch, cxx, lto, ...(lto && args.pgo === 'generate' && args.pgoLibrary ? { pgo: 'generate', pgoDir: args.pgoDir } : {}) });
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   mkdirSync(buildDir, { recursive: true });
 
   let targets;
   if (args.all) targets = TARGETS;
-  else if (args.abi) targets = TARGETS.filter(t => t.abi === args.abi);
+  else if (args.abi) targets = TARGETS.filter(t => args.abi.includes(t.abi));
   else targets = TARGETS.filter(t => t.abi === parseInt(process.versions.modules, 10));
 
   if (targets.length === 0) {
     console.error(
-      `No target for ABI ${args.abi ?? process.versions.modules}. Known: ${TARGETS.map(t => t.abi).join(', ')}`
+      `No target for ABI ${args.abi ? args.abi.join(',') : process.versions.modules}. Known: ${TARGETS.map(t => t.abi).join(', ')}`
     );
     process.exit(1);
   }
@@ -526,7 +620,7 @@ async function main() {
         pgoDir: args.pgoDir,
         pgoProfile: args.pgoProfile,
         outDir: args.outDir,
-        bssl: tls === 'boringssl' ? ensureBoringSsl({ arch: args.arch, cxx: platform === 'win32' ? null : toolchain().cxx }) : null,
+        bssl: tls === 'boringssl' ? boringSslBuild(args) : null,
       });
     }
   }

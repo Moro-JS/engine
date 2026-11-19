@@ -6,9 +6,11 @@ name: release
 # button). Binaries ship ONLY from this CI run with npm provenance — never from
 # a developer machine (CONTRIBUTING.md).
 #
-# Flow: rebuild every platform (same matrix as ci.yml) -> load-smoke every
-# shipped binary + run conformance per OS (the same gates ci.yml enforces, so a
-# tag never publishes anything ci.yml would have failed) -> assemble the
+# Flow: the whole of ci.yml on the tagged commit (job `gate`: units,
+# sanitizers, fuzz smoke, every transport, h1spec) and, beside it, rebuild
+# every platform (same matrix as ci.yml) -> load-smoke every shipped binary +
+# run conformance per OS, against the binaries that will be published. Nothing
+# is published unless both are green -> assemble the
 # per-platform packages + sync all versions (tools/prepare-release.mjs) ->
 # publish each platform package, then the meta package LAST so its
 # optionalDependencies already resolve. Publishes are idempotent
@@ -28,24 +30,55 @@ on:
     types: [published]
   workflow_dispatch:
 
-# Least privilege at the top; the publish job elevates to contents:write to
-# attach SHA256SUMS to the Release (see its job-level permissions).
+# Least privilege at the top. The publish job alone elevates: contents:write to
+# attach SHA256SUMS to the Release, id-token:write for npm trusted publishing
+# (see its job-level permissions). No build, smoke or conformance job can mint
+# the OIDC token npm trusts.
 permissions:
   contents: read
-  id-token: write # npm provenance + trusted publishing (OIDC)
 
 jobs:
   # A dispatch has to be on a release tag: everything below reads the version
-  # from GITHUB_REF_NAME.
+  # from GITHUB_REF_NAME. The tag is vX.Y.Z for a release, or vX.Y.Z-rc.N
+  # (also -beta.N, -alpha.N) for a release candidate, which is published under
+  # the npm dist-tag `next` and leaves `latest` alone (tools/version.mjs holds
+  # the same grammar for the tooling). Anything else is refused here.
   ref-check:
     runs-on: ubuntu-latest
     steps:
-      - name: Require a vX.Y.Z tag
+      - name: Require a vX.Y.Z or vX.Y.Z-rc.N tag
+        env:
+          # 'true' when this run was started by publishing a GitHub Release
+          # that is marked as a pre-release; empty on a dispatch.
+          MARKED_PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
-          case "$GITHUB_REF" in
-            refs/tags/v[0-9]*.[0-9]*.[0-9]*) echo "releasing $GITHUB_REF_NAME" ;;
-            *) echo "release.yml must run on a vX.Y.Z tag, got $GITHUB_REF"; exit 1 ;;
-          esac
+          re='^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.[1-9][0-9]*)?$'
+          if [[ ! "$GITHUB_REF" =~ $re ]]; then
+            echo "release.yml must run on a vX.Y.Z or vX.Y.Z-rc.N tag, got $GITHUB_REF"
+            exit 1
+          fi
+          # A Release marked "pre-release" on a plain X.Y.Z tag says two
+          # things at once: the mark says candidate, the version would go out
+          # as `latest`. Not guessed at - unmark it, or tag a candidate.
+          if [ -z "${BASH_REMATCH[4]}" ] && [ "$MARKED_PRERELEASE" = true ]; then
+            echo "The GitHub Release for $GITHUB_REF_NAME is marked as a pre-release, but $GITHUB_REF_NAME is a release version and would be published to npm as latest."
+            echo "Unmark it and re-run, or release a candidate instead (vX.Y.Z-rc.N)."
+            exit 1
+          fi
+          echo "releasing $GITHUB_REF_NAME"
+
+  # ── The per-commit gate, on the commit being released ───────────────────────
+  # A tag can be pushed, and its Release published, before ci.yml has finished
+  # on that commit - or after it failed. So the gate runs here as well, and
+  # `publish` waits for it: a release cannot go out on a commit that the
+  # sanitizer, fuzz, unit or io_uring lanes would have stopped. Its builds are
+  # test builds under their own artifact names; what is published are the
+  # binaries built below.
+  gate:
+    needs: [ref-check]
+    uses: ./.github/workflows/ci.yml
+    with:
+      artifact_prefix: gate-
 
   # ── Build every published binary flavor + its checksum manifest ─────────────
   # Two binaries per ABI: BoringSSL inside (tools/boringssl.mjs, pinned), and
@@ -56,17 +89,19 @@ jobs:
     # clang 18+; the runner's Apple clang is older, so build with Homebrew LLVM.
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
         run: |
           brew list llvm >/dev/null 2>&1 || brew install llvm
           command -v cmake >/dev/null || brew install cmake
           echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
-      # PGO cycle (lenient: a profile problem keeps the plain build). The x64
-      # binaries are cross-built from the arm64 host's training profile.
+      # PGO cycle (lenient: a profile problem keeps the plain build). Each ABI
+      # is trained under a Node.js of that ABI (tools/pgo.mjs fetches the
+      # pinned ones); the x64 binaries are cross-built and trained under
+      # Rosetta 2, which the arm64 runners carry.
       - run: node tools/pgo.mjs --all --arch arm64
       - run: node tools/pgo.mjs --all --arch x64
       # SHA-256 manifest of the exact bytes we ship; the publish job concatenates
@@ -74,15 +109,25 @@ jobs:
       # and attaches SHA256SUMS to the GitHub Release.
       - name: Checksum manifest
         run: shasum -a 256 build/*.node > SHA256SUMS.darwin
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-darwin
           path: build/*.node
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: checksums-darwin
           path: SHA256SUMS.darwin
 
+  # Built inside a glibc 2.28 image (manylinux_2_28, AlmaLinux 8), so the
+  # binaries load on glibc 2.28 and later, the floor of Node.js's own Linux
+  # builds. Built on the runner (Ubuntu 22.04) they needed 2.35 and did not
+  # load on Debian 11, Ubuntu 20.04 or RHEL 8.
+  # tools/linux-gnu-build.sh installs the same clang 18 toolchain, runs the
+  # PGO build with the runner's Node mounted at /opt/node, and fails if a
+  # binary needs a newer glibc. docker run, as for musl (see ci.yml).
+  # seccomp=unconfined: Docker's default profile refuses io_uring_setup, and
+  # the training run would leave the io_uring transport unprofiled (compiled
+  # as cold code) in the binaries built here.
   linux-gnu:
     needs: [ref-check]
     strategy:
@@ -90,35 +135,40 @@ jobs:
         include:
           - runner: ubuntu-22.04
             arch: x64
+            image: quay.io/pypa/manylinux_2_28_x86_64:2026.11.14-1@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
           - runner: ubuntu-22.04-arm
             arch: arm64
+            image: quay.io/pypa/manylinux_2_28_aarch64:2026.11.14-1@sha256:34a5e614a4eb26f73f8bf44cbbf2acf8011620453d03ea35a58537bb3cde44de
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
-      - name: Install clang-18 + lld + llvm-profdata
-        run: |
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
-          sudo apt-get install -y lld-18 llvm-18
-          echo "CXX=clang++-18" >> "$GITHUB_ENV"
-          echo "LLVM_PROFDATA=llvm-profdata-18" >> "$GITHUB_ENV"
-          sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
-      - run: node tools/pgo.mjs --all
+      - name: PGO build in the glibc 2.28 image
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm --security-opt seccomp=unconfined -v "$PWD:/repo" -w /repo -v "$(dirname "$(dirname "$(command -v node)")"):/opt/node:ro" \
+            "$IMAGE" sh tools/linux-gnu-build.sh node tools/pgo.mjs --all
       - name: Checksum manifest
         run: shasum -a 256 build/*.node > SHA256SUMS.linux-${{ matrix.arch }}-gnu
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-linux-${{ matrix.arch }}-gnu
           path: build/*.node
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: checksums-linux-${{ matrix.arch }}-gnu
           path: SHA256SUMS.linux-${{ matrix.arch }}-gnu
 
   # docker-run instead of `container:`: JS actions can't run inside Alpine
   # containers on arm64 runners (no musl Node to inject). See ci.yml.
+  # seccomp=unconfined: so that the training run can use io_uring (see linux-gnu).
+  # compiler-rt: the profile runtime the instrumented build links. Alpine's
+  # clang package does not bring it, and without it every musl binary was
+  # published as the plain build (the cycle is lenient here); ci.yml's
+  # pgo-musl job runs the same cycle strictly.
   linux-musl:
     needs: [ref-check]
     strategy:
@@ -130,18 +180,18 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build in Alpine container (musl)
         run: |
-          docker run --rm -v "$PWD:/repo" -w /repo node:24-alpine \
-            sh -c "apk add --no-cache build-base clang lld llvm cmake git linux-headers && node tools/pgo.mjs --all"
+          docker run --rm --security-opt seccomp=unconfined -v "$PWD:/repo" -w /repo node:24-alpine \
+            sh -c "apk add --no-cache build-base clang compiler-rt lld llvm cmake git linux-headers && node tools/pgo.mjs --all"
       - name: Checksum manifest
         run: shasum -a 256 build/*.node > SHA256SUMS.linux-${{ matrix.arch }}-musl
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-linux-${{ matrix.arch }}-musl
           path: build/*.node
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: checksums-linux-${{ matrix.arch }}-musl
           path: SHA256SUMS.linux-${{ matrix.arch }}-musl
@@ -150,7 +200,7 @@ jobs:
     needs: [ref-check]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Third-party action pinned to a full commit SHA (supply-chain integrity);
       # Dependabot (.github/dependabot.yml) bumps the SHA + comment on new tags.
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
@@ -160,22 +210,26 @@ jobs:
         run: |
           choco install nasm -y --no-progress
           "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
-      # MSVC PGO stays opt-in (MORO_PGO_WINDOWS) until the pgort runtime is
-      # verified on the runner; pgo.mjs then keeps the plain build.
+      # MSVC PGO (opt-in through MORO_PGO_WINDOWS; lenient here: a binary whose
+      # cycle fails keeps its plain build). ci.yml's pgo-windows job runs the
+      # same cycle strictly on every commit, so a toolchain that cannot do it
+      # is seen there and not first in a release.
       - run: node tools/pgo.mjs --all
+        env:
+          MORO_PGO_WINDOWS: '1'
       # Git Bash ships coreutils sha256sum; same `<hash>  <path>` format as the
       # POSIX `shasum -a 256` legs, so the concatenated manifest stays uniform.
       - name: Checksum manifest
         shell: bash
         run: sha256sum build/*.node > SHA256SUMS.windows-x64
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-windows-x64
           path: build/*.node
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: checksums-windows-x64
           path: SHA256SUMS.windows-x64
@@ -190,15 +244,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-22.04]
+        # ubuntu-22.04-arm: the linux-arm64-gnu binaries, loaded on arm64.
+        os: [macos-15, ubuntu-22.04, ubuntu-22.04-arm]
         node: [20, 22, 23, 24, 25, 26]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: ${{ matrix.node }}
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: binaries-*
           merge-multiple: true
@@ -213,8 +268,8 @@ jobs:
         node: [20, 22, 23, 24, 25, 26]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: binaries-linux-*-musl
           merge-multiple: true
@@ -232,11 +287,11 @@ jobs:
         node: [20, 22, 23, 24, 25, 26]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: ${{ matrix.node }}
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: binaries-windows-x64
           path: build/
@@ -252,12 +307,12 @@ jobs:
         node: [20, 22, 23, 24, 25, 26]
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: ${{ matrix.node }}
           architecture: x64
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: binaries-darwin
           path: build/
@@ -267,16 +322,24 @@ jobs:
   # matrix above load-tests the shipped binaries, this proves protocol behavior).
   conformance-linux:
     needs: [linux-gnu]
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
       # The exact binaries being published (PGO'd), not a fresh local build.
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: binaries-linux-x64-gnu
+          name: binaries-linux-${{ matrix.arch }}-gnu
           path: build/
       - run: npm run test:smoke && npm run test:suites
 
@@ -284,12 +347,12 @@ jobs:
     needs: [darwin]
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
       # The exact binaries being published (PGO'd), not a fresh local build.
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: binaries-darwin
           path: build/
@@ -299,11 +362,11 @@ jobs:
     needs: [windows]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: binaries-windows-x64
           path: build/
@@ -312,6 +375,7 @@ jobs:
   # ── Publish ─────────────────────────────────────────────────────────────────
   publish:
     needs:
+      - gate
       - darwin
       - linux-gnu
       - linux-musl
@@ -324,26 +388,52 @@ jobs:
       - conformance-macos
       - conformance-windows
     runs-on: ubuntu-latest
+    # Puts the job behind this environment's protection rules (set in the
+    # repository settings), and lets each package's trusted publisher on
+    # npmjs.com be bound to the environment as well as to this workflow file.
+    # The rule that matters is "deployment branches and tags: v*" (tags only).
+    # A workflow_dispatch runs the copy of this file that is on the ref it
+    # names, so `ref-check` above protects nothing against a dispatch from a
+    # branch whose copy has dropped it; npm sees the same file name either
+    # way. The environment's tag rule (and a ruleset on who may create v*
+    # tags) is what keeps the publish credential to release tags. Required
+    # reviewers there would add a human step to the scheduled BoringSSL
+    # release as well.
+    environment: npm-publish
     permissions:
       contents: write # attach SHA256SUMS to the GitHub Release
       id-token: write # npm provenance + trusted publishing (OIDC)
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
       # Trusted publishing (OIDC) needs npm >= 11.5.1; guarantee it regardless of
       # the Node image's bundled npm. Pin the 11.x line: npm@latest is now 12.x,
       # which requires newer Node than some runners provide (11.x covers 20.17+/22.9+).
+      # An exact version, so the npm that holds the publish credential is the
+      # one that was chosen, not whatever 11.x is newest on the day.
       - name: Ensure a trusted-publishing-capable npm
-        run: npm install -g npm@11
-      - uses: actions/download-artifact@v8
+        run: npm install -g npm@11.21.3
+      # The version, and the dist-tag it is published under: `latest` for
+      # X.Y.Z, `next` for a release candidate (outputs: version, dist_tag,
+      # prerelease). Where `latest` stands for each package is noted now, to
+      # be compared after a candidate has been published.
+      - name: Version and dist-tag
+        id: dist
+        run: |
+          node tools/version.mjs "$GITHUB_REF_NAME"
+          for dir in packages/engine*/; do
+            name=$(node -p "require('./$dir/package.json').name")
+            echo "$name $(npm view "$name" dist-tags.latest 2>/dev/null)"
+          done | tee "$RUNNER_TEMP/latest-before"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: binaries-*
           merge-multiple: true
           path: build/
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: checksums-*
           merge-multiple: true
@@ -358,12 +448,21 @@ jobs:
           echo "Shipping these binaries:"
           cat SHA256SUMS
           shasum -a 256 -c SHA256SUMS
+          # -c checks the files the manifest lists. A binary that is in build/
+          # and in no manifest would go out unchecked and unlisted, so the two
+          # sets of names are compared as well.
+          diff <(sed -E 's/^[0-9a-f]+ [ *]//' SHA256SUMS | sort) <(printf '%s\n' build/*.node | sort)
 
       # Attach the verified manifest to the GitHub Release (needs contents:write).
+      # A candidate's Release is also marked as a pre-release, so GitHub does
+      # not present it as the latest release whether or not the box was ticked.
       - name: Attach SHA256SUMS to the Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$GITHUB_REF_NAME" SHA256SUMS --clobber
+          PRERELEASE: ${{ steps.dist.outputs.prerelease }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS --clobber
+          if [ "$PRERELEASE" = true ]; then gh release edit "$GITHUB_REF_NAME" --prerelease; fi
 
       # Derive the release version from the tag (v1.2.3 -> 1.2.3) and assemble.
       # --check fails the release unless every platform package got both
@@ -390,8 +489,24 @@ jobs:
       # Each publish is idempotent — it skips a version already on the registry —
       # so if a later step fails mid-release, re-running completes it cleanly
       # instead of erroring on "cannot publish over previously published version".
+      #
+      # --ignore-scripts: none of the eight packages defines a lifecycle script
+      # and tools/prepare-release.mjs adds none, so nothing runs at publish time
+      # today; the flag keeps it that way.
+      #
+      # Dist-tag: a release is published exactly as before (no --tag: npm
+      # applies `latest`, and refuses by itself a version below the current
+      # `latest`). A release candidate is published with `--tag next`, on
+      # every one of the eight packages, and so never becomes `latest`.
       - name: Publish platform packages
+        env:
+          DIST_TAG: ${{ steps.dist.outputs.dist_tag }}
         run: |
+          case "$DIST_TAG" in
+            latest) tag_args=() ;;
+            next) tag_args=(--tag next) ;;
+            *) echo "no dist-tag for $GITHUB_REF_NAME (got '$DIST_TAG')"; exit 1 ;;
+          esac
           for dir in packages/engine-*/; do
             if ! ls "$dir"/*.node >/dev/null 2>&1; then
               echo "skipping $dir (no binaries)"
@@ -403,15 +518,34 @@ jobs:
               echo "skip $name@$ver (already on registry)"
             else
               echo "publishing $name@$ver"
-              npm publish "./$dir" --provenance --access public
+              npm publish "./$dir" --provenance --access public --ignore-scripts "${tag_args[@]}"
             fi
           done
 
       - name: Publish meta package
+        env:
+          DIST_TAG: ${{ steps.dist.outputs.dist_tag }}
         run: |
+          case "$DIST_TAG" in
+            latest) tag_args=() ;;
+            next) tag_args=(--tag next) ;;
+            *) echo "no dist-tag for $GITHUB_REF_NAME (got '$DIST_TAG')"; exit 1 ;;
+          esac
           ver=$(node -p "require('./packages/engine/package.json').version")
           if npm view "@morojs/engine@$ver" version >/dev/null 2>&1; then
             echo "@morojs/engine@$ver already published"
           else
-            npm publish ./packages/engine --provenance --access public
+            npm publish ./packages/engine --provenance --access public --ignore-scripts "${tag_args[@]}"
           fi
+
+      # A candidate must have left `latest` where it was, on every package. A
+      # difference cannot be undone from here, but it must not go unnoticed:
+      # the run fails and says which package moved.
+      - name: A release candidate did not move latest
+        if: steps.dist.outputs.prerelease == 'true'
+        run: |
+          for dir in packages/engine*/; do
+            name=$(node -p "require('./$dir/package.json').name")
+            echo "$name $(npm view "$name" dist-tags.latest 2>/dev/null)"
+          done > "$RUNNER_TEMP/latest-after"
+          diff "$RUNNER_TEMP/latest-before" "$RUNNER_TEMP/latest-after"

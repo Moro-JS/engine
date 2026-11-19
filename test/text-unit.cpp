@@ -1,7 +1,8 @@
 // Differential unit test for src/text.h: the word-at-a-time ASCII scan and
 // the Latin-1 -> UTF-8 encoder must agree with byte-at-a-time reference
-// implementations on every byte value, every buffer length up to a few words,
-// and random buffers (so odd tails and mid-word non-ASCII bytes are covered).
+// implementations on every byte value, every buffer length up to a few of the
+// scan's thirty-two-byte steps, and random buffers (so odd tails and non-ASCII
+// bytes anywhere in a step are covered).
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -61,12 +62,24 @@ int main() {
 
   // Empty input.
   CHECK(isAscii(nullptr, 0) == true);
+  // Every length through several 32-byte steps, with the one high byte at
+  // every position: each step width and both tails see it.
+  for (size_t len = 1; len <= 130; ++len) {
+    std::string b(len, 'a');
+    bool ok = isAscii(reinterpret_cast<const uint8_t*>(b.data()), b.size());
+    for (size_t pos = 0; pos < len; ++pos) {
+      b[pos] = static_cast<char>(0x80 + (pos & 0x7f));
+      ok = ok && !isAscii(reinterpret_cast<const uint8_t*>(b.data()), b.size());
+      b[pos] = 'a';
+    }
+    CHECK(ok);
+  }
   latin1ToUtf8(nullptr, 0, out);
   CHECK(out.empty());
 
   // One non-ASCII byte at every position of buffers spanning several words
   // (catches a wrong mask, a wrong tail loop, an off-by-one at a word edge).
-  for (size_t len = 1; len <= 40; ++len) {
+  for (size_t len = 1; len <= 104; ++len) {
     for (size_t pos = 0; pos < len; ++pos) {
       std::vector<uint8_t> v(len, 'a');
       v[pos] = 0xE9;  // 'é'
@@ -81,7 +94,7 @@ int main() {
 
   // Random buffers, both mixed and forced-ASCII.
   for (int iter = 0; iter < 20000; ++iter) {
-    const size_t len = nextByte() % 96;
+    const size_t len = (nextByte() | (iter & 1 ? 0x100 : 0)) % 300;
     std::vector<uint8_t> v(len);
     const bool forceAscii = (nextByte() & 1) != 0;
     for (size_t i = 0; i < len; ++i) v[i] = forceAscii ? (nextByte() & 0x7F) : nextByte();

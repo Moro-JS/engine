@@ -9,6 +9,7 @@
 #include <uv.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <functional>
@@ -40,6 +41,8 @@
 #include "http2.h"
 #include "http_parser.h"
 #include "response_template.h"
+#include "text.h"
+#include "thread_state.h"
 #include "tls.h"
 #include "websocket.h"
 #include "ws_deflate.h"
@@ -96,30 +99,75 @@ inline void appendChunkSize(std::string& out, size_t v) {
   out.append(p, static_cast<size_t>(buf + sizeof(buf) - p));
 }
 
+// The reason phrase sent with a status code: the registered one (IANA HTTP
+// Status Code Registry; 418 has the phrase everyone knows it by). A client
+// must not act on it (RFC 9112 §4), but it is what a log line, `curl -i` and
+// fetch()'s statusText show, and "429 OK" reads as success. A code the
+// registry does not know keeps the "OK" it was always sent with.
 inline const char* reasonPhrase(int status) {
   switch (status) {
     case 100: return "Continue";
+    case 101: return "Switching Protocols";
+    case 102: return "Processing";
+    case 103: return "Early Hints";
     case 200: return "OK";
     case 201: return "Created";
+    case 202: return "Accepted";
+    case 203: return "Non-Authoritative Information";
     case 204: return "No Content";
+    case 205: return "Reset Content";
     case 206: return "Partial Content";
+    case 207: return "Multi-Status";
+    case 208: return "Already Reported";
+    case 226: return "IM Used";
+    case 300: return "Multiple Choices";
     case 301: return "Moved Permanently";
     case 302: return "Found";
+    case 303: return "See Other";
     case 304: return "Not Modified";
+    case 305: return "Use Proxy";
+    case 307: return "Temporary Redirect";
+    case 308: return "Permanent Redirect";
     case 400: return "Bad Request";
     case 401: return "Unauthorized";
+    case 402: return "Payment Required";
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
+    case 406: return "Not Acceptable";
+    case 407: return "Proxy Authentication Required";
     case 408: return "Request Timeout";
+    case 409: return "Conflict";
+    case 410: return "Gone";
     case 411: return "Length Required";
+    case 412: return "Precondition Failed";
     case 413: return "Content Too Large";
     case 414: return "URI Too Long";
+    case 415: return "Unsupported Media Type";
+    case 416: return "Range Not Satisfiable";
+    case 417: return "Expectation Failed";
+    case 418: return "I'm a Teapot";
+    case 421: return "Misdirected Request";
+    case 422: return "Unprocessable Content";
+    case 423: return "Locked";
+    case 424: return "Failed Dependency";
+    case 425: return "Too Early";
+    case 426: return "Upgrade Required";
+    case 428: return "Precondition Required";
+    case 429: return "Too Many Requests";
     case 431: return "Request Header Fields Too Large";
+    case 451: return "Unavailable For Legal Reasons";
     case 500: return "Internal Server Error";
     case 501: return "Not Implemented";
+    case 502: return "Bad Gateway";
     case 503: return "Service Unavailable";
+    case 504: return "Gateway Timeout";
     case 505: return "HTTP Version Not Supported";
+    case 506: return "Variant Also Negotiates";
+    case 507: return "Insufficient Storage";
+    case 508: return "Loop Detected";
+    case 510: return "Not Extended";
+    case 511: return "Network Authentication Required";
     default: return "OK";
   }
 }
@@ -127,36 +175,46 @@ inline const char* reasonPhrase(int status) {
 class Server;
 struct Connection;
 
-// Request id counter + registry mapping a reqId (the binding's only handle)
-// back to its Connection, across every Server on the calling thread.
-// thread_local, not process-global: worker_threads + reusePort (see
-// HttpLimits::reusePort) runs one engine per thread, each with its own uv
-// loop, servers and connections, and a reqId only ever crosses the
-// JS<->C++ boundary on the thread that created it - per-thread registries
-// are race-free without locks.
-inline uint32_t& globalReqCounter() {
-  static thread_local uint32_t counter = 0;
-  return counter;
+// Exchange two request-snapshot strings (parser <-> staged slot <-> active
+// request). Most requests have no query, no body and a known method, so both
+// sides of those fields are empty and there is nothing to exchange; the test
+// costs a few instructions where std::string::swap is an out-of-line call
+// into libstdc++ that copies both small-string buffers.
+inline void swapField(std::string& a, std::string& b) {
+  if (a.empty() && b.empty()) return;
+  a.swap(b);
 }
+
+// Request id counter + registry mapping a reqId (the binding's only handle)
+// back to its Connection, across every Server on the calling thread: per
+// thread (thread_state.h), since worker_threads + reusePort runs one engine
+// per thread, each with its own uv loop, servers and connections, and a
+// reqId only ever crosses the JS<->C++ boundary on the thread that created
+// it - per-thread registries are race-free without locks.
+inline uint32_t& globalReqCounter() { return threadState().reqCounter; }
+#if defined(MORO_ENGINE_TEST_FAULTS)
+// Test builds only (tools/build.mjs --sanitize defines it; no shipped binary
+// does): with MORO_ENGINE_TEST_ID_PERIOD=N in the environment at load, the
+// reqId and wsId counters start over after N-1 instead of after 2^32-1, so
+// what happens when an id comes round again can be exercised in a test.
+inline uint32_t testIdPeriod() {
+  static const uint32_t period = [] {
+    const char* env = std::getenv("MORO_ENGINE_TEST_ID_PERIOD");
+    return env ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 0u;
+  }();
+  return period;
+}
+#endif
 // reqId registry: flat open-addressing map (see flat_map.h) - no per-op
 // allocation where std::unordered_map paid a node malloc/free per request.
 // Key 0 is the empty sentinel; reqIds are never 0 (surfaceRequest skips it).
 using FlatReqMap = FlatMap<Connection*>;
 
-inline FlatReqMap& globalRequests() {
-  static thread_local FlatReqMap map;
-  return map;
-}
+inline FlatReqMap& globalRequests() { return threadState().requests; }
 
 // WebSocket connections get their own id space + registry (a wsId outlives the reqId that created it). Same per-thread ownership rules as globalRequests().
-inline uint32_t& globalWsCounter() {
-  static thread_local uint32_t counter = 0;
-  return counter;
-}
-inline std::unordered_map<uint32_t, Connection*>& globalWebSockets() {
-  static thread_local std::unordered_map<uint32_t, Connection*> map;
-  return map;
-}
+inline uint32_t& globalWsCounter() { return threadState().wsCounter; }
+inline std::unordered_map<uint32_t, Connection*>& globalWebSockets() { return threadState().webSockets; }
 
 // Per-connection state.
 // Which I/O transport a Server runs (decided once per process, see
@@ -184,6 +242,7 @@ struct EpollConn {
   void* wqTail;
   int peerCpu;          // SO_INCOMING_CPU: the CPU the peer's packets arrive on (-1 unknown); see EpollLoop::serve
   uint32_t reads;       // recv() calls that returned data; peerCpu is re-read every 1024
+  int writeError;       // a hard send() error (negative errno) epollFlush met; epollCompleteWrites tears the connection down for it (clean stack)
 };
 #endif
 
@@ -197,7 +256,7 @@ struct StagedRequest {
   std::string methodStr;
   std::string path;
   std::string query;
-  std::vector<Header> headers;
+  HeaderList headers;
   std::string body;
   bool isHead = false;
   bool reqKeepAlive = true;
@@ -211,6 +270,10 @@ struct StagedRequest {
   // ends with it): activateStaged may hand the handshake to the engine's own
   // upgrade (wsAutoUpgrade) before anything reaches JS.
   bool upgrade = false;
+  // Connection::routeMissGen as it stood when this request was staged: the
+  // route-table generation at which it is known to match no engine route
+  // (0: not known).
+  uint32_t routeMissGen = 0;
 };
 
 struct Connection {
@@ -237,6 +300,13 @@ struct Connection {
   ParamRoute* fastParam = nullptr;
   const char* fastSeg = nullptr;
   size_t fastSegLen = 0;
+  // The route-table generation (Server::routeGen_) at which the route hook
+  // looked the parser's current request up and found no engine route for it;
+  // that holds for as long as the tables are still at that generation. 0: the
+  // hook did not consult the tables. Written by every hook call except a
+  // match, and read only for a request that is not in light mode (a match
+  // puts the parser in light mode, and those requests never read it).
+  uint32_t routeMissGen = 0;
 #if defined(_WIN32)
   // Per-connection receive buffer (uninitialized on purpose - uv only reads
   // back what the socket filled). Windows/IOCP posts this into an overlapped
@@ -252,7 +322,7 @@ struct Connection {
   std::string methodStr;
   std::string path;
   std::string query;
-  std::vector<Header> headers;
+  HeaderList headers;
   std::string body;
   // The body once handed to JS (binding getBody): its storage, kept so a
   // second call hands over the same bytes again. Opaque here; cleared when
@@ -290,6 +360,19 @@ struct Connection {
   // arrives (or Server::kLingerMs passes, onSweep). See closeAfterResponse.
   bool lingering = false;
   uint32_t lingerTicks = 0;
+  // Nothing this connection sends is read as HTTP any more; what arrives is
+  // dropped (onTransportData). Set with `lingering`, and as soon as an error
+  // response (400/408/413/414/431/505) has been written or queued: until
+  // that response is flushed the connection is neither closing nor
+  // lingering, and the request it answers must stay rejected whatever the
+  // peer sends behind it.
+  bool inputClosed = false;
+  // Request intake is paused because response bytes are waiting on the peer
+  // (Server::outputBacklogged): what it sends meanwhile is buffered in
+  // `pending`, under the same cap as while a handler is running, and
+  // dispatched once the write queue has drained below the high-water mark
+  // (Server::resumeHeld). Only ever set while writes are pending.
+  bool outHeld = false;
   uv_shutdown_t shutdownReq;   // uv arm: the FIN for a queued (non-coalesced) last write
 
   // Pipelined-response corking (see dispatchBatch): while `corked`, response bytes accumulate in corkBuf and are flushed with a single write once the buffered input drains - one syscall per pipelined batch instead of one per response. batchClose records a Connection: close response inside the batch (the flush-then-close is handled by the batch loop's tail).
@@ -298,8 +381,9 @@ struct Connection {
   bool batchClose = false;
 
   // Batched dispatch (Server::dispatchBatch): complete pipelined requests
-  // parsed ahead of the active one - a FIFO ring over `staged` (allocated on
-  // first use, Server::kMaxStaged slots). Ids are assigned at staging and
+  // parsed ahead of the active one - a FIFO ring over `staged` (one slot from
+  // first use, Server::kMaxStaged once the connection pipelines; see
+  // stageRequest). Ids are assigned at staging and
   // registered only on activation, so a staged id is a safe no-op for every
   // binding call until then. aheadComplete: the parser holds one more
   // complete request that found no free slot (HttpParser::parse cannot be
@@ -308,6 +392,10 @@ struct Connection {
   uint32_t stagedHead = 0;
   uint32_t stagedCount = 0;
   uint32_t batchPos = 0;  // index of the active slot within the current batch call
+  // The active request was activated after JS left its batch loop (see
+  // completeCorkedResponse): no handler has seen it yet, dispatchBatch must
+  // deliver it.
+  bool undelivered = false;
   bool aheadComplete = false;
 
   // Reusable response-build buffer: respond()/writeHead()/write()/end() build
@@ -322,6 +410,7 @@ struct Connection {
   WsParser* wsParser = nullptr;
   bool wsClosing = false;
   bool wsShedPending = false;  // a 1013 Close is queued for this socket (wsSend backpressure)
+  bool wsGonePending = false;  // its teardown is queued: a send could not be completed (closeForFailedSend)
   // permessage-deflate context (RFC 7692); null unless negotiated for this connection at upgrade time.
   PmdContext* pmd = nullptr;
   // Outbound compression goes through the Server's SharedDeflator instead of
@@ -345,8 +434,16 @@ struct Connection {
   h2::Stream* h2s = nullptr;         // (a request) its stream, while it has one
   uint32_t h2Gen = 0;                // (a request) the batch call it was delivered in
   bool h2Bye = false;                // (the connection) the closing frames were sent, or are pointless
+  // (the connection) The slow-read defense for response bytes the session
+  // holds for want of flow-control window: sweeps in a row in which they did
+  // not move, and Session::heldSent() at the last sweep.
+  uint32_t h2HeldTicks = 0;
+  uint64_t h2LastSent = 0;
 
   // Idle-sweep bookkeeping: reset to 0 on every read, incremented each sweep while not actively running a handler; closed when it exceeds the limit.
+  // libuv transport: the bytes of the writes handed to uv_write() whose
+  // callback has not run (Server::tOutputHeld).
+  size_t uvQueued = 0;
   uint32_t idleTicks = 0;
   // Request-timeout bookkeeping: incremented each sweep while a request is partially received; NOT reset by activity (slow-drip defense), only when the request completes or the connection goes back to idle keep-alive.
   uint32_t requestTicks = 0;
@@ -390,6 +487,11 @@ struct ServerCallbacks {
   void (*onWsOpen)(void* user, Connection* c, const std::string& path) = nullptr;
   void (*onWsMessage)(void* user, Connection* c, const char* data, size_t len,
                       bool isBinary) = nullptr;
+  // A binary message handed over as the string that holds it: the callee
+  // takes the string (swaps or moves it out) instead of copying its bytes.
+  // Optional; used for a large message the engine had to buffer anyway, and
+  // every other message goes to onWsMessage.
+  void (*onWsBinaryOwned)(void* user, Connection* c, std::string& message) = nullptr;
   void (*onWsClose)(void* user, Connection* c, int code) = nullptr;
   // One read's worth of frames (Server::feedWebSocket). When set, the
   // binding is handed the buffer and must call Server::feedWebSocketFrames
@@ -514,13 +616,24 @@ class Server {
   bool wsAutoUpgrade() const { return wsAutoUpgrade_; }
   // The handshake request's headers and query string, kept on the connection
   // for its WebSocket lifetime (nothing parses HTTP on it again).
-  const std::vector<Header>& wsHeaders(Connection* c) const { return c->headers; }
+  const HeaderList& wsHeaders(Connection* c) const { return c->headers; }
   const std::string& wsQuery(Connection* c) const { return c->query; }
   // The control cell JS polls between slots: the index of the slot that is
   // active within the current batch call, or the batch's count once every
   // slot has been answered. Owned by the binding (an ArrayBuffer's storage),
   // stable for the server's lifetime.
   void setBatchControl(uint32_t* cell) { batchControl_ = cell; }
+
+  // JS has returned from its batch loop. The binding calls this before the
+  // Node callback scope of the call closes, because closing it runs the
+  // microtask and nextTick queues: a response sent from there completes its
+  // slot with nobody left reading the control cell, so the slot it uncovers
+  // has to be delivered by another call (dispatchBatch, h2DispatchBatch),
+  // not by the loop that has already ended.
+  void batchLoopReturned() {
+    batchLoopConn_ = nullptr;
+    h2LoopOpen_ = false;
+  }
 
   // A body buffer nothing refers to any more, handed back for reuse (the
   // binding, when a lent body is released; see recycleBodyBuffer).
@@ -542,6 +655,14 @@ class Server {
       if (uvErr) *uvErr = code;
       return 0;
     };
+    // One listener per server, for its whole life: a second listen(), or one
+    // after stopListening()/close(), is refused - the answer libuv gives on
+    // the uv transport (a bound handle cannot be bound again). The epoll and
+    // io_uring transports own their listening socket and would otherwise
+    // set up a second one over the first: the watcher of the first
+    // initialised again while libuv still holds it, its completions counted
+    // against the second.
+    if (listenUp_ || listenerClosed_ || closeRequested_) return fail(UV_EINVAL);
     // uv_ip4_addr/uv_ip6_addr parse numeric addresses only, not hostnames. Map the common names callers pass (Node's default host is 'localhost') to their loopback address; an empty host binds all interfaces.
     std::string h = host ? host : "";
     if (h.empty() || h == "0.0.0.0" || h == "*") {
@@ -567,7 +688,10 @@ class Server {
         kind_ = TransportKind::Epoll;
       } else {
         int r = uringListen(addr);
-        if (r != 0) return fail(r);
+        if (r != 0) {
+          uring_->retireIfUnused();  // (a ring set up for this listener alone)
+          return fail(r);
+        }
       }
     }
     if (kind_ == TransportKind::Epoll) {
@@ -582,7 +706,14 @@ class Server {
       }
     }
     if (kind_ == TransportKind::Uv) {
-#endif
+      // Linux: the listening socket is the engine's own on this transport
+      // too, watched by a poll handle, and the engine makes the accept call
+      // (uvListen). A libuv listener cannot be told to stop asking, which is
+      // what a process at its descriptor limit needs (pauseAccept).
+      int r = uvListen(addr);
+      if (r != 0) return fail(r);
+    }
+#else
 #if !defined(_WIN32)
     if (limits_.reusePort) {
       // uv_tcp_bind creates its socket lazily, so to set SO_REUSEPORT before bind we create + configure one explicitly and hand it to libuv.
@@ -611,9 +742,9 @@ class Server {
       }
     }
 #endif
-#if defined(__linux__)
-    }
 #endif
+
+    listenUp_ = true;
 
     // Start the connection sweep. Granularity adapts to the shortest enabled
     // timeout (capped at 4s, floored at 250ms) so short timeouts still fire
@@ -690,6 +821,13 @@ class Server {
       uv_timer_stop(&sweepTimer_);
       uv_close(reinterpret_cast<uv_handle_t*>(&sweepTimer_), onServerHandleClosed);
     }
+    // Streams stopped for this turn are closed below with every other
+    // connection; nothing starts them again.
+    uvStopped_.clear();
+    if (uvResumeInit_) {
+      uvResumeInit_ = false;
+      uv_close(reinterpret_cast<uv_handle_t*>(&uvResume_), onServerHandleClosed);
+    }
     // Close every live connection (doClose mutates conns_, so iterate a copy).
     std::vector<Connection*> live(conns_.begin(), conns_.end());
     for (Connection* c : live) doClose(c);
@@ -760,6 +898,7 @@ class Server {
   // a registered GET still reaches JS, which owns method policy).
   void setStaticRoute(int32_t method, std::string path, ResponseTemplate&& tpl,
                       std::string body) {
+    routesChanged();
     auto& vec = staticRoutes_[std::move(path)];
     for (StaticRoute& existing : vec) {
       if (existing.method == method) {
@@ -772,7 +911,10 @@ class Server {
     }
     vec.push_back(StaticRoute{method, std::move(tpl), std::move(body)});
   }
-  void clearStaticRoutes() { staticRoutes_.clear(); }
+  void clearStaticRoutes() {
+    routesChanged();
+    staticRoutes_.clear();
+  }
 
   // ---- parameter routes (capabilities.paramRoutes) ----
   // A route with ONE variable path segment whose body IS that segment,
@@ -783,6 +925,7 @@ class Server {
   // undecoded (what uWS's writeParameterValue does) - a route that needs
   // decoding stays a JS route. Method policy is JS's, as for static routes.
   void setParamRoute(int32_t method, std::string prefix, std::string suffix, ResponseTemplate&& tpl) {
+    routesChanged();
     for (ParamRoute& existing : paramRoutes_) {
       if (existing.method == method && existing.prefix == prefix && existing.suffix == suffix) {
         existing.tpl = std::move(tpl);
@@ -793,17 +936,35 @@ class Server {
     }
     paramRoutes_.push_back(ParamRoute{method, std::move(prefix), std::move(suffix), std::move(tpl)});
   }
-  void clearParamRoutes() { paramRoutes_.clear(); }
+  void clearParamRoutes() {
+    routesChanged();
+    paramRoutes_.clear();
+  }
+  // Every change to either table starts a new generation: what a connection
+  // remembers about a lookup (Connection::routeMissGen: that nothing matched)
+  // is good for the generation it was made in and is looked up again after
+  // it.
+  void routesChanged() {
+    if (++routeGen_ == 0) routeGen_ = 1;
+  }
   // Any engine-answered route registered (static or parameter): the dispatch
   // sites test this once per request before trying either table.
   bool hasEngineRoutes() const { return !staticRoutes_.empty() || !paramRoutes_.empty(); }
 
   // ---- response API (called by the binding, by reqId->Connection) ----
 
-  // Responses that MUST NOT carry a body or Content-Length (RFC 9110 §6.4.1, §15.3.5): 1xx informational, 204 No Content, 304 Not Modified.
+  // Responses that never carry a body (RFC 9110 §6.4.1): 1xx informational,
+  // 204 No Content, 304 Not Modified. None of them is framed with a length
+  // of the engine's own; a length the handler supplies is sent only on a 304,
+  // where it describes the representation a 200 would have carried (§8.6) -
+  // a 1xx or 204 response must not have a Content-Length at all.
   static bool isBodyless(int status) {
     return status == 204 || status == 304 || (status >= 100 && status < 200);
   }
+  // ... and 205 Reset Content, which has a body by framing and must not have
+  // content (§15.3.6): it is sent as Content-Length: 0, whatever body or
+  // length the handler gave it.
+  static bool isContentless(int status) { return isBodyless(status) || status == 205; }
 
   // Single-shot terminal response (the fast path). customCL is an app-supplied Content-Length value, or -1 when none was given; the header block itself never contains Content-Length (the binding strips it).
   // `tpl`: the template the status and headers came from, when there is one
@@ -811,14 +972,38 @@ class Server {
   void respond(Connection* c, int status, const std::string& headersBlock,
                long long customCL, const char* body, size_t bodyLen,
                const ResponseTemplate* tpl = nullptr) {
-    if (!c || c->responseEnded || c->closing) return;
+    if (!c || c->closing) return;
+    if (c->responseStarted) {
+      if (c->responseEnded) return;  // already answered (a response that has ended has started)
+      if (c->h2Parent) {
+        h2Respond(c, status, headersBlock, customCL, body, bodyLen, tpl);
+        return;
+      }
+      // The head of this response is already on the wire (writeHead() or
+      // write() came first), so the status and headers given here cannot be
+      // sent: a second status line would be read by the client as body bytes
+      // of the response in progress, and on a keep-alive connection every
+      // response after it would be read out of step. The response ends where
+      // it is and the connection is closed behind it - a chunked body without
+      // its last chunk, a declared length not reached - so the client sees a
+      // response that was cut short, which is what happened.
+      c->reqKeepAlive = false;
+      c->responseEnded = true;
+      writeOutView(c, std::string_view(), /*terminal=*/true);
+      return;
+    }
     if (c->h2Parent) {
       h2Respond(c, status, headersBlock, customCL, body, bodyLen, tpl);
       return;
     }
 
     const bool bodyless = isBodyless(status);
-    if (bodyless) bodyLen = 0;  // never emit a body for these statuses
+    if (bodyless || status == 205) bodyLen = 0;  // never emit a body for these statuses
+
+    if (bodyLen >= kDirectBody && !c->tls &&
+        respondDirect(c, status, headersBlock, customCL, body, bodyLen, tpl)) {
+      return;
+    }
 
     // Corked plaintext fast path: build the frame STRAIGHT INTO the cork
     // buffer - no scratch, no intermediate memcpy. This is the hot path for
@@ -828,7 +1013,7 @@ class Server {
       c->corkBuf.reserve(c->corkBuf.size() + bodyLen + headersBlock.size() +
                          128);
       appendResponse(c->corkBuf, c, status, headersBlock, customCL, body,
-                     bodyLen, bodyless);
+                     bodyLen, bodyless, tpl);
       c->responseStarted = true;
       c->responseEnded = true;
       completeCorkedResponse(c);
@@ -847,7 +1032,7 @@ class Server {
       // again, so a large static file paid a copy and fresh pages per reply.
       // A small body still rides the head's record: one copy of a few
       // kilobytes costs less than a record of its own.
-      appendResponseHead(out, c, status, headersBlock, customCL, bodyLen, bodyless);
+      appendResponseHead(out, c, status, headersBlock, customCL, bodyLen, bodyless, tpl);
       c->responseStarted = true;
       c->responseEnded = true;
       tlsWrite(c, out, std::string_view(body, sendLen), /*terminal=*/true);
@@ -856,42 +1041,106 @@ class Server {
     }
     out.reserve(bodyLen + headersBlock.size() + 128);
     appendResponse(out, c, status, headersBlock, customCL, body, bodyLen,
-                   bodyless);
+                   bodyless, tpl);
     c->responseStarted = true;
     c->responseEnded = true;
     writeOutView(c, out, /*terminal=*/true);
     releaseScratch(c);
   }
 
+  // A large body on a plaintext keep-alive connection with nothing queued
+  // ahead of it: the head is framed (behind whatever the batch has corked so
+  // far) and written together with the body in one gathered write, straight
+  // from the caller's bytes. Framed whole first, a body this size was copied
+  // once more than the kernel's own copy and, being over the capacity the
+  // cork and scratch buffers keep, into memory allocated for this response
+  // and released after it. The bytes on the wire are the same, and the
+  // caller's are not referenced after the return.
+  //
+  // Inside a batch the write happens here only for its last reply, or when
+  // the cork buffer would have been flushed for this reply anyway: several
+  // bodies that fit under the high-water mark together still leave in one
+  // write. Returns false when the reply is to be framed the usual way (TLS,
+  // which encrypts from the caller's bytes on its own path; HEAD; the last
+  // response of a connection, whose path sends the FIN with its last bytes;
+  // a socket with writes already queued).
+  MORO_NOINLINE bool respondDirect(Connection* c, int status, const std::string& headersBlock,
+                                   long long customCL, const char* body, size_t bodyLen,
+                                   const ResponseTemplate* tpl) {
+    if (c->tls || c->isHead || !c->reqKeepAlive || c->pendingWrites != 0) return false;
+    std::string& buf = c->corked ? c->corkBuf : c->scratch;
+    if (!c->corked) {
+      buf.clear();
+    } else if ((c->stagedCount != 0 || c->aheadComplete) &&
+               buf.size() + bodyLen < limits_.writeHighWaterMark) {
+      return false;
+    }
+    appendResponseHead(buf, c, status, headersBlock, customCL, bodyLen, /*bodyless=*/false, tpl);
+    c->responseStarted = true;
+    c->responseEnded = true;
+    writeBehind(c, buf, body, bodyLen, /*terminal=*/true);
+    if (c->corked) {
+      completeCorkedResponse(c);
+      if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
+    }
+    return true;
+  }
+
   // Append one complete response frame (status line through body) to `out`.
   // Framing belongs to the engine: a body-carrying response always declares
   // the ACTUAL body size (an app-supplied mismatch would desync every
-  // follow-up response on a keep-alive connection). HEAD and bodyless statuses
-  // legitimately declare the would-be entity length (RFC 9110 §8.6), so the
-  // app-supplied value is honored there.
+  // follow-up response on a keep-alive connection). A HEAD response and a
+  // 304 legitimately declare the would-be entity length (RFC 9110 §8.6), so
+  // the app-supplied value is honored there, and only there: a 1xx or 204
+  // carries no Content-Length, and a 205 always says 0. The caller passes
+  // bodyLen 0 for a status without content (isContentless).
   void appendResponse(std::string& out, Connection* c, int status,
                       const std::string& headersBlock, long long customCL,
-                      const char* body, size_t bodyLen, bool bodyless) {
-    appendResponseHead(out, c, status, headersBlock, customCL, bodyLen, bodyless);
+                      const char* body, size_t bodyLen, bool bodyless,
+                      const ResponseTemplate* tpl = nullptr) {
+    appendResponseHead(out, c, status, headersBlock, customCL, bodyLen, bodyless, tpl);
     if (!c->isHead && bodyLen) out.append(body, bodyLen);
   }
 
   // The status line and header block of appendResponse, without the body.
   void appendResponseHead(std::string& out, Connection* c, int status,
                           const std::string& headersBlock, long long customCL,
-                          size_t bodyLen, bool bodyless) {
+                          size_t bodyLen, bool bodyless,
+                          const ResponseTemplate* tpl = nullptr) {
+    if (tpl != nullptr && !bodyless) {
+      // A prepared response: everything up to the length is the same bytes
+      // for a whole second (the template's status and header block and the
+      // Date line), kept on the template and appended in one piece.
+      const std::string& date = dateLine();
+      if (tpl->headAt != dateCachedAt_ || tpl->head.empty()) {
+        tpl->head.clear();
+        appendStatusLine(tpl->head, tpl->status);
+        tpl->head += date;
+        tpl->head += tpl->headers;
+        tpl->head += "Content-Length: ";
+        tpl->headAt = dateCachedAt_;
+      }
+      out += tpl->head;
+      appendDecimal(out, (c->isHead && customCL >= 0 && status != 205)
+                             ? static_cast<unsigned long long>(customCL)
+                             : static_cast<unsigned long long>(bodyLen));
+      out += "\r\n";
+      out += connectionHeader(c);
+      out += "\r\n";
+      return;
+    }
     appendStatusLine(out, status);
     out += dateLine();
     out += headersBlock;
     if (!bodyless) {
       const unsigned long long cl =
-          (c->isHead && customCL >= 0)
+          (c->isHead && customCL >= 0 && status != 205)
               ? static_cast<unsigned long long>(customCL)
               : static_cast<unsigned long long>(bodyLen);
       out += "Content-Length: ";
       appendDecimal(out, cl);
       out += "\r\n";
-    } else if (customCL >= 0) {
+    } else if (customCL >= 0 && status == 304) {
       out += "Content-Length: ";
       appendDecimal(out, static_cast<unsigned long long>(customCL));
       out += "\r\n";
@@ -919,10 +1168,21 @@ class Server {
     c->responseStarted = true;
     c->bodylessStatus = isBodyless(status);
     c->bodyBytesSent = 0;
+    if (status == 205) customCL = 0;  // no content: framed as an empty body, and write()/end() clamp to it
     if (c->bodylessStatus) {
-      // No body framing at all; an app-supplied Content-Length (the would-be entity length, e.g. on a 304) is honored verbatim.
+      // No body framing at all; an app-supplied Content-Length is sent on a
+      // 304 only (the would-be entity length), never on a 1xx or 204.
       c->chunkedResponse = false;
       c->declaredLen = 0;
+    } else if (customCL < 0 && !c->reqHttp11) {
+      // No declared length, and an HTTP/1.0 client: it cannot read chunked
+      // framing (a response carries Transfer-Encoding only when the request
+      // was HTTP/1.1, RFC 9112 §6.1), so the body goes out as it is and the
+      // end of the connection ends it (§6.3). A HEAD response has no body to
+      // delimit and leaves the connection as it was.
+      c->chunkedResponse = false;
+      c->declaredLen = -1;
+      if (!c->isHead) c->reqKeepAlive = false;
     } else {
       c->chunkedResponse = customCL < 0;  // no CL -> chunked framing
       c->declaredLen = customCL;
@@ -934,14 +1194,14 @@ class Server {
     out += dateLine();
     out += headersBlock;
     if (c->bodylessStatus) {
-      if (customCL >= 0) {
+      if (customCL >= 0 && status == 304) {
         out += "Content-Length: ";
         appendDecimal(out, static_cast<unsigned long long>(customCL));
         out += "\r\n";
       }
     } else if (c->chunkedResponse) {
       out += "Transfer-Encoding: chunked\r\n";
-    } else {
+    } else if (customCL >= 0) {
       out += "Content-Length: ";
       appendDecimal(out, static_cast<unsigned long long>(customCL));
       out += "\r\n";
@@ -957,16 +1217,30 @@ class Server {
     if (!c || c->responseEnded || c->closing) return false;
     if (c->h2Parent) return h2Write(c, data, len);
     // write() without writeHead(): synthesize an implicit 200 chunked head (Node behavior). Raw body bytes with no status line would corrupt this response and desync every follow-up response on a keep-alive socket.
-    if (!c->responseStarted) writeHead(c, 200, std::string(), -1);
+    if (!c->responseStarted) {
+      writeHead(c, 200, std::string(), -1);
+      // The head may have closed the connection (a session that could not
+      // encrypt it, a write over the response limit), and with notifications
+      // delivered in place (MORO_ENGINE_NOTIFY=sync) the handler has been
+      // told and has run: `data` is the caller's memory and is not read
+      // after that.
+      if (c->closing) return false;
+    }
     // HEAD / 1xx / 204 / 304: suppress body bytes
     if (c->isHead || c->bodylessStatus || len == 0) return true;
 
-    std::string& out = c->scratch;
-    out.clear();
     if (c->chunkedResponse) {
+      // TLS has a path of its own (the test is the one writeOutView would
+      // make), and so has a large chunk on either: it is written, or
+      // encrypted, from the caller's bytes.
+      if (c->tls || len >= kChunkDirect) return writeChunkApart(c, data, len);
+      std::string& out = c->scratch;
+      out.clear();
       appendChunkSize(out, len);
       out.append(data, len);
       out += "\r\n";
+      transportWriteView(c, out, /*terminal=*/false);
+      releaseScratch(c);
     } else {
       // Fixed-length response: never let body bytes overflow the declared Content-Length - excess would be parsed as the next response.
       if (c->declaredLen >= 0) {
@@ -977,10 +1251,11 @@ class Server {
           len = static_cast<size_t>(declared - c->bodyBytesSent);
       }
       c->bodyBytesSent += len;
-      out.append(data, len);
+      // No framing around the bytes of a fixed-length body: they are written
+      // (or encrypted) from where the caller has them - writeOutView copies
+      // only what it has to keep - and not staged in the scratch buffer.
+      writeOutView(c, std::string_view(data, len), /*terminal=*/false);
     }
-    writeOutView(c, out, /*terminal=*/false);
-    releaseScratch(c);
     bool ok = tPendingBytes(c) < limits_.writeHighWaterMark;
     if (!ok) c->wantDrain = true;
     return ok;
@@ -995,8 +1270,15 @@ class Server {
 
     std::string& out = c->scratch;
     out.clear();
+    std::string_view direct;  // an unframed last piece, written from the caller's bytes
     if (!c->responseStarted) {
       // end() without writeHead(): a 200 with the given body as the full payload
+      // (a large one exactly as respond() sends it: the same bytes, and the
+      // body is not copied behind its head first).
+      if (len >= kDirectBody && !c->isHead) {
+        respond(c, 200, emptyHeaders(), -1, data, len);
+        return;
+      }
       appendStatusLine(out, 200);
       out += dateLine();
       out += "Content-Length: ";
@@ -1007,6 +1289,15 @@ class Server {
       if (!c->isHead && len) out.append(data, len);
     } else if (c->chunkedResponse) {
       if (!c->isHead && !c->bodylessStatus && len) {
+        // A large last chunk, as in write(). (Not the last response of a
+        // plaintext connection: its path sends the FIN with its last bytes.)
+        if (len >= kChunkDirect && (c->tls || c->reqKeepAlive)) {
+          c->responseEnded = true;
+          if (c->tls) tlsWriteChunk(c, data, len, /*last=*/true);
+          else writeChunkDirect(c, data, len, /*last=*/true);
+          releaseScratch(c);
+          return;
+        }
         appendChunkSize(out, len);
         out.append(data, len);
         out += "\r\n";
@@ -1025,7 +1316,7 @@ class Server {
             len = static_cast<size_t>(declared - c->bodyBytesSent);
         }
         c->bodyBytesSent += len;
-        if (len) out.append(data, len);
+        if (len) direct = std::string_view(data, len);  // as in write()
       }
       // Ending short of the declared Content-Length: the bytes owed can never arrive, so force the connection closed - the client then sees a truncated response (an error) instead of silently consuming the NEXT response's bytes as the remainder of this body.
       if (!c->isHead && c->declaredLen >= 0 &&
@@ -1035,7 +1326,7 @@ class Server {
     }
     c->responseStarted = true;
     c->responseEnded = true;
-    writeOutView(c, out, /*terminal=*/true);
+    writeOutView(c, direct.empty() ? std::string_view(out) : direct, /*terminal=*/true);
     releaseScratch(c);
   }
 
@@ -1046,14 +1337,27 @@ class Server {
   }
 
   // Upgrade the request's connection to a WebSocket (RFC 6455 §4.2.2). Returns the new wsId, or 0 if the request is not a valid upgrade.
-  uint32_t upgradeToWebSocket(Connection* c) {
+  // `unsupportedVersion` (when given) is set for the one refusal RFC 6455
+  // gives an answer of its own (§4.2.2, §4.4): a handshake that is valid in
+  // every other respect and asks for a protocol version other than 13.
+  uint32_t upgradeToWebSocket(Connection* c, bool* unsupportedVersion = nullptr) {
     if (!c || c->responseStarted || c->closing) return 0;
     if (c->h2Parent) return 0;  // no WebSockets over HTTP/2 (RFC 8441 is not implemented)
+    // RFC 6455 §4.2.1 item 1: the handshake is "an HTTP/1.1 or higher GET
+    // request". Any other method, and HTTP/1.0, is an ordinary request
+    // whatever headers it carries.
+    if (c->method != Method::GET || !c->reqHttp11) return 0;
     // Validate the upgrade (RFC 6455 §4.2.1): Upgrade: websocket, Connection: Upgrade, a Sec-WebSocket-Key, Version 13.
-    const std::string* key = nullptr;
-    const std::string* extensions = nullptr;
+    std::string_view key;
+    std::string_view extensions;
+    bool haveExtensions = false;
+    std::string extensionList;  // several Sec-WebSocket-Extensions lines, joined
+    // §11.3.1, §11.3.5: Sec-WebSocket-Key and Sec-WebSocket-Version MUST NOT
+    // appear more than once in a request; one that repeats either is refused
+    // (which of two keys, or of two versions, would be the one meant?).
+    unsigned keyLines = 0, versionLines = 0;
     bool hasUpgrade = false, hasConnUpgrade = false, ver13 = false;
-    for (const auto& h : c->headers) {
+    for (const Header h : c->headers) {
       if (h.name == "upgrade" && iequals(trimOWS(h.value), "websocket"))
         hasUpgrade = true;
       else if (h.name == "connection") {
@@ -1072,23 +1376,40 @@ class Server {
           if (comma == std::string_view::npos) break;
           pos = comma + 1;
         }
-      } else if (h.name == "sec-websocket-key")
-        key = &h.value;
-      else if (h.name == "sec-websocket-version" && trimOWS(h.value) == "13")
-        ver13 = true;
-      else if (h.name == "sec-websocket-extensions")
-        extensions = &h.value;
+      } else if (h.name == "sec-websocket-key") {
+        key = h.value;
+        keyLines++;
+      } else if (h.name == "sec-websocket-version") {
+        versionLines++;
+        if (trimOWS(h.value) == "13") ver13 = true;
+      } else if (h.name == "sec-websocket-extensions") {
+        // §9.1: the field may be split over several lines, which together
+        // are one list of offers, in order.
+        if (!haveExtensions) {
+          extensions = h.value;
+          haveExtensions = true;
+        } else {
+          if (extensionList.empty()) extensionList = std::string(extensions);
+          extensionList += ", ";
+          extensionList += h.value;
+          extensions = extensionList;
+        }
+      }
     }
-    if (!hasUpgrade || !hasConnUpgrade || !key || !ver13) return 0;
+    if (!hasUpgrade || !hasConnUpgrade || keyLines != 1 || versionLines != 1) return 0;
     // RFC 6455 §4.1: the key must be the base64 of a 16-byte nonce; refuse
     // malformed/probing clients before the accept-key computation (§4.2.1).
-    if (!isValidWsKey(*key)) return 0;
+    if (!isValidWsKey(key)) return 0;
+    if (!ver13) {
+      if (unsupportedVersion) *unsupportedVersion = true;
+      return 0;
+    }
 
     // permessage-deflate negotiation (RFC 7692), opt-in via options.wsDeflate.
     std::string extResp;
     std::optional<PmdParams> pmdParams;
-    if (limits_.wsDeflate.enabled && extensions) {
-      pmdParams = parsePmdOffer(*extensions, limits_.wsDeflate);
+    if (limits_.wsDeflate.enabled && haveExtensions) {
+      pmdParams = parsePmdOffer(extensions, limits_.wsDeflate);
       if (pmdParams) {
         size_t cap = limits_.wsDeflate.maxDecompressedSize
                          ? limits_.wsDeflate.maxDecompressedSize
@@ -1138,7 +1459,7 @@ class Server {
     }
 
     // Send the 101 handshake response (with the negotiated extension, if any).
-    std::string resp = buildHandshakeResponse(*key, extResp);
+    std::string resp = buildHandshakeResponse(key, extResp);
     c->responseStarted = true;
     c->responseEnded = true;
     c->isWebSocket = true;
@@ -1149,6 +1470,9 @@ class Server {
     auto& wsMap = globalWebSockets();
     do {
       c->wsId = ++globalWsCounter();
+#if defined(MORO_ENGINE_TEST_FAULTS)
+      if (testIdPeriod() != 0 && c->wsId >= testIdPeriod()) c->wsId = globalWsCounter() = 0;
+#endif
     } while (c->wsId == 0 || wsMap.count(c->wsId));
     wsMap[c->wsId] = c;
     // This request's reqId is done; the connection is now a WebSocket. The
@@ -1186,8 +1510,21 @@ class Server {
   // Send a WebSocket data frame (server frames are never masked, §5.1). permessage-deflate: when negotiated and the message is at least the configured threshold, compress it and set RSV1 (RFC 7692 §7.2.1).
   bool wsSend(Connection* c, const char* data, size_t len, bool isBinary) {
     if (!c || !c->isWebSocket || c->closing || c->wsClosing) return false;
+    // Whether bytes of an earlier send are still waiting for the socket (see
+    // the backpressure check below). pendingWrites is zero on a connection
+    // that is keeping up, so the common case reads one field.
+    const bool backlog = c->pendingWrites > 0 && tPendingBytes(c) > 0;
+    // Already shed (below) and still not draining: the Close that ends it is
+    // on its way, and nothing more is queued behind what the peer has not
+    // read. Without this every send between the shed and its delivery on the
+    // next loop turn - the replies to a whole read's worth of messages, when
+    // the sends come from onWsMessage - joined the queue the limit had just
+    // been enforced on.
+    if (backlog && c->wsShedPending) return false;
     bool compressed = false;
-    std::string deflated;
+    // The loop's buffer, not a string of this call: a send that is not
+    // compressed never touches it, and one that is does not allocate.
+    std::string& deflated = deflateScratch_;
     if (c->pmd && len >= c->pmd->threshold()) {
       // pmdShared connections deflate through the server-owned SharedDeflator
       // (their PmdContext is InflateOnly - see upgradeToWebSocket); the reset
@@ -1200,39 +1537,58 @@ class Server {
     std::string_view payload = compressed ? std::string_view(deflated)
                                           : std::string_view(data, len);
     const WsOpcode opcode = isBinary ? WsOpcode::Binary : WsOpcode::Text;
-    if (c->corked && !c->tls) {
+    size_t gathered = 0;  // plaintext this batch still holds for its record (TLS)
+    if (payload.size() >= kWsDirectPayload) {
+      // A large message: only the frame header is built, and the payload
+      // goes to the socket (or into the cipher) from where the caller has
+      // it. Framed into a buffer first, every byte of it was copied once
+      // more on its way out.
+      wsSendDirect(c, opcode, payload, compressed);
+    } else if (c->corked && !c->tls) {
       // Inside a read's batch (feedWebSocket) on a plaintext connection: the
       // frame is built straight into the cork buffer, the way respond() builds
       // a corked HTTP reply, so an echo costs one append and no scratch copy.
       // The flush at the high-water mark is the one transportWrite applies.
-      encodeFrame(c->corkBuf, opcode, payload, /*fin=*/true, /*rsv1=*/compressed);
+      encodeShortFrame(c->corkBuf, opcode, payload, /*rsv1=*/compressed);
       if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
     } else {
       // Frame into the connection's reusable scratch buffer (same policy as
       // respond()'s non-corked path): a warm connection sends with zero
       // allocations, and releaseScratch keeps one huge frame from pinning its
-      // capacity. writeOutView never keeps a reference past the call: the
-      // bytes reach the kernel synchronously (uv_try_write) or are copied
-      // first - into a queued WriteReq, the TLS ciphertext buffer
-      // (writePlain), or corkBuf on a TLS connection.
+      // capacity. Neither write keeps a reference past the call: the bytes
+      // reach the kernel synchronously (uv_try_write) or are copied first -
+      // into a queued WriteReq, the TLS ciphertext buffer (writePlain), or
+      // on a TLS connection the batch's plaintext or its corkBuf.
       std::string& out = c->scratch;
       out.clear();
-      encodeFrame(out, opcode, payload, /*fin=*/true, /*rsv1=*/compressed);
-      writeOutView(c, out, /*terminal=*/false);
+      encodeShortFrame(out, opcode, payload, /*rsv1=*/compressed);
+      if (c->tls) {
+        tlsWrite(c, out, /*terminal=*/false);
+        gathered = tlsGatheredBytes(c);
+      } else {
+        transportWriteView(c, out, /*terminal=*/false);
+      }
       releaseScratch(c);
     }
+    if (compressed && deflated.capacity() > kCipherScratchKeep) std::string().swap(deflated);
     // Frames corked for this read's batch (feedWebSocket) are queued too:
     // they leave with the flush, so the backpressure signal counts them.
-    size_t q = tPendingBytes(c) + c->corkBuf.size();
-    if (limits_.wsBackpressureLimit && q > limits_.wsBackpressureLimit) {
+    size_t q = tPendingBytes(c) + c->corkBuf.size() + gathered;
+    if (backlog && limits_.wsBackpressureLimit && q > limits_.wsBackpressureLimit) {
       // Slow/stalled consumer - shed it (1013 Try Again Later) so its queued
       // frames can't grow memory without bound (limits_.wsBackpressureLimit,
-      // 0 = unlimited; maxBackpressure defense). The Close goes out on a
-      // later loop turn, through the same queue as onAborted/onWritable: a
-      // synchronous onWsClose from inside wsSend() would reach JS while the
-      // binding still borrows the payload's bytes out of the V8 heap. Under
-      // sync notification (MORO_ENGINE_NOTIFY=sync) the binding copies and
-      // the shed is immediate, as before.
+      // 0 = unlimited; maxBackpressure defense). Only a consumer that had
+      // not taken an earlier send is slow: a message larger than the limit,
+      // sent to a socket with nothing waiting, is over the limit the moment
+      // it is queued whatever its reader does, so it goes out whole, and the
+      // next send finds it here if the peer has not drained it. A peer that
+      // stops reading with one such message in flight is closed by the
+      // response-delivery deadline (responseTimeoutMs, onSweep).
+      // The Close goes out on a later loop turn, through the same queue as
+      // onAborted/onWritable: a synchronous onWsClose from inside wsSend()
+      // would reach JS while the binding still borrows the payload's bytes
+      // out of the V8 heap. Under sync notification (MORO_ENGINE_NOTIFY=sync)
+      // the binding copies and the shed is immediate, as before.
       if (!c->wsShedPending) {
         c->wsShedPending = true;
         queueNotify(c->wsId, kNotifyWsShed);
@@ -1243,13 +1599,18 @@ class Server {
   }
 
   // Send a Close frame (§5.5.1) and close the connection after it flushes.
-  void wsClose(Connection* c, uint16_t code, const char* reason, size_t rlen) {
+  // The frame is legal whatever the application passed (closeFramePayload,
+  // websocket.h): a code that may not appear on the wire is replaced (1005
+  // by a Close without a status, anything else by 1011) and the reason is
+  // cut to the 123 bytes a control frame has room for. onWsClose reports the
+  // code as it was passed.
+  void wsClose(Connection* c, int code, const char* reason, size_t rlen) {
     if (!c || !c->isWebSocket || c->wsClosing) return;
     c->wsClosing = true;
     // Notify JS exactly once. The wsClosing guard above + the check in feedWebSocket/onRead means no client-side or EOF path re-fires it, so server-initiated closes (disconnect/kick) no longer leak the JS wrapper.
     if (cb_.onWsClose) cb_.onWsClose(cb_.user, c, code);
     std::string payload;
-    encodeClosePayload(payload, code, std::string_view(reason, rlen));
+    closeFramePayload(payload, code, std::string_view(reason, rlen));
     std::string out;
     encodeFrame(out, WsOpcode::Close, payload);
     c->reqKeepAlive = false;  // close the TCP socket once the frame flushes
@@ -1307,6 +1668,27 @@ class Server {
   static constexpr size_t kTlsInlineBody = 8192;
   // Ciphertext scratch capacity kept between replies (see tlsWrite).
   static constexpr size_t kCipherScratchKeep = 1u << 20;
+  // respond() on a plaintext connection: a body from this size on is written
+  // from the caller's bytes (respondDirect). It is the capacity the cork and
+  // scratch buffers give back after use, so a smaller body is framed into
+  // memory that is already there.
+  static constexpr size_t kDirectBody = 16384;
+  // A buffered binary message in a string of more capacity than this is
+  // handed to the application as that string (see feedWebSocketFrames): it
+  // is the capacity above which the parser gives its buffer back after a
+  // message, so nothing it would have kept is taken from it.
+  static constexpr size_t kWsTakeMessage = 16384;
+  // A WebSocket message from this size on is written as its frame header
+  // and the caller's bytes (wsSendDirect).
+  static constexpr size_t kWsDirectPayload = 32 * 1024;
+  // A chunk of a streamed response from this size on is written
+  // (writeChunkDirect) or encrypted (tlsWriteChunk) from the caller's bytes.
+  static constexpr size_t kChunkDirect = 32 * 1024;
+  // The small replies of one batch on a TLS connection share records
+  // (tlsCork): a reply up to kTlsGatherMax is held as plaintext until
+  // kTlsRecord of it has come together or the batch ends.
+  static constexpr size_t kTlsGatherMax = 4096;
+  static constexpr size_t kTlsRecord = 16384;  // a record's plaintext limit (RFC 8446 5.1)
 
   // Frame-level write: response/frame bytes from the HTTP/WS machinery. On a TLS connection the plaintext is encrypted first; `terminal` rides the (single) ciphertext buffer so the flush-then-finish semantics (onWrite -> finishResponse) are identical on both transports.
   void writeOut(Connection* c, std::string&& data, bool terminal) {
@@ -1345,9 +1727,21 @@ class Server {
       // records go to the socket from where OpenSSL wrote them and are not
       // copied here at all (tlsDirect). Pipelined requests keep the cork: one
       // send for the batch is worth more than a copy saved per reply.
+      //
+      // A small reply that has company in its batch - pipelined responses,
+      // the frames a WebSocket read provokes - is not encrypted here either:
+      // its plaintext is gathered (tlsCork) and the batch is sealed as one
+      // record per 16 KiB at the flush, where each reply used to be a record
+      // of its own, with its own header, tag and pass through the cipher
+      // set-up.
       std::string& cork = c->corkBuf;
+      const bool direct = cork.empty() && tlsDirectOk(c) && c->stagedCount == 0 &&
+                          !c->aheadComplete && tlsGather_.conn != c;
+      if (!direct && (tlsGather_.conn == c || tlsCompany(c))) {
+        tlsCork(c, head, body, terminal);
+        return;
+      }
       const size_t mark = cork.size();
-      const bool direct = mark == 0 && tlsDirectOk(c) && c->stagedCount == 0 && !c->aheadComplete;
       if (direct) c->tls->beginDirect(&Server::tlsDirectSend, c);
       const bool ok =
           (head.empty() || c->tls->writePlain(head.data(), head.size(), cork, !body.empty())) &&
@@ -1355,7 +1749,7 @@ class Server {
       if (direct) c->tls->endDirect();
       if (!ok) {
         cork.resize(mark);  // no part of a reply that could not be encrypted goes out
-        doClose(c);
+        closeForFailedSend(c, /*abort=*/false);
         return;
       }
       if (terminal) completeCorkedResponse(c);
@@ -1375,7 +1769,7 @@ class Server {
     if (direct) c->tls->endDirect();
     if (!ok) {
       // Encrypting failed (session torn down / pre-handshake write): the response can never reach the peer - drop the connection.
-      doClose(c);
+      closeForFailedSend(c, /*abort=*/false);
       return;
     }
     transportWriteView(c, cipher, terminal);
@@ -1388,6 +1782,292 @@ class Server {
     }
   }
 
+  // ---- small TLS replies of one batch, sealed together ----
+  //
+  // tlsGather_ holds, for at most one connection at a time, the plaintext of
+  // the replies its batch has produced so far (`plain`, less than a record's
+  // worth) and the records already sealed from it (`sealed`). While a
+  // connection has anything here its cork buffer is empty: flushCork, which
+  // every batch ends with, finds nothing corked, looks here, and moves the
+  // records into the cork buffer to write them. So nothing waits past the
+  // batch that produced it, and a plaintext connection's flush never looks.
+  //
+  // `conn` alone does not say whose the content is: a batch that ends on a
+  // closing connection is not flushed, and the address may be given to a
+  // later connection. The session carries the ticket it was given when it
+  // took the buffers (TlsSession::gatherTicket, zero in a new session), and
+  // only a connection whose session holds the current ticket owns them; what
+  // anyone else finds here is discarded unread.
+  struct TlsGather {
+    Connection* conn = nullptr;
+    uint32_t ticket = 0;
+    std::string plain;
+    std::string sealed;
+  };
+
+  // Whether more replies are due in the batch in progress on `c`: requests
+  // staged behind the one being answered, or input behind the WebSocket
+  // frame being delivered. A reply without company is encrypted where it is,
+  // as it always was; gathering it would only add a copy.
+  bool tlsCompany(const Connection* c) const {
+    if (c->isWebSocket) return c->wsParser != nullptr && c->wsParser->moreInRead();
+    return c->stagedCount != 0 || c->aheadComplete;
+  }
+
+  bool tlsGathering(const Connection* c) const {
+    return tlsGather_.conn == c && c->tls != nullptr && c->tls->gatherTicket == tlsGather_.ticket;
+  }
+
+  // Plaintext and records of `c`'s batch that are held here and not yet in
+  // its cork buffer (they count as queued for a backpressure decision).
+  size_t tlsGatheredBytes(const Connection* c) const {
+    return tlsGathering(c) ? tlsGather_.plain.size() + tlsGather_.sealed.size() : 0;
+  }
+
+  void tlsGatherDrop() {
+    tlsGather_.conn = nullptr;
+    tlsGather_.plain.clear();
+    tlsGather_.sealed.clear();
+  }
+
+  // A reply inside a batch that has company (tlsCompany), or follows replies
+  // already gathered. A small one is gathered. Any other is encrypted into
+  // the cork buffer the way tlsWrite does it, behind what was gathered ahead
+  // of it - sealed first, so the records keep the order of the replies.
+  MORO_NOINLINE void tlsCork(Connection* c, std::string_view head, std::string_view body,
+                             bool terminal) {
+    TlsGather& g = tlsGather_;
+    const size_t n = head.size() + body.size();
+    const bool mine = tlsGathering(c);
+    if (n > kTlsGatherMax || (!mine && (!c->corkBuf.empty() || !c->tls->writable()))) {
+      if (mine) {
+        tlsUngather(c);
+        if (c->closing) return;
+      }
+      std::string& cork = c->corkBuf;
+      const size_t mark = cork.size();
+      const bool ok =
+          (head.empty() || c->tls->writePlain(head.data(), head.size(), cork, !body.empty())) &&
+          (body.empty() || c->tls->writePlain(body.data(), body.size(), cork));
+      if (!ok) {
+        cork.resize(mark);  // no part of a reply that could not be encrypted goes out
+        closeForFailedSend(c, /*abort=*/false);
+        return;
+      }
+      if (terminal) completeCorkedResponse(c);
+      if (cork.size() >= limits_.writeHighWaterMark) flushCork(c);
+      return;
+    }
+    if (!mine) {
+      tlsGatherDrop();  // a batch that ended on a closing connection left it behind
+      g.conn = c;
+      if (++tlsGatherSeq_ == 0) tlsGatherSeq_ = 1;
+      g.ticket = c->tls->gatherTicket = tlsGatherSeq_;
+    } else if (g.plain.size() + n > kTlsRecord) {
+      if (!tlsSeal(c, g.sealed)) return;
+    }
+    g.plain.append(head.data(), head.size());
+    g.plain.append(body.data(), body.size());
+    // The high-water mark applies to what is held here as it does to the
+    // cork buffer, and ahead of the bookkeeping that asks whether the peer
+    // is keeping up (completeCorkedResponse, holdForOutput).
+    if (g.plain.size() + g.sealed.size() >= limits_.writeHighWaterMark) {
+      flushCork(c);
+      if (c->closing) return;
+    }
+    if (terminal) completeCorkedResponse(c);
+  }
+
+  // Encrypt the plaintext gathered for `c` into one record, appended to
+  // `into`. False: the session could not, and the connection is being
+  // closed.
+  bool tlsSeal(Connection* c, std::string& into) {
+    TlsGather& g = tlsGather_;
+    if (g.plain.empty()) return true;
+    const size_t mark = into.size();
+    const bool ok = c->tls->writePlain(g.plain.data(), g.plain.size(), into);
+    g.plain.clear();
+    if (!ok) {
+      into.resize(mark);  // no part of a record that could not be finished goes out
+      tlsGatherDrop();
+      closeForFailedSend(c, /*abort=*/false);
+      return false;
+    }
+    return true;
+  }
+
+  // The gathering for `c` ends: what is left is sealed and the records move
+  // to its cork buffer (empty until now - see TlsGather). False when there
+  // is nothing to write: the connection is closing, the session failed, or
+  // the buffers were not this connection's after all.
+  MORO_NOINLINE bool tlsUngather(Connection* c) {
+    TlsGather& g = tlsGather_;
+    if (!tlsGathering(c) || c->closing) {
+      tlsGatherDrop();
+      return false;
+    }
+    // The usual batch is under a record's worth and nothing has been sealed
+    // yet: it is encrypted straight into the cork buffer.
+    if (g.sealed.empty() && c->corkBuf.empty()) {
+      if (!tlsSeal(c, c->corkBuf)) return false;
+      g.conn = nullptr;
+      return !c->corkBuf.empty();
+    }
+    if (!tlsSeal(c, g.sealed)) return false;
+    g.conn = nullptr;
+    if (c->corkBuf.empty()) c->corkBuf.swap(g.sealed);
+    else c->corkBuf.append(g.sealed);
+    g.sealed.clear();
+    // The buffers are one per loop and keep what a batch of small replies
+    // needs; a batch that grew past that gives its memory back.
+    if (g.sealed.capacity() > kCipherScratchKeep) std::string().swap(g.sealed);
+    return !c->corkBuf.empty();
+  }
+
+  MORO_NOINLINE void tlsFlushGathered(Connection* c) {
+    if (tlsUngather(c)) flushCorked(c);
+  }
+
+  // One chunk of a chunked response on TLS (write(), and end() when `last`:
+  // the last-chunk marker rides behind it). A small one is assembled in
+  // scratch and encrypted from there, as on a plaintext connection. Of a
+  // large one only the two ends are copied - the size line with enough of
+  // the data to fill a record, and what is left over a whole number of
+  // records with the CRLF - and the records between are encrypted from the
+  // caller's bytes: the same bytes in the same number of records as when the
+  // chunk was assembled whole first, less a pass over all of it.
+  //
+  // On a plaintext connection a large chunk is one gathered write
+  // (writeChunkDirect).
+  MORO_NOINLINE bool writeChunkApart(Connection* c, const char* data, size_t len) {
+    if (!c->tls) {
+      writeChunkDirect(c, data, len, /*last=*/false);
+    } else if (len >= kChunkDirect) {
+      tlsWriteChunk(c, data, len, /*last=*/false);
+    } else {
+      std::string& out = c->scratch;
+      out.clear();
+      appendChunkSize(out, len);
+      out.append(data, len);
+      out += "\r\n";
+      tlsWrite(c, out, /*terminal=*/false);
+    }
+    releaseScratch(c);
+    const bool ok = tPendingBytes(c) < limits_.writeHighWaterMark;
+    if (!ok) c->wantDrain = true;
+    return ok;
+  }
+
+  // A large chunk on a plaintext connection: its size line (behind whatever
+  // the batch has corked), the caller's bytes and the CRLF - with the
+  // last-chunk marker when `last` - in one gathered write. Assembled in
+  // scratch first, every byte of it was copied once more than the kernel's
+  // own copy, into memory allocated for the chunk and released after it.
+  void writeChunkDirect(Connection* c, const char* data, size_t len, bool last) {
+    std::string& buf = c->corked ? c->corkBuf : c->scratch;
+    if (!c->corked) buf.clear();
+    appendChunkSize(buf, len);
+    writeBehind(c, buf, data, len, /*terminal=*/last,
+                last ? std::string_view("\r\n0\r\n\r\n", 7) : std::string_view("\r\n", 2));
+    if (!c->corked) return;
+    if (last) completeCorkedResponse(c);
+    if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
+  }
+
+  void tlsWriteChunk(Connection* c, const char* data, size_t len, bool last) {
+    std::string& out = c->scratch;
+    out.clear();
+    out.reserve(2 * kTlsRecord + 32);  // both ends at their largest: one allocation
+    appendChunkSize(out, len);
+    const size_t fill = kTlsRecord - out.size();
+    out.append(data, fill);
+    const size_t first = out.size();
+    const size_t whole = (len - fill) / kTlsRecord * kTlsRecord;
+    out.append(data + fill + whole, len - fill - whole);
+    out += last ? "\r\n0\r\n\r\n" : "\r\n";
+    const std::string_view ends(out);
+    tlsWrite3(c, ends.substr(0, first), std::string_view(data + fill, whole), ends.substr(first),
+              /*terminal=*/last);
+  }
+
+  // tlsWrite for three pieces (the copied front of a large chunk, its middle
+  // where the caller has it, its copied end), on the same two routes: into
+  // the cork buffer inside a batch, behind whatever the batch has gathered;
+  // through the ciphertext scratch, or straight to the socket, outside one.
+  MORO_NOINLINE void tlsWrite3(Connection* c, std::string_view a, std::string_view b,
+                               std::string_view t, bool terminal) {
+    if (c->closing) return;
+    if (c->corked && tlsGather_.conn == c) {
+      tlsUngather(c);
+      if (c->closing) return;
+    }
+    std::string& out = c->corked ? c->corkBuf : cipherScratch_;
+    if (!c->corked) out.clear();
+    const size_t mark = out.size();
+    const bool direct = mark == 0 && tlsDirectOk(c) &&
+                        (!c->corked || (c->stagedCount == 0 && !c->aheadComplete));
+    if (direct) c->tls->beginDirect(&Server::tlsDirectSend, c);
+    const bool ok = c->tls->writePlain(a.data(), a.size(), out, /*more=*/true) &&
+                    (b.empty() || c->tls->writePlain(b.data(), b.size(), out, /*more=*/true)) &&
+                    c->tls->writePlain(t.data(), t.size(), out);
+    if (direct) c->tls->endDirect();
+    if (!ok) {
+      if (c->corked) out.resize(mark);
+      closeForFailedSend(c, /*abort=*/false);
+      return;
+    }
+    if (c->corked) {
+      if (terminal) completeCorkedResponse(c);
+      if (out.size() >= limits_.writeHighWaterMark) flushCork(c);
+      return;
+    }
+    transportWriteView(c, out, terminal);
+    if (out.capacity() > kCipherScratchKeep) {
+      out.clear();
+      out.shrink_to_fit();
+    }
+  }
+
+  // A send could not be completed and the connection cannot go on: the TLS
+  // session failed to encrypt, or the transport refused the write outright.
+  // An HTTP connection is closed here and now, as it always was - its
+  // teardown calls nothing (onAborted is itself queued). The teardown of a
+  // WebSocket calls onWsClose, and this may be running inside wsSend(), where
+  // the binding may be reading the payload straight out of the V8 heap and no
+  // JS may run. So its close is queued with the notifications
+  // (kNotifyWsGone) and happens on a later loop turn, the way wsSend()'s shed
+  // of a slow consumer does. A socket already in its closing handshake has
+  // had its onWsClose and is closed at once. Under MORO_ENGINE_NOTIFY=sync
+  // the queue delivers in place and the binding copies, as for the shed.
+  void closeForFailedSend(Connection* c, bool abort) {
+    if (c->isWebSocket && !c->wsClosing) {
+      if (!c->wsGonePending) {
+        c->wsGonePending = true;
+        queueNotify(c->wsId, kNotifyWsGone);
+      }
+      return;
+    }
+    if (abort) abortConnection(c);
+    else doClose(c);
+  }
+
+  // The socket of an open WebSocket refused a frame outright (the peer reset
+  // the connection): the frame is dropped and the close queued, as for any
+  // send that cannot be completed. Queued instead, the frame would wait for
+  // the transport to report the failure on a later pass of the loop, and
+  // until then every further frame for this socket - the replies to a whole
+  // read's worth of messages - would be held behind it, uncounted on a
+  // transport whose queue size no longer includes a write that has failed.
+  // Only the errors that say the peer is gone; any other keeps the queued
+  // path, as does a socket already in its closing handshake (its Close
+  // frame is the last thing written to it).
+  bool wsPeerGone(Connection* c, int err) {
+    if (!c->isWebSocket || c->wsClosing) return false;
+    if (err != UV_EPIPE && err != UV_ECONNRESET && err != UV_ECONNABORTED && err != UV_ENOTCONN) return false;
+    closeForFailedSend(c, /*abort=*/true);
+    return true;
+  }
+
   // Whether a TLS reply may be written to the socket record by record as it
   // is encrypted (TlsSession::beginDirect): an HTTP response with nothing
   // queued ahead of it. WebSocket frames keep their batch - a read's worth of
@@ -1396,10 +2076,98 @@ class Server {
     return c->pendingWrites == 0 && !c->isWebSocket && !c->closing;
   }
 
-  static long tlsDirectSend(void* user, const char* held, size_t heldLen,
-                            const char* data, size_t len, bool more) {
+  MORO_NOINLINE static long tlsDirectSend(void* user, const char* held, size_t heldLen,
+                                          const char* data, size_t len, bool more) {
     Connection* c = static_cast<Connection*>(user);
     return c->server->tTryWrite2(c, held, heldLen, data, len, more);
+  }
+
+  // `held` and then `data` (and then `tail`), in one gathered write when the
+  // socket is free. `held` is the connection's cork buffer inside a batch
+  // (what the batch has corked so far, with the head, frame header or chunk
+  // size line that goes in front of `data` appended) or its scratch buffer
+  // outside one; `data` is the caller's and is not referenced after the
+  // return; `tail` is what closes a chunk. What the socket does not take is
+  // copied: it is what the cork buffer holds afterwards inside a batch (the
+  // caller completes the reply and the batch flushes as usual), and is
+  // queued outside one, where `terminal` completes the response as it does
+  // for any write.
+  void writeBehind(Connection* c, std::string& held, const char* data, size_t len, bool terminal,
+                   std::string_view tail = std::string_view()) {
+    const size_t heldLen = held.size();
+    const size_t all = heldLen + len + tail.size();
+    size_t sent = 0;
+    if (c->pendingWrites == 0 && all <= kMaxWriteChunk) {
+      // (tlsDirectSend is tTryWrite2 by the name the TLS session calls it.)
+      const long n = tail.empty()
+                         ? tlsDirectSend(c, held.data(), heldLen, data, len, /*more=*/false)
+                         : tTryWrite3(c, held.data(), heldLen, data, len, tail.data(), tail.size());
+      if (n > 0) {
+        sent = static_cast<size_t>(n);
+      } else if (n < 0 && n != UV_EAGAIN && wsPeerGone(c, static_cast<int>(n))) {
+        held.clear();  // the frames of a socket whose peer is gone; its close is queued
+        return;
+      }
+      // would block, or an error the queued write will meet again
+    }
+    if (sent == all) {
+      held.clear();
+    } else if (sent >= heldLen) {
+      const size_t into = sent - heldLen;  // how far into `data` and `tail` the socket got
+      if (into < len) {
+        held.assign(data + into, len - into);
+        held.append(tail);
+      } else {
+        held.assign(tail.substr(into - len));
+      }
+    } else {
+      held.erase(0, sent);
+      held.append(data, len);
+      held.append(tail);
+    }
+    if (c->corked) return;
+    if (held.empty()) {
+      if (terminal) transportWriteView(c, std::string_view(), /*terminal=*/true);
+      return;
+    }
+    std::string rest;
+    rest.swap(held);
+    queueWrite(c, std::move(rest), terminal);
+  }
+
+  // encodeFrame for a payload below kWsDirectPayload, expanded where wsSend
+  // uses it: the 64-bit length form cannot occur and is not compiled in.
+  static MORO_ALWAYS_INLINE void encodeShortFrame(std::string& out, WsOpcode opcode,
+                                                  std::string_view payload, bool rsv1) {
+    out += char(uint8_t(0x80) | uint8_t(rsv1 ? 0x40 : 0x00) | uint8_t(opcode));
+    const size_t n = payload.size();
+    if (n <= 125) {
+      out += char(uint8_t(n));
+    } else {
+      out += char(126);
+      out += char(uint8_t(n >> 8));
+      out += char(uint8_t(n));
+    }
+    out.append(payload);
+  }
+
+  // A large WebSocket message: its frame header, and the payload from where
+  // the caller has it - one gathered write on a plaintext connection (behind
+  // whatever the read's batch has corked, so the frames keep their order),
+  // the two-piece encrypt on TLS.
+  MORO_NOINLINE void wsSendDirect(Connection* c, WsOpcode opcode, std::string_view payload,
+                                  bool rsv1) {
+    char bytes[10];
+    const size_t n = encodeFrameHeader(bytes, opcode, payload.size(), /*fin=*/true, rsv1);
+    if (c->tls) {
+      tlsWrite(c, std::string_view(bytes, n), payload, /*terminal=*/false);
+      return;
+    }
+    std::string& buf = c->corked ? c->corkBuf : c->scratch;
+    if (!c->corked) buf.clear();
+    buf.append(bytes, n);
+    writeBehind(c, buf, payload.data(), payload.size(), /*terminal=*/false);
+    if (c->corked && buf.size() >= limits_.writeHighWaterMark) flushCork(c);
   }
 
   // Transport-level write: bytes go to the socket verbatim (ciphertext on TLS connections, plaintext otherwise).
@@ -1438,6 +2206,7 @@ class Server {
           if (terminal) finishResponse(c);
           return;
         }
+        if (n < 0 && n != UV_EAGAIN && wsPeerGone(c, n)) return;
         if (n > 0) {
           // Partial write: queue only the remainder (ordering preserved - nothing else was queued).
           data.erase(0, static_cast<size_t>(n));
@@ -1491,6 +2260,7 @@ class Server {
           if (terminal) finishResponse(c);
           return;
         }
+        if (n < 0 && n != UV_EAGAIN && wsPeerGone(c, n)) return;
         if (n > 0) data.remove_prefix(static_cast<size_t>(n));
       }
     }
@@ -1516,6 +2286,7 @@ class Server {
       return;
     }
 #endif
+    c->uvQueued += wr->data.size();  // until onWrite
     int r;
     if (wr->data.size() <= kMaxWriteChunk) {
       uv_buf_t buf = uv_buf_init(wr->data.empty() ? nullptr : &wr->data[0],
@@ -1538,8 +2309,9 @@ class Server {
     }
     if (r != 0) {
       c->pendingWrites--;
+      c->uvQueued -= wr->data.size();
       delete wr;
-      abortConnection(c);
+      closeForFailedSend(c, /*abort=*/true);
       return;
     }
     // Opt-in outbound hard cap (responseBackpressureLimit) - the HTTP mirror
@@ -1557,6 +2329,7 @@ class Server {
     WriteReq* wr = static_cast<WriteReq*>(req->data);
     Connection* c = wr->conn;
     bool terminal = wr->terminal;
+    c->uvQueued -= wr->data.size();
     delete wr;
     c->pendingWrites--;
     c->server->completeWrite(c, terminal, status);
@@ -1582,22 +2355,81 @@ class Server {
         else queueNotify(c->reqId, kNotifyWritable);
       }
     }
+    if (c->outHeld) resumeHeld(c);
     if (c->closeAfterFlush && c->pendingWrites == 0) closeAfterResponse(c);
+  }
+
+  // Response bytes the transport has queued and the kernel has not taken, at
+  // or past the write high-water mark: the peer is not reading as fast as
+  // responses are produced. A response a handler gives before it returns is
+  // complete the moment it is framed (completeCorkedResponse), not when its
+  // bytes have left, so the dispatch loops ask this before they take the
+  // next request: a peer that pipelines requests and reads nothing would
+  // otherwise have every one of them answered into memory. One field read
+  // when nothing is queued.
+  bool outputBacklogged(Connection* c) {
+    return c->pendingWrites > 0 && tOutputHeld(c) >= limits_.writeHighWaterMark;
+  }
+
+  // ... and when it is, the connection's request intake is held (outHeld):
+  // nothing more is parsed or handed to a handler, what arrives is buffered
+  // (dispatchPlaintext), and completeWrite resumes once the queue is below
+  // the mark again. Memory per connection stays at the high-water mark plus
+  // the one response that crossed it, plus maxPendingBytes of input.
+  bool holdForOutput(Connection* c) {
+    if (!outputBacklogged(c)) return false;
+    c->outHeld = true;
+    return true;
+  }
+
+  // A write completed on a held connection: once the queue is below the
+  // mark, dispatch what was held back - slots still staged first, then
+  // whatever was buffered - exactly as finishResponse resumes behind a
+  // response that was in flight. Always on a clean stack (write completions
+  // are never delivered from inside a dispatch).
+  void resumeHeld(Connection* c) {
+    if (c->closing || outputBacklogged(c)) return;
+    c->outHeld = false;
+    if (c->h2 && !c->inputClosed && !c->closeAfterFlush) {
+      // HTTP/2: the session goes on with the input it kept (h2Feed).
+      c->h2->resume();
+      h2Feed(c, "", 0);
+      return;
+    }
+    if (c->active || c->inputClosed || c->closeAfterFlush || c->isWebSocket || c->h2) return;
+    if (batchOn_ && (c->stagedCount > 0 || c->aheadComplete)) dispatchBatch(c, ParseStatus::NeedMore, /*parsed=*/false);
+    else dispatchBatch(c, parseNext(c), /*parsed=*/true);
+  }
+
+  // The last response of the connection (Connection: close, HTTP/1.0, a
+  // response that cannot be framed otherwise) has been given: close once it
+  // is out. If bytes are still queued the close waits for them
+  // (completeWrite), and from this moment nothing the peer sends is read:
+  // the exchange is over, and a request that arrives while the last response
+  // is draining gets the same treatment as one that arrives after it (see
+  // closeAfterResponse) - dropped, not answered behind a response that said
+  // "close".
+  void closeOnceFlushed(Connection* c) {
+    if (c->pendingWrites == 0) {
+      closeAfterResponse(c);
+      return;
+    }
+    c->closeAfterFlush = true;
+    c->inputClosed = true;
   }
 
   // Response for the active request is fully flushed: either close or move on to the next pipelined request.
   void finishResponse(Connection* c) {
     if (c->closing) return;
     uint32_t oldId = c->reqId;
-    globalRequests().erase(oldId);
+    reqMap_->erase(oldId);
     c->active = false;
     c->jsBody.reset();  // a body JS kept lives on in JS; nothing pins it to an idle connection
     c->jsLent.reset();
     recycleBody(c);
 
     if (!c->reqKeepAlive) {
-      if (c->pendingWrites == 0) closeAfterResponse(c);
-      else c->closeAfterFlush = true;
+      closeOnceFlushed(c);
       return;
     }
 
@@ -1616,7 +2448,7 @@ class Server {
 
   // Corked variant of finishResponse: same per-request bookkeeping, but no write happened yet (the bytes sit in corkBuf) and the next pipelined request is surfaced by dispatchBatch's loop, not from here. A Connection: close response just flags the batch; the loop's tail closes after the flush.
   void completeCorkedResponse(Connection* c) {
-    globalRequests().erase(c->reqId);
+    reqMap_->erase(c->reqId);
     c->active = false;
     c->jsBody.reset();
     c->jsLent.reset();
@@ -1634,17 +2466,59 @@ class Server {
     // hold the next (partial or parsed-ahead) request - leave it. Hand JS the
     // next slot, or tell it the batch is done.
     if (c->stagedCount > 0) {
+      // A handshake the engine answers itself (wsAutoUpgrade) is never
+      // activated from here. Upgrading calls into JS - onWsOpen, and
+      // onWsMessage for frames that came with the handshake - and this runs
+      // inside the response call that completed the slot ahead of it, where
+      // the binding may be reading the body straight out of the V8 heap and
+      // nothing may run JS. The slot stays staged: JS's loop is told its
+      // batch is over (a cell value of at least the count), and dispatchBatch
+      // activates the slot once onRequestBatch has returned.
+      //
+      // Nor is the next slot activated while the responses already given
+      // are waiting on the peer (holdForOutput): the slots stay staged, the
+      // loop is told the same thing, and resumeHeld delivers them once the
+      // write queue has drained. The response just completed is still in the
+      // cork buffer; once that has reached the mark it is written out first
+      // (the caller would do it next), so that the check counts it.
+      if (c->corkBuf.size() >= limits_.writeHighWaterMark) {
+        flushCork(c);
+        if (c->closing) return;  // the write failed or went over a limit; the loop has been told
+      }
+      if ((wsAutoUpgrade_ && c->staged[c->stagedHead].upgrade) || holdForOutput(c)) {
+        if (batchControl_ && batchLoopConn_ == c) *batchControl_ = c->batchPos + 1 + c->stagedCount;
+        return;
+      }
       c->batchPos++;
       if (batchControl_) *batchControl_ = c->batchPos;
+      // Only JS's own loop over this connection's batch picks the next slot
+      // up from the control cell. Past it (the response came from a microtask
+      // or nextTick of the call, or from another connection's handler) the
+      // slot is flagged for dispatchBatch to hand over.
+      const bool inLoop = batchLoopConn_ == c;
       activateStaged(c);
+      if (!inLoop) c->undelivered = true;
     } else if (batchControl_) {
       *batchControl_ = c->batchPos + 1;
     }
   }
 
   // Flush the accumulated batch with one write. Tries synchronously straight from corkBuf (a full write keeps the buffer's capacity for the next batch); only a partial/backpressured remainder is copied out and queued.
-  void flushCork(Connection* c) {
-    if (c->corkBuf.empty() || c->closing) return;
+  //
+  // The two tests are made where it is called, so a batch that corked
+  // nothing - every read of a request body still arriving ends with one -
+  // costs a comparison and no call.
+  MORO_ALWAYS_INLINE void flushCork(Connection* c) {
+    if (c->corkBuf.empty() || c->closing) {
+      // Nothing corked - unless the batch's small TLS replies are still to
+      // be sealed (tlsCork): their records are put here, and written.
+      if (tlsGather_.conn == c) tlsFlushGathered(c);
+      return;
+    }
+    flushCorked(c);
+  }
+
+  MORO_NOINLINE void flushCorked(Connection* c) {
     // A single huge corked response (respond() appends the whole frame to
     // corkBuf) can exceed one uv_buf_t; defer it to the queued path below,
     // which splits into <= 1 GiB segments (see kMaxWriteChunk).
@@ -1709,10 +2583,14 @@ class Server {
             parsed = false;
             break;
           }
+          if (holdForOutput(c)) {  // the rest waits for the peer to read
+            parsed = false;
+            break;
+          }
           st = parseNext(c);
           continue;
         }
-        if (c->parser.light()) {  // see handleParse: unreachable, but never stage a headerless request
+        if (c->parser.light()) {  // see handleParse: its route is gone; never stage a headerless request
           sendErrorAndClose(c, 500);
           parsed = false;
           break;
@@ -1733,13 +2611,29 @@ class Server {
       //    batch: descriptors, the control cell and JS's slot index all
       //    count from the request that is active at the call.
       activateStaged(c);
-      if (c->active) {
-        c->batchPos = 0;
-        if (batchControl_) *batchControl_ = 0;
-        cb_.onRequestBatch(cb_.user, c, 1 + c->stagedCount);
+      for (;;) {
+        while (c->active) {
+          c->batchPos = 0;
+          if (batchControl_) *batchControl_ = 0;
+          c->undelivered = false;
+          Connection* const outer = batchLoopConn_;
+          batchLoopConn_ = c;
+          cb_.onRequestBatch(cb_.user, c, 1 + c->stagedCount);
+          batchLoopConn_ = outer;
+          // A slot activated after JS left its loop has reached no handler:
+          // give it (and whatever is staged behind it) a call of its own.
+          if (!c->undelivered || c->closing || c->isWebSocket || c->batchClose) break;
+        }
+        // A slot completeCorkedResponse held back - a handshake the engine
+        // answers itself - is activated here, where no response call is on
+        // the stack. One the engine turns down is active after that and gets
+        // a call of its own, like any request.
+        if (c->active || c->stagedCount == 0 || c->closing || c->isWebSocket || c->batchClose || c->outHeld) break;
+        activateStaged(c);
       }
       if (c->closing || c->isWebSocket || c->batchClose) break;
       if (c->active) break;  // a handler went async; finishResponse resumes the rest
+      if (c->outHeld || holdForOutput(c)) break;  // answered into a queue the peer is not draining; resumeHeld goes on
       // 3. Every slot answered synchronously: parse on.
       if (c->aheadComplete) {
         c->aheadComplete = false;
@@ -1755,17 +2649,15 @@ class Server {
     }
     c->corked = false;
     if (!c->closing) flushCork(c);
-    if (c->batchClose && !c->closing) {
-      if (c->pendingWrites == 0) closeAfterResponse(c);
-      else c->closeAfterFlush = true;
-    }
+    if (c->batchClose && !c->closing) closeOnceFlushed(c);
   }
 
   // Parse the next request: the bytes buffered while a response was in
   // flight (swapped into a local, as the sequential loop does, so a huge
   // pipelined backlog's capacity is released at scope exit), else whatever
-  // the parser still holds.
-  ParseStatus parseNext(Connection* c) {
+  // the parser still holds. (Inlined into the dispatch loops, where it runs
+  // once per pipelined request.)
+  MORO_ALWAYS_INLINE ParseStatus parseNext(Connection* c) {
     if (!c->pending.empty()) {
       std::string p;
       p.swap(c->pending);
@@ -1782,12 +2674,17 @@ class Server {
   // parsed now: a Connection: close request, or an Upgrade request (what
   // follows is not HTTP if the upgrade succeeds).
   bool stageRequest(Connection* c) {
-    if (c->staged.empty()) c->staged.resize(kMaxStaged);
+    // A connection gets one slot at first, and the other fifteen the first
+    // time a request is staged behind another (it pipelines): one that sends
+    // a request at a time - most of them, and every connection that carries
+    // a single request - never constructs and destroys the rest.
+    if (c->staged.empty()) c->staged.resize(1);
     // An empty ring starts over at its first slot: a connection that sends
     // one request at a time then uses the same slot for every one of them,
     // where walking the ring spread its header and path strings over sixteen
     // sets of buffers, each cold by the time its turn came round again.
     if (c->stagedCount == 0) c->stagedHead = 0;
+    else if (c->staged.size() < kMaxStaged) growStaged(c);
     StagedRequest& sr = c->staged[(c->stagedHead + c->stagedCount) % kMaxStaged];
     c->stagedCount++;
     const bool upgrade = c->parser.hasUpgrade();
@@ -1796,18 +2693,25 @@ class Server {
     sr.method = c->parser.method;
     // Swap, not copy (see surfaceRequest): the slot's previous buffers become
     // the parser's scratch for the next request.
-    sr.methodStr.swap(c->parser.methodStr);
+    swapField(sr.methodStr, c->parser.methodStr);
     sr.path.swap(c->parser.path);
-    sr.query.swap(c->parser.query);
+    swapField(sr.query, c->parser.query);
     sr.headers.swap(c->parser.headers);
-    sr.body.swap(c->parser.body);
+    swapField(sr.body, c->parser.body);
     sr.isHead = (sr.method == Method::HEAD);
     sr.reqKeepAlive = c->parser.keepAlive;
     sr.reqHttp11 = c->parser.minorVersion >= 1;
     sr.upgrade = upgrade;
+    sr.routeMissGen = c->routeMissGen;  // a staged request is never an engine-answered one
     c->parser.reset();
     return !sr.reqKeepAlive || upgrade;
   }
+
+  // The whole ring, for a connection that has started to pipeline. Its one
+  // slot keeps its place (index 0, where an empty ring starts), so the ring
+  // arithmetic needs no change; no reference to a slot is held across a call
+  // to stageRequest.
+  MORO_NOINLINE void growStaged(Connection* c) { c->staged.resize(kMaxStaged); }
 
   // The head staged slot becomes the active request: fields swapped in, id
   // registered, static routes answered right here (which, inside a corked
@@ -1818,11 +2722,11 @@ class Server {
     c->stagedCount--;
     c->reqId = sr.reqId;
     c->method = sr.method;
-    c->methodStr.swap(sr.methodStr);
+    swapField(c->methodStr, sr.methodStr);
     c->path.swap(sr.path);
-    c->query.swap(sr.query);
+    swapField(c->query, sr.query);
     c->headers.swap(sr.headers);
-    c->body.swap(sr.body);
+    swapField(c->body, sr.body);
     c->jsBody.reset();
     c->jsLent.reset();
     c->isHead = sr.isHead;
@@ -1830,7 +2734,18 @@ class Server {
     c->reqHttp11 = sr.reqHttp11;
     c->active = true;
     c->requestTicks = 0;
-    globalRequests().insert(c->reqId, c);
+    // The id was assigned when the request was staged, and a staged id is in
+    // no registry, so nextReqId() does not know to skip it: once the 32-bit
+    // counter has gone round (2^32 requests on this thread while the slot
+    // waited behind a response that was held or not read), the same number
+    // can belong to a request that is live now. Registering it here would
+    // hand that request's id to this connection, and the response its
+    // handler gives would be written here. The live request keeps the id;
+    // this one is activated again under a new one.
+    if (!reqMap_->insertNew(c->reqId, c)) {
+      activateUnderNewId(c);
+      return;
+    }
     if (sr.expectContinue && !c->sentContinue) {
       // Same interim the sequential loop sends from handleParse (a client
       // that shipped the body with the head still gets it; Node does too).
@@ -1838,8 +2753,56 @@ class Server {
       std::string cont = "HTTP/1.1 100 Continue\r\n\r\n";
       writeOut(c, std::move(cont), /*terminal=*/false);
     }
-    if (hasEngineRoutes() && tryStaticRoute(c)) return;
-    if (sr.upgrade && wsAutoUpgrade_) upgradeToWebSocket(c);
+    // Looked up when its request line was parsed (the route hook) and not
+    // matched, with the tables unchanged since: not looked up again.
+    if (hasEngineRoutes() && sr.routeMissGen != routeGen_ && tryStaticRoute(c)) return;
+    if (sr.upgrade && wsAutoUpgrade_) autoUpgrade(c);
+  }
+
+  // activateStaged found the slot's id bound to another request. The slot is
+  // put back at the head of the ring exactly as it was (every swap
+  // activateStaged made is made again, which undoes it), given an id that is
+  // free now, and activated a second time. Only ever reached once the id
+  // counter has wrapped, so it stays out of line.
+  MORO_NOINLINE void activateUnderNewId(Connection* c) {
+    c->stagedHead = (c->stagedHead + kMaxStaged - 1) % kMaxStaged;
+    c->stagedCount++;
+    StagedRequest& sr = c->staged[c->stagedHead];
+    c->methodStr.swap(sr.methodStr);
+    c->path.swap(sr.path);
+    c->query.swap(sr.query);
+    c->headers.swap(sr.headers);
+    c->body.swap(sr.body);
+    c->active = false;
+    const uint32_t id = nextReqId();
+    sr.reqId = id;
+    activateStaged(c);
+    // JS's loop over this batch was given the old id as this slot's
+    // descriptor. If the request is still for a handler (no engine route or
+    // upgrade took it), the loop is told its batch is over, as when the
+    // connection closes under it, and dispatchBatch delivers the slot in a
+    // call of its own, with the id it has now.
+    if (c->active && c->reqId == id && batchLoopConn_ == c) {
+      if (batchControl_) *batchControl_ = UINT32_MAX;
+      c->undelivered = true;
+    }
+  }
+
+  // wsAutoUpgrade: the engine's own answer to a request that carries an
+  // Upgrade header. True when the request is finished with here: the
+  // WebSocket is open, or the handshake asked for a protocol version this
+  // server does not speak and was answered 426 naming the one it does
+  // (RFC 6455 §4.2.2 item 4, §4.4; the Upgrade field is RFC 9110 §15.5.22's
+  // requirement for a 426). False leaves the request for JS, as any request
+  // that is not a WebSocket handshake.
+  bool autoUpgrade(Connection* c) {
+    bool unsupportedVersion = false;
+    if (upgradeToWebSocket(c, &unsupportedVersion) != 0) return true;
+    if (!unsupportedVersion) return false;
+    static const std::string kUpgradeRequired =
+        "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n";
+    respond(c, 426, kUpgradeRequired, -1, nullptr, 0);
+    return true;
   }
 
   // The finished request's body buffer goes back to the loop's pool (see
@@ -1865,10 +2828,13 @@ class Server {
     // Skip ids still bound to live requests: the uint32 counter wraps after
     // 2^32 requests (~12h at 100k rps) and a collision with a still-open
     // long-lived request (e.g. an SSE stream) would silently rebind it.
-    auto& reqMap = globalRequests();
+    const FlatReqMap& reqMap = *reqMap_;
     uint32_t id;
     do {
-      id = ++globalReqCounter();
+      id = ++*reqCounter_;
+#if defined(MORO_ENGINE_TEST_FAULTS)
+      if (testIdPeriod() != 0 && id >= testIdPeriod()) id = *reqCounter_ = 0;
+#endif
     } while (id == 0 || reqMap.contains(id));
     return id;
   }
@@ -1897,6 +2863,7 @@ class Server {
       if (c->closing || c->isWebSocket || c->batchClose) break;
       if (c->active) break;  // handler went async; respond() completes later
       if (st != ParseStatus::Complete) break;  // NeedMore: await more bytes
+      if (holdForOutput(c)) break;  // answered into a queue the peer is not draining; resumeHeld goes on
       // Response corked and completed synchronously - surface the next buffered pipelined request (completeCorkedResponse already reset the parser; reads cannot interleave while this loop runs).
       if (!c->pending.empty()) {
         std::string p;
@@ -1910,10 +2877,7 @@ class Server {
     }
     c->corked = false;
     if (!c->closing) flushCork(c);
-    if (c->batchClose && !c->closing) {
-      if (c->pendingWrites == 0) closeAfterResponse(c);
-      else c->closeAfterFlush = true;
-    }
+    if (c->batchClose && !c->closing) closeOnceFlushed(c);
   }
 
   // ---- HTTP/2 ----
@@ -2022,18 +2986,67 @@ class Server {
   // JS in batches, and every frame the session and the handlers produced
   // meanwhile goes out in one write afterwards - the cork of the HTTP/1
   // batch, for free: nothing is written while the read is being processed.
+  //
+  // Flow control does not bound what a connection is answered with: a peer
+  // may open its windows as wide as the protocol allows and then not read
+  // the socket, and every response it asks for is then complete - its stream
+  // closed, room for the next - the moment it is framed. So the rule of the
+  // HTTP/1 dispatch loops applies here too (outputBacklogged): once the
+  // bytes waiting on the peer reach the write high-water mark, nothing more
+  // it sent is acted on - the session stops at the frame it is on (h2Throttle
+  // inside a read, here after one), what arrives meanwhile is kept, and
+  // resumeHeld goes on when the queue has drained below the mark. Memory per
+  // connection stays at the mark plus the responses of one batch, plus the
+  // input kept.
   void h2Feed(Connection* c, const char* data, size_t len) {
     if (c->closing) return;
-    c->h2Feeding = true;
-    c->h2->feed(data, len, uv_now(loop_));
-    h2DispatchBatch(c);
-    c->h2Feeding = false;
-    if (c->closing) return;
-    h2Flush(c);
-    if (c->h2->dead()) {  // a connection error: the GOAWAY is on its way, then close
-      if (c->pendingWrites == 0) closeAfterResponse(c);
-      else c->closeAfterFlush = true;
+    if (c->pendingWrites > 0 && (c->outHeld || holdForOutput(c))) {
+      // Kept, not acted on. A client that keeps to flow control can have at
+      // most one connection window of DATA on its way, on top of the
+      // allowance every connection has for input it is not being read for
+      // (maxPendingBytes); more than that into a connection whose answers
+      // are not being read is a flood, and is cut off as on HTTP/1.
+      c->h2->pause();
+      if (c->h2->inputHeld() + len > maxPending_ + c->h2->settings().connectionWindow) {
+        doClose(c);
+        return;
+      }
+      c->h2->feed(data, len, uv_now(loop_));
+      return;
     }
+    for (;;) {
+      c->h2Feeding = true;
+      c->h2->feed(data, len, uv_now(loop_));
+      h2DispatchBatch(c);
+      c->h2Feeding = false;
+      if (c->closing) return;
+      h2Flush(c);
+      if (c->closing) return;
+      if (c->h2->dead()) {  // a connection error: the GOAWAY is on its way, then close
+        if (c->pendingWrites == 0) closeAfterResponse(c);
+        else c->closeAfterFlush = true;
+        return;
+      }
+      if (outputBacklogged(c)) {  // the peer is not reading: resumeHeld goes on
+        c->h2->pause();
+        c->outHeld = true;
+        return;
+      }
+      if (!c->h2->paused()) return;
+      // Stopped part-way through the read, and the socket took everything
+      // that was written: go on with the rest of it.
+      c->h2->resume();
+      data = "";
+      len = 0;
+    }
+  }
+
+  // After a request was answered inside a read: stop the session at this
+  // frame when what this read has been answered with so far, on top of what
+  // the socket still holds, has reached the write high-water mark.
+  void h2Throttle(Connection* c) {
+    if (c->h2->out().size() + (c->pendingWrites > 0 ? tPendingBytes(c) : 0) >= limits_.writeHighWaterMark)
+      c->h2->pause();
   }
 
   // Put the session's frames on the wire.
@@ -2092,13 +3105,20 @@ class Server {
     globalRequests().insert(sc->reqId, sc);
     c->h2->hold(st, sc);
 
-    if (hasEngineRoutes() && tryStaticRoute(sc)) return;
+    if (hasEngineRoutes() && tryStaticRoute(sc)) {
+      h2Throttle(c);
+      return;
+    }
     if (!batchOn_) {
       if (cb_.onRequest) cb_.onRequest(cb_.user, sc);
+      h2Throttle(c);
       return;
     }
     h2Batch_.push_back(sc);
-    if (h2Batch_.size() >= kMaxStaged) h2DispatchBatch(c);
+    if (h2Batch_.size() >= kMaxStaged) {
+      h2DispatchBatch(c);
+      h2Throttle(c);
+    }
   }
 
   // Hand the gathered requests to JS: one call for up to kMaxStaged of them.
@@ -2110,6 +3130,7 @@ class Server {
   // in another call.
   void h2DispatchBatch(Connection* c) {
     size_t pos = 0;
+    h2BatchParent_ = c;
     while (pos < h2Batch_.size() && !c->closing) {
       const uint32_t count = static_cast<uint32_t>(h2Batch_.size() - pos);
       h2BatchBase_ = pos;
@@ -2120,14 +3141,17 @@ class Server {
       }
       if (batchControl_) *batchControl_ = 0;
       h2InBatchCall_ = true;
+      h2LoopOpen_ = true;
       cb_.onRequestBatch(cb_.user, h2Batch_[pos], count);
       h2InBatchCall_ = false;
+      h2LoopOpen_ = false;
       // Where JS stopped: the slot whose handler did not finish, or the count.
       const uint32_t at = batchControl_ ? *batchControl_ : count;
       pos += at >= count ? count : at + 1;
     }
     h2Batch_.clear();
     h2BatchBase_ = 0;
+    h2BatchParent_ = nullptr;
   }
 
   // The handler's last word on `sc` is about to be sent: its stream is no
@@ -2144,7 +3168,10 @@ class Server {
   void h2Done(Connection* sc) {
     Connection* p = sc->h2Parent;
     globalRequests().erase(sc->reqId);
-    if (h2InBatchCall_ && batchControl_ && sc->h2Gen == h2BatchGen_ &&
+    // h2LoopOpen_: once JS has left its loop the cell stays where the loop
+    // stopped, so the slots after it are delivered by the next call instead
+    // of being counted as handled.
+    if (h2InBatchCall_ && h2LoopOpen_ && batchControl_ && sc->h2Gen == h2BatchGen_ &&
         *batchControl_ == sc->batchPos) {
       *batchControl_ = sc->batchPos + 1;  // the next slot, or the count when it was the last
     }
@@ -2192,11 +3219,17 @@ class Server {
       sc->abortNotified = true;
       break;
     }
-    if (sc->active && !sc->abortNotified) {
-      sc->abortNotified = true;
-      queueNotify(sc->reqId, kNotifyAborted);
-    }
+    // The request is released before JS is told. On a later loop turn (the
+    // default) the order makes no difference. Delivered in place
+    // (MORO_ENGINE_NOTIFY=sync) it does: the callback, and the continuations
+    // the microtask checkpoint behind it runs, must find the request gone as
+    // they do in the default mode. Told first, a handler woken by onAborted
+    // saw isAborted() false and a write() that reported backpressure, and
+    // waited for an onWritable that could never come.
+    const bool tell = sc->active && !sc->abortNotified;
+    const uint32_t reqId = sc->reqId;
     h2Done(sc);
+    if (tell) queueNotify(reqId, kNotifyAborted);
   }
 
   void h2OnWritable(Connection* sc) {
@@ -2242,11 +3275,39 @@ class Server {
     h2Flush(p);
   }
 
+  // The connection is closing while the batch call in progress is its own
+  // (a handler closed the server, or the connection went over a limit): the
+  // slots JS's loop has not reached must never reach a handler. Their
+  // requests are about to be released (h2Teardown), and the descriptors JS
+  // holds would name requests that no longer exist. They were never handed
+  // over, so they get no onAborted either; the loop is told its batch is
+  // over. The slot the cell names stays as it is - its handler may be the
+  // one running - and is told once, like any request a handler holds.
+  void h2CutBatch() {
+    if (!batchControl_) return;
+    const uint32_t count = static_cast<uint32_t>(h2Batch_.size() - h2BatchBase_);
+    const uint32_t at = *batchControl_;
+    for (uint32_t k = at < count ? at + 1 : count; k < count; k++) {
+      Connection* sc = h2Batch_[h2BatchBase_ + k];
+      if (sc->h2Gen == h2BatchGen_ && sc->active) sc->abortNotified = true;
+    }
+    if (h2LoopOpen_) {
+      *batchControl_ = count;
+      h2LoopOpen_ = false;  // the cell is final for this call
+    }
+  }
+
   // The connection is closing: every request in flight on it is over.
   void h2Teardown(Connection* p) {
+    if (h2InBatchCall_ && h2BatchParent_ == p) h2CutBatch();
     std::vector<Connection*> held;
     p->h2->forEachHeld([&held](void* user) { held.push_back(static_cast<Connection*>(user)); });
-    for (Connection* sc : held) h2OnAborted(sc);
+    // (Each is checked again when its turn comes: told in place, a handler
+    // may answer another of these requests from inside onAborted, and that
+    // one is then finished and must not be finished a second time.)
+    for (Connection* sc : held) {
+      if (sc->h2Parent == p && sc->active) h2OnAborted(sc);
+    }
     for (size_t i = 0; i < h2Waiters_.size();) {
       if (h2Waiters_[i].second == p) {
         h2Waiters_[i] = h2Waiters_.back();
@@ -2329,16 +3390,23 @@ class Server {
       h2Done(sc);
       return;
     }
+    // After writeHead() the head is out: a second HEADERS frame would be a
+    // malformed response, so this one only finishes the body.
+    if (sc->responseStarted) {
+      h2End(sc, body, bodyLen);
+      return;
+    }
     const bool bodyless = isBodyless(status);
-    if (bodyless) bodyLen = 0;
+    if (bodyless || status == 205) bodyLen = 0;
     std::string& block = h2Block_;
     block.clear();
     h2Head(block, status, headersBlock, tpl);
-    // Content-Length exactly as the HTTP/1 path declares it.
+    // Content-Length exactly as the HTTP/1 path declares it (appendResponseHead).
     if (!bodyless) {
-      h2ContentLength(block, (sc->isHead && customCL >= 0) ? static_cast<unsigned long long>(customCL)
-                                                          : static_cast<unsigned long long>(bodyLen));
-    } else if (customCL >= 0) {
+      h2ContentLength(block, (sc->isHead && customCL >= 0 && status != 205)
+                                 ? static_cast<unsigned long long>(customCL)
+                                 : static_cast<unsigned long long>(bodyLen));
+    } else if (customCL >= 0 && status == 304) {
       h2ContentLength(block, static_cast<unsigned long long>(customCL));
     }
     const bool noBody = sc->isHead || bodyLen == 0;
@@ -2360,12 +3428,15 @@ class Server {
     sc->responseStarted = true;
     sc->bodylessStatus = isBodyless(status);
     sc->bodyBytesSent = 0;
+    if (status == 205) customCL = 0;  // no content (see writeHead)
     sc->declaredLen = sc->bodylessStatus ? 0 : customCL;
     if (st == nullptr || p->closing) return;
     std::string& block = h2Block_;
     block.clear();
     h2Head(block, status, headersBlock, tpl);
-    if (customCL >= 0) h2ContentLength(block, static_cast<unsigned long long>(customCL));
+    // A length on a 304 only, among the statuses without a body (see writeHead).
+    if (customCL >= 0 && (!sc->bodylessStatus || status == 304))
+      h2ContentLength(block, static_cast<unsigned long long>(customCL));
     p->h2->sendHeaders(*st, block, /*endStream=*/false);
     h2Written(p);
   }
@@ -2473,6 +3544,133 @@ class Server {
     uv_read_start(reinterpret_cast<uv_stream_t*>(&c->handle), onAlloc, onRead);
   }
 
+#if defined(__linux__)
+  // ---- the libuv transport's listener (Linux) ----
+  // The connections are libuv streams; the listener is not. libuv's own
+  // makes one accept call per readiness report and, when that fails for want
+  // of a descriptor and the spare one it keeps for the occasion is gone
+  // (another thread took it while it was lent out), returns without a word:
+  // the connection stays queued, the listener is reported again on the next
+  // loop turn, and the next - a loop that never sleeps for as long as the
+  // process stays at its limit. Nothing in its API stops a listener short of
+  // closing it. So on Linux the socket is opened, bound and watched here (a
+  // poll handle), accept is called here, and each accepted descriptor is
+  // handed to a libuv stream: the options libuv sets (SO_REUSEADDR,
+  // dual-stack on an IPv6 address), and the same pause at the limit as the
+  // epoll and io_uring transports. (Elsewhere the listener is libuv's: the
+  // macOS kernel drops a connection whose accept fails for want of a
+  // descriptor, so nothing stays queued to be reported again.)
+  int uvListen(const sockaddr_storage& addr) {
+    const socklen_t len = addr.ss_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in);
+    int fd = ::socket(addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -errno;
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    if (addr.ss_family == AF_INET6) {
+      int off = 0;
+      setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+    }
+    if (limits_.reusePort) setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));  // inherited by every accepted socket
+    if (::bind(fd, reinterpret_cast<const sockaddr*>(&addr), len) < 0 || ::listen(fd, limits_.backlog) < 0) {
+      int e = -errno;
+      ::close(fd);
+      return e;
+    }
+    uvListenPoll_.data = this;
+    int r = uv_poll_init(loop_, &uvListenPoll_, fd);
+    if (r != 0) {
+      ::close(fd);
+      return r;
+    }
+    uvListenFd_ = fd;
+    liveHandles_++;  // balanced in onUvListenPollClosed
+    // The descriptor that is given up for a moment to turn a waiting peer
+    // away at the limit (uvOnListener). Without one - the process is at its
+    // limit already - accepting pauses instead.
+    uvSpareFd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    uv_poll_start(&uvListenPoll_, UV_READABLE, onUvListenPoll);
+    return 0;
+  }
+
+  static void onUvListenPoll(uv_poll_t* h, int, int) {
+    static_cast<Server*>(h->data)->uvOnListener();
+  }
+
+  // One accept per readiness report, as libuv's listener makes: a connection
+  // still waiting is reported again on the next loop turn. (Never called
+  // once the listener is closed: its watcher is closed with it.)
+  void uvOnListener() {
+    int fd = ::accept4(uvListenFd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (fd < 0) {
+      if (errno == EMFILE || errno == ENFILE) {
+        // Out of descriptors: the spare one is given up for as long as it
+        // takes to accept one waiting connection and close it, so that its
+        // peer sees a close instead of a hang.
+        if (uvSpareFd_ >= 0) {
+          ::close(uvSpareFd_);
+          int d = ::accept4(uvListenFd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+          if (d >= 0) ::close(d);
+          uvSpareFd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        }
+        // Without the spare (something else in the process took the
+        // descriptor while it was lent out, or there never was one) the
+        // connection can be neither accepted nor dropped, and the listener
+        // would report it on every loop turn. It is left alone until a
+        // descriptor may be free again (resumeAccept).
+        if (uvSpareFd_ < 0) pauseAccept();
+      } else if (errno == ENOBUFS || errno == ENOMEM) {
+        pauseAccept();  // the same: the connection stays queued, and so would the event
+      }
+      return;  // EAGAIN, a connection that went away, or an error: nothing to accept right now
+    }
+    // Connection-flood defense: over the cap, accept then close at once.
+    if (limits_.maxConnections && conns_.size() >= limits_.maxConnections) {
+      ::close(fd);
+      return;
+    }
+    Connection* c = new Connection();
+    c->server = this;
+    c->handle.data = c;
+    uv_tcp_init(loop_, &c->handle);
+    liveHandles_++;  // balanced by onCloseFree's decrement
+    if (uv_tcp_open(&c->handle, fd) != 0) {
+      ::close(fd);
+      uv_close(reinterpret_cast<uv_handle_t*>(&c->handle), onCloseFree);
+      return;
+    }
+    attachConnection(c);
+    uv_read_start(reinterpret_cast<uv_stream_t*>(&c->handle), onAlloc, onRead);
+  }
+
+  // The socket is closed here and now, as libuv closes a listener of its
+  // own: the port is free the moment close() or stopListening() returns.
+  // libuv has let go of the descriptor once uv_close() has returned.
+  void uvCloseListener() {
+    if (uvListenFd_ < 0) return;
+    uv_close(reinterpret_cast<uv_handle_t*>(&uvListenPoll_), onUvListenPollClosed);
+    ::close(uvListenFd_);
+    uvListenFd_ = -1;
+    if (uvSpareFd_ >= 0) ::close(uvSpareFd_);
+    uvSpareFd_ = -1;
+  }
+  static void onUvListenPollClosed(uv_handle_t* h) {
+    Server* s = static_cast<Server*>(h->data);
+    s->liveHandles_--;
+    s->checkFullyClosed();  // may delete s
+  }
+
+  void uvPauseAccept() { uv_poll_stop(&uvListenPoll_); }
+  void uvResumeAccept() {
+    if (uvListenFd_ < 0 || listenerClosed_ || closeRequested_) return;
+    if (uvSpareFd_ < 0) uvSpareFd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    uv_poll_start(&uvListenPoll_, UV_READABLE, onUvListenPoll);
+  }
+  int uvListenFd_ = -1;
+  int uvSpareFd_ = -1;
+  uv_poll_t uvListenPoll_{};
+#endif
+
   // Transport-neutral tail of accepting a connection: protocol state, TLS
   // session, registry. The caller then starts reads its own way.
   void attachConnection(Connection* c) {
@@ -2506,8 +3704,30 @@ class Server {
     // O(connections) x 64 KiB zero-filled footprint collapses to O(1).
     Server* s = static_cast<Connection*>(handle->data)->server;
     if (s->readBufSize_ < suggested) {
-      s->readBuf_.reset(new char[suggested]);
-      s->readBufSize_ = suggested;
+      // No buffer yet - or the last read was a full one (onRead), which
+      // shows here as a buffer of no size: nothing is added to the path of
+      // an ordinary read. One read per stream per loop turn: libuv reads a
+      // stream again at once whenever a read filled its buffer, up to 32
+      // times - two megabytes of one peer's input, each small frame of it a
+      // call into the application, with every timer and every other
+      // connection waiting behind it. So that second request is declined (no
+      // buffer; libuv reports UV_ENOBUFS to onRead and leaves the stream as
+      // it is): the bytes stay in the socket and are reported again on the
+      // next turn, which is how the epoll transport reads.
+      if (s->uvDeclined_) {
+        const bool again = s->uvDeclined_ == static_cast<Connection*>(handle->data);
+        s->uvDeclined_ = nullptr;
+        s->readBufSize_ = s->uvReadBufKept_;
+        if (again) {
+          buf->base = nullptr;
+          buf->len = 0;
+          return;
+        }
+      }
+      if (s->readBufSize_ < suggested) {
+        s->readBuf_.reset(new char[suggested]);
+        s->readBufSize_ = suggested;
+      }
     }
     buf->base = s->readBuf_.get();
     buf->len = static_cast<unsigned>(s->readBufSize_);
@@ -2518,28 +3738,176 @@ class Server {
     Connection* c = static_cast<Connection*>(handle->data);
     Server* s = c->server;
     if (nread < 0) {
+#if !defined(_WIN32)
+      if (nread == UV_ENOBUFS) return;  // the read onAlloc declined: nothing was read, nothing is wrong
+#endif
       s->onTransportEof(c);
       return;
     }
     if (nread == 0) return;
-    s->onTransportData(c, buf->base, static_cast<size_t>(nread));
+    if (nread >= static_cast<ssize_t>(kUvReadBound)) {
+      s->onFullRead(c, buf->base, static_cast<size_t>(nread));
+      return;
+    }
+    // The protocol is chosen here, where no frame has been set up yet, and
+    // each of the plaintext ones is a function of its own: what an HTTP/1
+    // request pays on its way in does not depend on the others. (Behind
+    // onTransportData they share one function with HTTP/1, and each adds to
+    // it - registers to save for the WebSocket and HTTP/2 paths, the frame
+    // of the TLS output buffer - by as much as the build's profile makes of
+    // them; on this transport nothing else absorbs that.)
+    if (c->tls) {
+      s->onTransportData(c, buf->base, static_cast<size_t>(nread));
+      return;
+    }
+    if (c->isWebSocket) {
+      s->onWebSocketRead(c, buf->base, static_cast<size_t>(nread));
+      return;
+    }
+    s->onPlainRead(c, buf->base, static_cast<size_t>(nread));
+  }
+
+  // A plaintext read that is not a WebSocket's: what onTransportData does
+  // with it, HTTP/1 first.
+  MORO_NOINLINE void onPlainRead(Connection* c, char* base, size_t nread) {
+    if (c->inputClosed) return;
+    c->idleTicks = 0;
+    if (c->proto != 1) {
+      // HTTP/2, or a connection whose first bytes have yet to say which
+      // (h2Decide) - unless HTTP/2 is off, which settles it here.
+      if (c->proto != 0 || limits_.http2.enabled) {
+        onOtherProtocol(c, base, nread);
+        return;
+      }
+      c->proto = 1;
+    }
+    dispatchHttp1(c, base, nread);
+  }
+  MORO_NOINLINE void onOtherProtocol(Connection* c, char* base, size_t nread) {
+    dispatchPlaintext(c, base, nread);
+  }
+  // ... and a plaintext WebSocket's.
+  MORO_NOINLINE void onWebSocketRead(Connection* c, char* base, size_t nread) {
+    if (c->inputClosed) return;
+    c->idleTicks = 0;
+    feedWebSocket(c, base, nread);
+  }
+
+  // The libuv transport's share of a loop turn for one stream: one read of
+  // this size (libuv asks for 64 KiB). libuv follows a read that filled the
+  // buffer with another at once, up to 32 times, and there are two ways of
+  // not having it:
+  //  - POSIX: its request for the next buffer is declined (onAlloc). Nothing
+  //    is added to the stream's state; the bytes stay in the socket and are
+  //    reported on the next turn.
+  //  - Windows: the stream stops reading (uv_read_stop ends libuv's loop over
+  //    it and leaves no read queued) and is started again from the check
+  //    phase of the same turn (onUvResume), so that its next read is the next
+  //    turn's. Declining a buffer there would lean on how libuv's IOCP code
+  //    happens to queue its reads; stopping and starting is its documented
+  //    interface.
+  // The second way works everywhere, and MORO_ENGINE_TEST_UV_READ_RESTART=1
+  // (read once; for tests) selects it on POSIX too, so that what Windows runs
+  // is run where the suites are.
+  static constexpr size_t kUvReadBound = 64 * 1024;
+  static bool uvBoundByRestart() {
+#if defined(_WIN32)
+    return true;
+#else
+    static const bool on = [] {
+      const char* e = std::getenv("MORO_ENGINE_TEST_UV_READ_RESTART");
+      return e && *e && *e != '0';
+    }();
+    return on;
+#endif
+  }
+  MORO_NOINLINE void onFullRead(Connection* c, char* base, size_t nread) {
+    if (uvBoundByRestart()) {
+      uvStopReading(c);
+    } else {
+#if !defined(_WIN32)
+      if (!uvDeclined_) {
+        uvReadBufKept_ = readBufSize_;
+        readBufSize_ = 0;
+      }
+      uvDeclined_ = c;
+#endif
+    }
+    onTransportData(c, base, nread);
+  }
+#if !defined(_WIN32)
+  Connection* uvDeclined_ = nullptr;  // the stream whose next buffer request is declined
+  size_t uvReadBufKept_ = 0;          // readBufSize_, which reads 0 meanwhile
+#endif
+
+  // Stop the stream for the rest of this turn. Before its bytes are
+  // dispatched: whatever the dispatch does to the connection - close it,
+  // upgrade it, close the server - finds a stream that is simply not reading.
+  void uvStopReading(Connection* c) {
+    uv_read_stop(reinterpret_cast<uv_stream_t*>(&c->handle));
+    if (closeRequested_) return;  // (being torn down: nothing is started again)
+    uvStopped_.push_back(c);
+    if (!uvResumeInit_) {
+      uvResume_.data = this;
+      uv_check_init(loop_, &uvResume_);
+      uvResumeInit_ = true;
+      liveHandles_++;  // balanced by onServerHandleClosed (close())
+    }
+    // Active only while a stream is stopped, and a reference on the loop for
+    // that long: a stopped stream holds none of its own.
+    if (!uvResumeOn_) {
+      uvResumeOn_ = true;
+      uv_check_start(&uvResume_, onUvResume);
+    }
+  }
+
+  // The check phase of the turn in which streams were stopped: each is
+  // started again unless it has been closed meanwhile. A closed connection
+  // has left conns_ (doClose) and is not touched; its memory is freed by the
+  // close callback, later in the loop, and should that order ever be another
+  // one the address is at worst that of a newer connection, which is reading
+  // already (UV_EALREADY). A stream that cannot be started again is ended
+  // like one whose read failed: none is left stopped.
+  static void onUvResume(uv_check_t* h) {
+    Server* s = static_cast<Server*>(h->data);
+    s->uvResumeOn_ = false;
+    uv_check_stop(&s->uvResume_);
+    std::vector<Connection*> list;
+    list.swap(s->uvStopped_);
+    for (Connection* c : list) {
+      if (s->conns_.count(c) == 0) continue;
+      uv_stream_t* stream = reinterpret_cast<uv_stream_t*>(&c->handle);
+      if (uv_is_closing(reinterpret_cast<uv_handle_t*>(stream))) continue;
+      const int r = uv_read_start(stream, onAlloc, onRead);
+      if (r != 0 && r != UV_EALREADY) s->onTransportEof(c);
+    }
   }
 
   // EOF or a read error on the transport: notify an in-flight request / WS
-  // exactly once, then tear the connection down.
+  // exactly once, then tear the connection down. A request that was awaiting
+  // its response is aborted by the teardown itself (doClose), which tells JS
+  // once the request has been released; told from here, ahead of it, a
+  // notification delivered in place (MORO_ENGINE_NOTIFY=sync) reached a
+  // handler whose request still looked alive.
   void onTransportEof(Connection* c) {
-    if (c->isWebSocket) {
-      // Fire onWsClose exactly once: set wsClosing before the impending doClose so its own 1006 guard can't re-fire it.
-      if (!c->wsClosing && cb_.onWsClose)
-        cb_.onWsClose(cb_.user, c, 1006);  // abnormal closure (§7.1.5)
-      c->wsClosing = true;
-      globalWebSockets().erase(c->wsId);
-    } else if (c->active && !c->abortNotified) {
-      // A request was awaiting its response: it's aborted.
-      c->abortNotified = true;
-      queueNotify(c->reqId, kNotifyAborted);
-    }
+    if (c->isWebSocket) wsGone(c);
     abortConnection(c);
+  }
+
+  // The peer of a WebSocket is gone without a closing handshake (EOF, a
+  // read error, a TLS failure): JS is told once, with 1006 (abnormal
+  // closure, §7.1.5). wsClosing is set BEFORE the callback: a wsClose()
+  // made from inside it must find the socket already closing and return
+  // (set afterwards, it would pass wsClose's guard and fire onWsClose a
+  // second time), and wsSend() from inside it must report false. The socket
+  // stays registered until the callback has returned, so wsGetHeaders() and
+  // the other accessors still answer inside it.
+  void wsGone(Connection* c) {
+    if (!c->wsClosing) {
+      c->wsClosing = true;
+      if (cb_.onWsClose) cb_.onWsClose(cb_.user, c, 1006);
+    }
+    globalWebSockets().erase(c->wsId);
   }
 
   // Bytes arrived on the transport (a uv read, or an io_uring recv into a
@@ -2551,7 +3919,11 @@ class Server {
     // peer still writes (typically a request it sent before seeing the FIN)
     // is read and dropped so the kernel never answers it with a RST. The
     // peer's own FIN (onTransportEof) or kLingerMs ends the connection.
-    if (c->lingering) return;
+    // The same goes for a connection whose request was rejected, from the
+    // moment the error response is written or queued (inputClosed covers
+    // both): the parser stopped at the error, and nothing sent behind a
+    // rejected request is read.
+    if (c->inputClosed) return;
     c->idleTicks = 0;  // activity: reset the idle sweep counter
 
     if (c->tls) {
@@ -2568,26 +3940,47 @@ class Server {
             if (!cipherOut.empty() && !c->closing) {
               std::string flight;
               flight.swap(cipherOut);
-              s->transportWrite(c, std::move(flight), /*terminal=*/false);
+              s->tlsAnswer(c, std::move(flight));
             }
             if (!c->closing) s->dispatchPlaintext(c, d, n);
           },
           cipherOut);
       if (!c->closing && !cipherOut.empty())
-        s->transportWrite(c, std::move(cipherOut), /*terminal=*/false);
+        s->tlsAnswer(c, std::move(cipherOut));
       if (!ok && !c->closing) {
         // Fatal TLS error or clean close_notify: same bookkeeping as EOF - notify an in-flight request/WS exactly once, then tear down.
-        if (c->isWebSocket) {
-          if (!c->wsClosing && s->cb_.onWsClose)
-            s->cb_.onWsClose(s->cb_.user, c, 1006);
-          c->wsClosing = true;
-          globalWebSockets().erase(c->wsId);
-        }
+        if (c->isWebSocket) s->wsGone(c);
         s->abortConnection(c);
       }
       return;
     }
     s->dispatchPlaintext(c, base, nread);
+  }
+
+  // What the TLS library wrote while reading (handshake flights, and after
+  // the handshake its answers to the peer's own records: a KeyUpdate for each
+  // KeyUpdate that asks for one, an alert for each renegotiation request it
+  // refuses). The peer decides how many of those there are, and a peer that
+  // sends them without reading would have every answer queued behind the
+  // last, a byte held here for each byte it sends. So what it has left
+  // unread of them is bounded: a client that reads never comes near the
+  // bound (an answer is a few dozen bytes), and one that does not is closed
+  // at it. May tear the connection down.
+  static constexpr size_t kTlsAnswerBacklog = 256 * 1024;
+  void tlsAnswer(Connection* c, std::string&& out) {
+    const bool drained = c->pendingWrites == 0;
+    const size_t n = out.size();
+    transportWrite(c, std::move(out), /*terminal=*/false);
+    if (c->closing || c->pendingWrites == 0) return;
+    // With nothing queued before it, what is queued now is the part of this
+    // write the socket did not take.
+    size_t& queued = c->tls->answerQueued;
+    queued = drained ? tPendingBytes(c) : queued + n;
+    if (queued > kTlsAnswerBacklog) {
+      // The same bookkeeping as a failed read: JS is told once.
+      if (c->isWebSocket) wsGone(c);
+      abortConnection(c);
+    }
   }
 
   // Plaintext ingestion - identical for direct TCP reads and decrypted TLS records. May tear the connection down (doClose sets c->closing; the Connection object itself stays alive until uv's close callback).
@@ -2611,9 +4004,27 @@ class Server {
       feedWebSocket(c, const_cast<char*>(data), len);
       return;
     }
-    if (c->active) {
+    dispatchHttp1(c, data, len);
+  }
+
+  // HTTP/1 input: the rest of dispatchPlaintext, and what the libuv
+  // transport hands a plaintext HTTP/1 read to directly (onPlainRead).
+  // Always inline: it is part of dispatchPlaintext as it was before it had a
+  // name of its own. Buffered while a response is in flight ...
+  MORO_ALWAYS_INLINE void dispatchHttp1(Connection* c, const char* data, size_t len) {
+    // ... or responses already given are waiting on the peer (outHeld, or a
+    // queue found over the mark now): the same buffering, until the write
+    // queue drains (resumeHeld). outHeld is only ever set while writes are
+    // pending, so a connection with nothing queued pays one field read here.
+    if (c->active || (c->pendingWrites > 0 && (c->outHeld || holdForOutput(c)))) {
       // A response is in flight; buffer bytes for after it completes. Cap the buffer so a client can't pipeline unbounded requests and exhaust memory while we're busy (the parser enforces per-request limits, but this bounds the not-yet-parsed backlog). A response is already in flight, so we can't inject an error status - hard-close the flood.
-      if (c->pending.size() + len > maxPending_) {
+      // The cap is on everything received and not yet dispatched: `pending`
+      // and the input the parser still holds behind the requests it has
+      // handed over. Each time dispatch resumes, `pending` moves into the
+      // parser, and one request (or one write queue's worth) is taken out of
+      // it; counting `pending` alone let a peer add another maxPendingBytes
+      // per response for as long as it liked.
+      if (c->pending.size() + c->parser.leftover().size() + len > maxPending_) {
         doClose(c);
         return;
       }
@@ -2682,17 +4093,29 @@ class Server {
           // remaining complete frames already in this read buffer - delivering
           // them would fire onWsMessage on a closed/gone socket. The control
           // path already guards Ping this way; mirror it here.
-          if (c->wsClosing || c->closing) return;
+          // The same once a message of this read has failed to inflate: the
+          // connection is about to be failed for it (below), and the frames
+          // behind it in the buffer are not delivered.
+          if (c->wsClosing || c->closing || pmdFail) return;
           if (compressed && c->pmd) {
             // Inflate (hard output cap = zip-bomb defense), then UTF-8-validate text post-inflate (the parser skipped it for compressed frames).
             std::string inflated;
             if (!c->pmd->inflateMessage(payload, inflated)) {
-              pmdFail = 1009;  // over the decompressed cap or corrupt stream
+              // §7.4.1: 1009 for a message too big to process (past the
+              // decompressed cap), 1007 for data that is not consistent with
+              // the type of the message - here, bytes that are not a deflate
+              // stream.
+              pmdFail = c->pmd->inflateOverCap() ? 1009 : 1007;
               return;
             }
-            if (!isBinary && !isValidUtf8(inflated)) {
-              pmdFail = 1007;  // invalid UTF-8 after inflate
-              return;
+            // The validator the parser runs over uncompressed text (ASCII by
+            // the word), not the byte-at-a-time check kept for close reasons.
+            if (!isBinary) {
+              Utf8Validator utf8;
+              if (!utf8.accept(inflated) || !utf8.complete()) {
+                pmdFail = 1007;  // invalid UTF-8 after inflate
+                return;
+              }
             }
             if (cb_.onWsMessage)
               cb_.onWsMessage(cb_.user, c, inflated.data(), inflated.size(), isBinary);
@@ -2710,7 +4133,7 @@ class Server {
               encodeFrame(out, WsOpcode::Pong, payload);
               writeOut(c, std::move(out), /*terminal=*/false);
               // Bound the outgoing queue: a peer flooding Pings while never reading our Pongs would otherwise grow libuv's write buffer without limit (OOM). Shed it, same as wsSend's backpressure cap.
-              size_t q = tPendingBytes(c) + c->corkBuf.size();
+              size_t q = tPendingBytes(c) + c->corkBuf.size() + tlsGatheredBytes(c);
               if (limits_.wsBackpressureLimit && q > limits_.wsBackpressureLimit)
                 wsClose(c, 1013, "", 0);
               break;
@@ -2734,12 +4157,27 @@ class Server {
             default:
               break;
           }
+        },
+        [&](std::string& message, bool isBinary, bool compressed) {
+          // A binary message that was buffered here, in memory the parser
+          // would release once it is delivered (capacity over its 16 KiB
+          // watermark): the application is given that memory instead of a
+          // copy of it. Not when much of it is unused (a message grown
+          // fragment by fragment): that would stay allocated behind the
+          // bytes for as long as the application keeps them.
+          if (!isBinary || compressed || !cb_.onWsBinaryOwned || message.capacity() <= kWsTakeMessage ||
+              message.capacity() - message.size() > message.size() / 8) {
+            return false;
+          }
+          if (c->wsClosing || c->closing || pmdFail) return true;  // not delivered (see above)
+          cb_.onWsBinaryOwned(cb_.user, c, message);
+          return true;
         });
     if (!ok) {
-      // Protocol failure: fail the connection WITH a Close frame first (§7.1.7 SHOULD) carrying the parser's failure code - 1009 for an oversized message, 1007 for invalid UTF-8, 1002 otherwise. wsClose sets wsClosing, fires onWsClose once, erases the ws registry entry, and terminal-writes the Close frame - the flush-then-close machinery (finishResponse -> !reqKeepAlive -> doClose) tears the TCP connection down right after it drains. The parser's failed latch plus the wsClosing early-return above stop any already-buffered bytes from being re-fed. If wsClosing was already set (violation raced a close handshake in flight) this is a no-op and the pending terminal write finishes the job.
+      // Protocol failure: fail the connection WITH a Close frame first (§7.1.7 SHOULD) carrying the parser's failure code - 1009 for an oversized message, 1007 for invalid UTF-8, 1002 otherwise. wsClose sets wsClosing, fires onWsClose once, erases the ws registry entry, and terminal-writes the Close frame - the flush-then-close machinery (finishResponse -> !reqKeepAlive -> closeAfterResponse) ends the TCP connection once it drains. The parser's failed latch plus the wsClosing early-return above stop any already-buffered bytes from being re-fed. If wsClosing was already set (violation raced a close handshake in flight) this is a no-op and the pending terminal write finishes the job.
       wsClose(c, c->wsParser->failCode(), "", 0);
     } else if (pmdFail && !c->wsClosing) {
-      // Inflate/UTF-8 failure on a compressed message: close with the RFC 7692/6455 code (1009 too-big, 1007 bad UTF-8) via the same flush-then-close machinery as a parser failure.
+      // Inflate/UTF-8 failure on a compressed message: close with the RFC 7692/6455 code (1009 too big, 1007 not a deflate stream or bad UTF-8) via the same flush-then-close machinery as a parser failure.
       wsClose(c, pmdFail, "", 0);
     }
     if (outerCorked) return;  // the enclosing dispatch loop flushes and closes
@@ -2763,10 +4201,11 @@ class Server {
         answerFromParser(c))
       return;
     if (st == ParseStatus::Complete && c->parser.light()) {
-      // The route hook said "engine route" while this request was parsed, so
-      // its headers were never stored; the table cannot have changed since
-      // (no JS ran in between), so this is unreachable - fail loudly, never
-      // hand JS a request without its headers.
+      // The route hook said "engine route" when this request's line was
+      // parsed, so its headers were never stored, and the route is no longer
+      // there: the application took it out of the tables before the rest of
+      // the head arrived. Fail loudly, never hand JS a request without its
+      // headers.
       sendErrorAndClose(c, 500);
       return;
     }
@@ -2797,11 +4236,11 @@ class Server {
     c->reqId = nextReqId();
     c->method = c->parser.method;
     // Swap, don't copy: the parser is reset before its next request anyway (reset() clears every swapped-in field, keeping its heap capacity), so the previous snapshot's buffers become the parser's scratch for the NEXT request - snapshots are allocation-free on a warm connection.
-    c->methodStr.swap(c->parser.methodStr);
+    swapField(c->methodStr, c->parser.methodStr);
     c->path.swap(c->parser.path);
-    c->query.swap(c->parser.query);
+    swapField(c->query, c->parser.query);
     c->headers.swap(c->parser.headers);
-    c->body.swap(c->parser.body);
+    swapField(c->body, c->parser.body);
     c->jsBody.reset();
     c->jsLent.reset();
     c->isHead = (c->method == Method::HEAD);
@@ -2809,16 +4248,19 @@ class Server {
     c->reqHttp11 = c->parser.minorVersion >= 1;
     c->active = true;
     c->requestTicks = 0;  // the request-receive budget is per request
-    globalRequests().insert(c->reqId, c);
+    reqMap_->insert(c->reqId, c);
 
     // Static route: answered right here with the SAME respond() the binding
     // calls, so framing, HEAD handling, corking and keep-alive are identical -
     // the only thing skipped is the trip through JS.
-    if (hasEngineRoutes() && tryStaticRoute(c)) return;
+    // Not looked up again when the route hook found no engine route at the
+    // request line and the tables have not changed since.
+    if (hasEngineRoutes() && c->routeMissGen != routeGen_ && tryStaticRoute(c)) return;
     // The engine's own upgrade (wsAutoUpgrade): a valid WebSocket handshake
-    // is answered here and onWsOpen fired; the request never reaches JS. An
-    // invalid one (upgradeToWebSocket returns 0) is surfaced as usual.
-    if (wsAutoUpgrade_ && c->parser.hasUpgrade() && upgradeToWebSocket(c) != 0) return;
+    // is answered here and onWsOpen fired; the request never reaches JS. So
+    // is one whose only fault is its protocol version (426). Any other
+    // request with an Upgrade header is surfaced as usual.
+    if (wsAutoUpgrade_ && c->parser.hasUpgrade() && autoUpgrade(c)) return;
     if (cb_.onRequest) cb_.onRequest(cb_.user, c);
   }
 
@@ -2908,13 +4350,35 @@ class Server {
   static bool routeHook(void* user, Method method, const std::string& path) {
     Connection* c = static_cast<Connection*>(user);
     Server* s = c->server;
-    if (c->active || c->stagedCount > 0 || c->tls || !s->hasEngineRoutes()) return false;
-    return s->matchEngineRoute(c, method, path);
+    if (c->active || c->stagedCount > 0 || c->tls || !s->hasEngineRoutes()) {
+      c->routeMissGen = 0;
+      return false;
+    }
+    if (s->matchEngineRoute(c, method, path)) return true;
+    c->routeMissGen = s->routeGen_;  // no engine route, for as long as the tables stay as they are
+    return false;
   }
 
   bool answerFromParser(Connection* c) {
     HttpParser& p = c->parser;
-    if (!p.light() && !matchEngineRoute(c, p.method, p.path)) return false;
+    // A light request was matched when its request line was parsed, and the
+    // fast* fields point into the route tables. That match is used as it is
+    // only when the request completed in the same parse call (nothing ran in
+    // between). When the rest of the request came in a later read
+    // (lightFresh() is false), the application may have changed the tables
+    // meanwhile - a route registered, the tables cleared and filled again -
+    // and the pointers may be to storage that was moved or freed: the request
+    // is matched again, against the tables as they are now.
+    //
+    // A request the hook found no route for (not light) is not looked up
+    // again while the tables are at the generation of that lookup.
+    if (!p.lightFresh()) {
+      if (!p.light() && c->routeMissGen == routeGen_) return false;
+      if (!matchEngineRoute(c, p.method, p.path)) {
+        c->routeMissGen = routeGen_;
+        return false;
+      }
+    }
     // The framing inputs appendResponse reads from the Connection.
     c->method = p.method;
     c->isHead = (p.method == Method::HEAD);
@@ -2933,13 +4397,13 @@ class Server {
       const bool bodyless = isBodyless(r->tpl.status);
       out.reserve(out.size() + r->body.size() + r->tpl.headers.size() + 128);
       appendResponse(out, c, r->tpl.status, r->tpl.headers, r->tpl.customCL, r->body.data(),
-                     bodyless ? 0 : r->body.size(), bodyless);
+                     isContentless(r->tpl.status) ? 0 : r->body.size(), bodyless);
     } else {
       ParamRoute* pr = c->fastParam;
       const bool bodyless = isBodyless(pr->tpl.status);
       out.reserve(out.size() + c->fastSegLen + pr->tpl.headers.size() + 128);
       appendResponse(out, c, pr->tpl.status, pr->tpl.headers, pr->tpl.customCL, c->fastSeg,
-                     bodyless ? 0 : c->fastSegLen, bodyless);
+                     isContentless(pr->tpl.status) ? 0 : c->fastSegLen, bodyless);
     }
     // Same per-request bookkeeping completeCorkedResponse does for a
     // surfaced request, minus the registry: nothing was registered.
@@ -2956,7 +4420,7 @@ class Server {
   // parameter route its cached head up to Content-Length (a bodyless status
   // there is framed the general way).
   bool plainFrameable(Connection* c) const {
-    return c->fastStatic != nullptr || !isBodyless(c->fastParam->tpl.status);
+    return c->fastStatic != nullptr || !isContentless(c->fastParam->tpl.status);
   }
 
   void appendPlainFrame(Connection* c) {
@@ -2967,7 +4431,7 @@ class Server {
         r->frame.clear();
         const bool bodyless = isBodyless(r->tpl.status);
         appendResponse(r->frame, c, r->tpl.status, r->tpl.headers, r->tpl.customCL,
-                       r->body.data(), bodyless ? 0 : r->body.size(), bodyless);
+                       r->body.data(), isContentless(r->tpl.status) ? 0 : r->body.size(), bodyless);
         r->frameAt = dateCachedAt_;
       }
       out += r->frame;
@@ -3033,13 +4497,21 @@ class Server {
     return empty;
   }
 
+  // One error response per connection, and nothing is read from it
+  // afterwards (inputClosed): the response may sit behind others the peer has
+  // not read yet, and until it is flushed the connection is neither closing
+  // nor lingering.
   void sendErrorAndClose(Connection* c, int status) {
+    if (c->inputClosed) return;
+    c->inputClosed = true;
+    c->pending.clear();  // never parsed now
     c->reqKeepAlive = false;
     std::string& out = c->scratch;
     out.clear();
     appendStatusLine(out, status);
     out += dateLine();
     out += "Content-Length: 0\r\nConnection: close\r\n\r\n";
+    c->responseStarted = true;
     c->responseEnded = true;
     writeOutView(c, out, /*terminal=*/true);
   }
@@ -3055,11 +4527,21 @@ class Server {
   // in the peer's buffer. Measured with autocannon (which writes the next
   // request the moment a response completes, before it has seen the FIN):
   // the immediate close reconnected twice per cycle and ran at a quarter of
-  // the rate of servers that linger. TLS keeps its close_notify sequence and
-  // WebSockets their Close-frame sequence (doClose).
+  // the rate of servers that linger. TLS keeps its close_notify sequence
+  // (doClose).
+  //
+  // A WebSocket ends the same way once its Close frame is out (RFC 6455
+  // §7.1.1: half-close, read until the peer has closed too, then close). The
+  // peer of a Close the server started - wsClose(), a protocol failure, a
+  // message over the size limit - is usually still sending; closed outright,
+  // those bytes are answered with a RST and the Close frame, with the status
+  // code that says why, is lost with the peer's receive buffer. What the peer
+  // sends meanwhile is read and dropped (onTransportData), frames included:
+  // nothing is delivered after the Close. kLingerMs bounds a peer that never
+  // closes its side.
   void closeAfterResponse(Connection* c) {
     if (c->closing || c->lingering) return;
-    if (c->tls || c->isWebSocket) {
+    if (c->tls) {
       doClose(c);
       return;
     }
@@ -3086,6 +4568,7 @@ class Server {
       }
     }
     c->lingering = true;
+    c->inputClosed = true;
     c->lingerTicks = 0;
   }
 
@@ -3126,13 +4609,26 @@ class Server {
     }
     c->closing = true;
     c->jsLent.reset();  // a lent body ends with the connection, whatever state the request was in
+    // Closed from inside JS's loop over its own batch (a handler closed the
+    // server, or the connection went over a limit): the slots still staged
+    // die with it, so the loop is told its batch is over and takes no
+    // further slot of a connection that is gone.
+    if (batchLoopConn_ == c && batchControl_) *batchControl_ = UINT32_MAX;
     if (c->h2) h2Teardown(c);  // every request in flight on it is aborted
     // An HTTP request that was surfaced to a handler and never answered owes JS exactly one onAborted (server shutdown, timeout sweep, write error), or 'close' listeners and their resources (SSE intervals, monitors) leak. closing is already set, so a re-entrant respond() from JS is a no-op.
+    // The request is released before JS is told. On a later loop turn (the
+    // default) the order makes no difference. Delivered in place
+    // (MORO_ENGINE_NOTIFY=sync) it does: the callback, and the continuations
+    // the microtask checkpoint behind it runs, must find the request gone as
+    // they do in the default mode. Told first, a streaming handler woken by
+    // onAborted saw isAborted() false and a write() that reported
+    // backpressure, and waited for an onWritable that could never come.
+    const uint32_t reqId = c->reqId;
+    reqMap_->erase(reqId);
     if (c->active && !c->isWebSocket && !c->abortNotified) {
       c->abortNotified = true;
-      queueNotify(c->reqId, kNotifyAborted);
+      queueNotify(reqId, kNotifyAborted);
     }
-    globalRequests().erase(c->reqId);
     if (c->isWebSocket) {
       // A WebSocket torn down without an explicit wsClose (server shutdown, socket error) still owes JS exactly one onWsClose so wrappers/handlers don't leak. wsClosing guards against a double-fire.
       if (!c->wsClosing && cb_.onWsClose) {
@@ -3141,6 +4637,10 @@ class Server {
       }
       globalWebSockets().erase(c->wsId);
     }
+    // The callbacks above run application code, which may close the server:
+    // that closes every connection, this one included, and it must not be
+    // closed a second time here (libuv aborts on a handle closed twice).
+    if (tIsClosing(c)) return;
     conns_.erase(c);
     tCloseConn(c);
   }
@@ -3163,6 +4663,7 @@ class Server {
         wr = next;
       }
       c->ring.wqHead = c->ring.wqTail = nullptr;
+      delete static_cast<std::string*>(c->ring.held);
       if (uring_) uring_->release();
     } else if (kind_ == TransportKind::Epoll) {
       WriteReq* wr = static_cast<WriteReq*>(c->ep.wqHead);
@@ -3177,6 +4678,9 @@ class Server {
     delete c;
     // One fewer live transport handle; may complete a pending server shutdown.
     liveHandles_--;
+#if defined(__linux__)
+    if (acceptPaused_) resumeAccept();  // its descriptor is free again
+#endif
     checkFullyClosed();
   }
 
@@ -3217,8 +4721,14 @@ class Server {
     std::vector<Connection*> overdue;
     std::vector<Connection*> stalled;
     s->h2Reap();
+#if defined(__linux__)
+    if (s->acceptPaused_) s->resumeAccept();
+#endif
     for (Connection* c : s->conns_) {
       if (c->closing) continue;
+#if defined(__linux__)
+      if (s->kind_ == TransportKind::Uring) s->uringCheckPeer(c);
+#endif
       // Lingering close (closeAfterResponse): the peer has our FIN and owes
       // its own; one that never closes is cut at the deadline. Nothing of
       // ours is queued on such a connection, so no other timeout applies.
@@ -3257,17 +4767,46 @@ class Server {
         }
         c->lastWriteQueue = q;
       }
+      // The same budget for the response bytes an HTTP/2 peer keeps waiting
+      // behind its flow-control windows: the socket may be idle while they
+      // are, so its queue says nothing about them. Progress is some of them
+      // going out (the peer opened a window); writes of anything else - the
+      // answer to its PING - are not.
+      if (s->limits_.responseTimeoutMs && c->h2 != nullptr) {
+        const uint64_t sent = c->h2->heldSent();
+        if (c->h2->heldBytes() == 0 || sent != c->h2LastSent) {
+          c->h2HeldTicks = 0;
+        } else if (++c->h2HeldTicks >= respLimit) {
+          stalled.push_back(c);
+          continue;
+        }
+        c->h2LastSent = sent;
+      }
       // An HTTP/2 connection is busy while a handler holds one of its
       // requests; streams still waiting for the rest of a request are not
       // work in progress, and the idle timeout covers a peer that stalls them.
       if (c->isWebSocket || c->active || (c->h2 && c->h2->held() > 0)) continue;
-      if (s->limits_.idleTimeoutMs && ++c->idleTicks >= idleLimit) {
+      // A response still draining is not an idle connection, whether or not
+      // its request is still marked active (a response given inside a batch
+      // is complete once framed, with its bytes still queued): the peer is
+      // being sent to, and how long that may take is responseTimeoutMs'
+      // business, above - which also closes a peer that stops reading. With
+      // that budget disabled the idle timeout stays the only bound.
+      const bool draining = s->limits_.responseTimeoutMs && c->pendingWrites > 0;
+      if (!draining && s->limits_.idleTimeoutMs && ++c->idleTicks >= idleLimit) {
         stale.push_back(c);
         continue;
       }
+      // No request budget runs while intake is held for the peer to read
+      // (the rest of the request may be sitting in `pending`, unparsed), or
+      // once an error response has been queued.
+      if (c->outHeld || c->inputClosed) continue;
       if (s->limits_.requestTimeoutMs) {
         // A TLS handshake in progress counts as mid-request: the same requestTimeoutMs budget bounds handshake slow-drip (a stalled or byte-trickled ClientHello) with no extra knob.
-        bool mid = c->parser.midRequest() || (c->tls && !c->tls->handshakeDone());
+        // So does a cleartext connection whose first bytes are a part of the
+        // HTTP/2 preface still waiting for the rest.
+        bool mid = c->parser.midRequest() || (c->tls && !c->tls->handshakeDone()) ||
+                   (c->proto == 0 && !c->pending.empty());
         if (!mid)
           c->requestTicks = 0;
         else if (++c->requestTicks >= reqLimit)
@@ -3342,6 +4881,37 @@ class Server {
     unsigned nb = 0;
     if (an) bufs[nb++] = uv_buf_init(const_cast<char*>(a), static_cast<unsigned>(an));
     bufs[nb++] = uv_buf_init(const_cast<char*>(b), static_cast<unsigned>(bn));
+    return uv_try_write(reinterpret_cast<uv_stream_t*>(&c->handle), bufs, nb);
+  }
+
+  // tTryWrite2 with a third buffer behind the second (the bytes that close a
+  // chunk behind its data): one synchronous non-blocking write, nothing
+  // queued and nothing accounted, as there. Returns the bytes written across
+  // all three, UV_EAGAIN, or a negative errno.
+  long tTryWrite3(Connection* c, const char* a, size_t an, const char* b, size_t bn,
+                  const char* t, size_t tn) {
+#if defined(__linux__)
+    if (kind_ != TransportKind::Uv) {
+      const int fd = kind_ == TransportKind::Uring ? c->ring.fd : c->ep.fd;
+      struct iovec iov[3];
+      size_t n = 0;
+      if (an) iov[n++] = {const_cast<char*>(a), an};
+      iov[n++] = {const_cast<char*>(b), bn};
+      iov[n++] = {const_cast<char*>(t), tn};
+      struct msghdr msg {};
+      msg.msg_iov = iov;
+      msg.msg_iovlen = n;
+      const ssize_t r = ::sendmsg(fd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
+      if (r >= 0) return static_cast<long>(r);
+      if (errno == EAGAIN || errno == EWOULDBLOCK) return UV_EAGAIN;
+      return -errno;
+    }
+#endif
+    uv_buf_t bufs[3];
+    unsigned nb = 0;
+    if (an) bufs[nb++] = uv_buf_init(const_cast<char*>(a), static_cast<unsigned>(an));
+    bufs[nb++] = uv_buf_init(const_cast<char*>(b), static_cast<unsigned>(bn));
+    bufs[nb++] = uv_buf_init(const_cast<char*>(t), static_cast<unsigned>(tn));
     return uv_try_write(reinterpret_cast<uv_stream_t*>(&c->handle), bufs, nb);
   }
 
@@ -3429,6 +4999,30 @@ class Server {
     return uv_stream_get_write_queue_size(reinterpret_cast<uv_stream_t*>(&c->handle));
   }
 
+  // Response bytes handed to the transport and still held for it: what
+  // outputBacklogged() measures. On the engine's own transports that is the
+  // write queue, which keeps a write that has failed until the failure is
+  // acted on. On libuv it is the engine's own count of the writes whose
+  // callback has not run - not libuv's queue size, which no longer includes a
+  // write once the socket has taken or refused it (on Windows a write that
+  // fails at once is never in it), while its bytes are held here until the
+  // callback: the responses queued behind a reset would not be counted, and
+  // the requests pipelined behind them would all be answered into memory.
+  size_t tOutputHeld(Connection* c) {
+#if defined(__linux__)
+    if (kind_ == TransportKind::Uring) return c->ring.pendingBytes;
+    if (kind_ == TransportKind::Epoll) return c->ep.pendingBytes;
+#endif
+    return uvOutputHeld(c);
+  }
+  // (Out of line and through a volatile read, so that the compiler treats it
+  // as it treated the libuv call it stands in for. A plain load here was
+  // fetched ahead of the test that says whether it is wanted at all: five
+  // instructions on the path of every request, on every transport.)
+  MORO_NOINLINE static size_t uvOutputHeld(const Connection* c) {
+    return *static_cast<const volatile size_t*>(&c->uvQueued);
+  }
+
   bool tIsClosing(Connection* c) {
 #if defined(__linux__)
     if (kind_ == TransportKind::Uring) return c->ring.state >= 2;
@@ -3475,6 +5069,12 @@ class Server {
       *len = static_cast<int>(sl);
       return true;
     }
+    if (uvListenFd_ >= 0) {
+      socklen_t sl = static_cast<socklen_t>(*len);
+      if (::getsockname(uvListenFd_, reinterpret_cast<sockaddr*>(addr), &sl) != 0) return false;
+      *len = static_cast<int>(sl);
+      return true;
+    }
 #endif
     return uv_tcp_getsockname(&tcp_, reinterpret_cast<sockaddr*>(addr), len) == 0;
   }
@@ -3484,6 +5084,7 @@ class Server {
 #if defined(__linux__)
     if (kind_ == TransportKind::Uring) uringCloseListener();
     if (kind_ == TransportKind::Epoll) epollCloseListener();
+    if (kind_ == TransportKind::Uv) uvCloseListener();
 #endif
   }
 
@@ -3499,31 +5100,62 @@ class Server {
  public:
   // Public: the binding registers UringLoop::shutdownForThread as the
   // per-thread environment cleanup hook.
+  // The thread's event loops, kept in its ThreadState (thread_state.h), not
+  // in thread_locals of their own: UringLoop::slot and EpollLoop::slot hand
+  // out these fields.
+  struct UringLoop;
+  struct EpollLoop;
+  struct LoopSlots {
+    UringLoop* uring = nullptr;
+    EpollLoop* epoll = nullptr;
+  };
+  static LoopSlots& loopSlots() {
+    ThreadState& t = threadState();
+    if (t.loopSlots == nullptr) {
+      t.loopSlots = new LoopSlots();
+      t.freeLoopSlots = [](void* p) { delete static_cast<LoopSlots*>(p); };
+    }
+    return *static_cast<LoopSlots*>(t.loopSlots);
+  }
+
   struct UringLoop {
     uring::Ring<uring::LinuxSys> ring;
     uring::BufRing<uring::LinuxSys> bufs;
     uv_loop_t* loop = nullptr;
     uv_poll_t poll;
     uv_prepare_t prepare;
+    uv_idle_t undertaker;  // runs bury() from the loop for a dead ring (see die), retire() for an unused one
     int refs = 0;         // listening servers + live connections (ref/unref the poll handle)
     bool pollRef = false;
     bool dead = false;    // io_uring_enter started failing: no new uring work
-    bool inReap = false;
+    bool buried = false;  // ... and everything that lived on the ring has been released (bury)
+    bool retired = false; // unused and given back (retire): only its handles are still closing
+    UringLoop* older = nullptr;  // the ring this one took over from, while that one's handles are closing
+    uint8_t inReap = 0;   // 1 inside reap(); 2 once this pass has been given its number (passNo)
+    uint32_t passNo = 0;  // numbers the passes in which receive completions were counted (Server::uringCount)
+    // Connections that are closed and not freed yet: waiting for their
+    // cancel/close completions, or - on a dead ring - for bury(). Intrusive,
+    // through UringConn::closingPrev/closingNext.
+    Connection* closing = nullptr;
     int closedHandles = 0;
     int efd = -1;         // DEFER_TASKRUN: the registered eventfd the poll handle waits on
     bool woke = false;    // the eventfd fired since the last reap round
     std::vector<Connection*> rearm;  // multishot recvs to re-issue after a reap round
     std::unordered_set<Server*> servers;
     int emfileFd = -1;
+    // Receive pacing: the connections that went over the bound in one pass
+    // (Server::uringCount). The idle handle serves each of them once per
+    // loop turn (onPacer) and keeps the loop turning while there are any.
+    std::vector<Connection*> paced;
+    std::vector<Connection*> pacedTurn;  // onPacer's working copy, kept for its storage
+    uv_idle_t pacer;
+    bool pacerOn = false;
 
-    static UringLoop*& slot() {
-      static thread_local UringLoop* p = nullptr;
-      return p;
-    }
+    static UringLoop*& slot() { return loopSlots().uring; }
 
     static UringLoop* get(uv_loop_t* loop) {
       UringLoop*& s = slot();
-      if (s) return s->dead ? nullptr : s;
+      if (s && !s->retired) return s->dead ? nullptr : s;
       auto* u = new UringLoop();
       u->loop = loop;
       const uring::RingMode& mode = Server::uringModeSlot();
@@ -3560,11 +5192,16 @@ class Server {
       }
       u->prepare.data = u;
       uv_prepare_init(loop, &u->prepare);
+      u->undertaker.data = u;
+      uv_idle_init(loop, &u->undertaker);
+      u->pacer.data = u;
+      uv_idle_init(loop, &u->pacer);
       uv_prepare_start(&u->prepare, onPrepare);
       uv_unref(reinterpret_cast<uv_handle_t*>(&u->prepare));
       uv_poll_start(&u->poll, UV_READABLE, onReadable);
       uv_unref(reinterpret_cast<uv_handle_t*>(&u->poll));
       u->emfileFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+      u->older = s;  // a ring given back whose handles are still closing, if any (retire)
       s = u;
       return u;
     }
@@ -3578,10 +5215,82 @@ class Server {
       }
     }
     void release() {
-      if (--refs == 0 && pollRef) {
-        uv_unref(reinterpret_cast<uv_handle_t*>(&poll));
-        pollRef = false;
+      if (--refs == 0) {
+        if (pollRef) {
+          uv_unref(reinterpret_cast<uv_handle_t*>(&poll));
+          pollRef = false;
+        }
+        retireIfUnused();
       }
+    }
+
+    // No listener and no connection is left on this ring: the loop gives it
+    // back (retire), from the idle handle - this may be running inside a
+    // reap - unless a listener has arrived by then. A dead ring is kept: it
+    // is what tells later servers on this thread to use the epoll transport.
+    void retireIfUnused() {
+      if (refs == 0 && !dead && !retired) uv_idle_start(&undertaker, onUndertaker);
+    }
+
+    // The ring, its eventfd and the spare descriptor are closed here and
+    // now, so that a process that has closed its last server holds nothing
+    // of the transport's; the next listen() on this thread sets up a new
+    // ring (get). libuv has let go of the descriptors once uv_close() has
+    // returned; the object goes with the last of its handles, and stays
+    // reachable until then - as the thread's ring, or through `older` of the
+    // one that has taken its place - for shutdownForThread to wait for.
+    void retire() {
+      retired = true;
+      uv_close(reinterpret_cast<uv_handle_t*>(&poll), onRetiredHandleClosed);
+      uv_close(reinterpret_cast<uv_handle_t*>(&prepare), onRetiredHandleClosed);
+      uv_close(reinterpret_cast<uv_handle_t*>(&undertaker), onRetiredHandleClosed);
+      uv_close(reinterpret_cast<uv_handle_t*>(&pacer), onRetiredHandleClosed);
+      if (emfileFd >= 0) ::close(emfileFd);
+      if (efd >= 0) ::close(efd);
+      bufs.destroy(ring);
+      ring.close();
+    }
+    static void onRetiredHandleClosed(uv_handle_t* h) {
+      UringLoop* u = static_cast<UringLoop*>(h->data);
+      if (++u->closedHandles < 4) return;
+      UringLoop*& s = slot();
+      if (s == u) {
+        s = u->older;
+      } else {
+        for (UringLoop* p = s; p; p = p->older) {
+          if (p->older == u) {
+            p->older = u->older;
+            break;
+          }
+        }
+      }
+      delete u;
+    }
+
+    void linkClosing(Connection* c) {
+      c->ring.closingPrev = nullptr;
+      c->ring.closingNext = closing;
+      if (closing) closing->ring.closingPrev = c;
+      closing = c;
+      c->ring.closingLinked = true;
+    }
+    void unlinkClosing(Connection* c) {
+      if (!c->ring.closingLinked) return;
+      Connection* prev = static_cast<Connection*>(c->ring.closingPrev);
+      Connection* next = static_cast<Connection*>(c->ring.closingNext);
+      if (prev) prev->ring.closingNext = next;
+      else closing = next;
+      if (next) next->ring.closingPrev = prev;
+      c->ring.closingLinked = false;
+    }
+
+    // io_uring_enter. The sanitizer build has a fault point here, switched
+    // on by a test: a ring that refuses every enter from then on.
+    int enter(unsigned minComplete, uint32_t flags) {
+#if defined(MORO_ENGINE_TEST_FAULTS)
+      if (std::getenv("MORO_ENGINE_TEST_FAIL_URING_ENTER")) return -ENXIO;
+#endif
+      return ring.enter(minComplete, flags);
     }
 
     // Next SQE; the submission ring is flushed inline when full, so an SQE is
@@ -3598,7 +5307,7 @@ class Server {
     bool flush() {
       if (dead) return false;
       if (ring.pending() == 0) return true;
-      int r = ring.enter(0, 0);
+      int r = enter(0, 0);
       if (r < 0 && r != -EINTR && r != -EAGAIN && r != -EBUSY) {
         die();
         return false;
@@ -3606,12 +5315,100 @@ class Server {
       return true;
     }
 
-    void die() {
+    // The ring no longer takes submissions. From here on no SQE is handed
+    // out and nothing is entered or reaped. What lived on the ring is
+    // released by bury(), which closes and frees every connection and so
+    // needs a stack that holds none - and this may be running inside a write
+    // the application is making (an SQE was wanted and the queue was full),
+    // or inside the dispatch of a completion. So the loop does it, from an
+    // idle handle: started here, it runs before the loop can block again.
+    MORO_NOINLINE void die() {
       if (dead) return;
       dead = true;
       std::fprintf(stderr, "[morojs-engine] io_uring_enter failed; aborting io_uring connections on this thread\n");
+      uv_idle_start(&undertaker, onUndertaker);
+    }
+
+    static void onUndertaker(uv_idle_t* h) {
+      UringLoop* u = static_cast<UringLoop*>(h->data);
+      if (!u->dead) {
+        uv_idle_stop(&u->undertaker);
+        if (u->refs == 0) u->retire();  // (see retireIfUnused)
+        return;
+      }
+      u->bury();
+      u->freeClosing();  // also what was closed after the burial (uringCloseDead)
+      uv_idle_stop(&u->undertaker);
+    }
+
+    // Release everything that lived on a dead ring. No completion will be
+    // reaped again, so nothing here may wait for one.
+    MORO_NOINLINE void bury() {
+      if (buried) return;
+      buried = true;
+      rearm.clear();
+      uv_prepare_stop(&prepare);  // it reads the ring, which is about to go
+      // A CLOSE the kernel never took has not closed its descriptor.
+      ring.forEachUnsubmitted([](const uring::abi::io_uring_sqe& s) {
+        if (s.opcode == uring::abi::IORING_OP_CLOSE && s.fd >= 0) ::close(s.fd);
+      });
+      // Every live connection goes through the normal abort path (callbacks
+      // fire once); none is freed while that runs application code.
       std::vector<Server*> srvs(servers.begin(), servers.end());
+      for (Server* s : srvs) s->uringAbortAll();
+      // A connection accepted by a completion that was never reaped has no
+      // owner.
+      ring.forEachCqe([](const uring::abi::io_uring_cqe& c) {
+        if (uring::tagOf(c.user_data) == uring::kTagAccept && c.res >= 0) ::close(c.res);
+      });
+      // The kernel still holds every operation that was in flight: armed
+      // receives and accepts, a send waiting for its socket. Closing the
+      // ring cancels them, and only then are the buffers they point into
+      // freed, with the connections that were already waiting for
+      // completions when the ring died.
+      uv_poll_stop(&poll);
+      bufs.destroy(ring);
+      ring.close();
+      freeClosing();
+      // Servers that were listening carry on, on the epoll transport.
       for (Server* s : srvs) s->uringRingDied();
+    }
+
+    void freeClosing() {
+      while (closing) {
+        Connection* c = closing;
+        c->ring.state = 3;
+        c->ring.inflight = 0;
+        c->server->uringFreeIfDone(c);
+      }
+    }
+
+    void pace(Connection* c) {
+      paced.push_back(c);
+      if (!pacerOn) {
+        pacerOn = true;
+        uv_idle_start(&pacer, onPacer);
+      }
+    }
+    void unpace(Connection* c) {
+      auto it = std::find(paced.begin(), paced.end(), c);
+      if (it != paced.end()) paced.erase(it);
+      if (paced.empty() && pacerOn) {
+        pacerOn = false;
+        uv_idle_stop(&pacer);
+      }
+    }
+    // One service per paced connection per loop turn. Serving runs
+    // application code, which may close any connection (uringCloseConn takes
+    // it off `paced`); none is freed while this runs - that takes a reap or
+    // the undertaker - so the copy holds no dead pointer.
+    static void onPacer(uv_idle_t* h) {
+      UringLoop* u = static_cast<UringLoop*>(h->data);
+      u->pacedTurn.assign(u->paced.begin(), u->paced.end());
+      for (Connection* c : u->pacedTurn) {
+        if (c->ring.state == 0) c->server->uringServePaced(c);
+      }
+      u->pacedTurn.clear();
     }
 
     static void onPrepare(uv_prepare_t* h) {
@@ -3649,22 +5446,22 @@ class Server {
     // starve behind a busy ring.
     void reap() {
       if (inReap || dead) return;
-      inReap = true;
+      inReap = 1;
       for (int round = 0; round < 8 && !dead; round++) {
         if (woke || ring.pending() || ring.taskWorkPending() || ring.cqOverflowed()) {
           woke = false;
-          int r = ring.enter(0, uring::abi::IORING_ENTER_GETEVENTS);
+          int r = enter(0, uring::abi::IORING_ENTER_GETEVENTS);
           if (r < 0 && r != -EINTR && r != -EAGAIN && r != -EBUSY) {
             die();
             break;
           }
         }
-        unsigned n = ring.forEachCqe([this](const uring::abi::io_uring_cqe& c) { dispatch(c); });
+        unsigned n = ring.forEachCqeBatch([this](const uring::abi::io_uring_cqe& c, uint32_t batch) { dispatch(c, batch); });
         rearmStarved();
         if (n == 0 && ring.pending() == 0) break;
       }
       if (!dead && ring.pending()) flush();
-      inReap = false;
+      inReap = 0;
     }
 
     void rearmStarved() {
@@ -3676,12 +5473,16 @@ class Server {
       }
     }
 
-    void dispatch(const uring::abi::io_uring_cqe& cqe) {
+    void dispatch(const uring::abi::io_uring_cqe& cqe, uint32_t batch) {
       const uring::Tag t = uring::tagOf(cqe.user_data);
       void* p = uring::ptrOf(cqe.user_data);
       switch (t) {
         case uring::kTagRecv: {
           Connection* c = static_cast<Connection*>(p);
+          // The first completion a connection has in a batch is dispatched
+          // as it is; any further one is counted first (uringCount).
+          if (c->ring.seen != batch) c->ring.seen = batch;
+          else c->server->uringCount(c, cqe.res, batch);
           c->server->onRecvCqe(c, cqe);
           c->server->uringFreeIfDone(c);
           break;
@@ -3696,6 +5497,7 @@ class Server {
         case uring::kTagCancel: {
           Connection* c = static_cast<Connection*>(p);
           c->ring.inflight--;
+          c->ring.recvCancel = false;
           c->server->uringFreeIfDone(c);
           break;
         }
@@ -3722,13 +5524,24 @@ class Server {
     // the first uring server is created; runs AFTER every server's own
     // cleanup hook, so their cancel/close completions were reaped first).
     static void shutdownForThread() {
+      // A ring given back a moment ago still has handles closing.
+      if (UringLoop* r = slot()) {
+        uv_loop_t* l = r->loop;
+        while (slot() && (slot()->retired || slot()->older)) uv_run(l, UV_RUN_ONCE);
+      }
       UringLoop*& s = slot();
       if (!s) return;
       UringLoop* u = s;
       s = nullptr;
+      if (u->dead) {
+        u->bury();
+        u->freeClosing();
+      }
       uv_close(reinterpret_cast<uv_handle_t*>(&u->poll), onHandleClosed);
       uv_close(reinterpret_cast<uv_handle_t*>(&u->prepare), onHandleClosed);
-      while (u->closedHandles < 2) uv_run(u->loop, UV_RUN_ONCE);
+      uv_close(reinterpret_cast<uv_handle_t*>(&u->undertaker), onHandleClosed);
+      uv_close(reinterpret_cast<uv_handle_t*>(&u->pacer), onHandleClosed);
+      while (u->closedHandles < 4) uv_run(u->loop, UV_RUN_ONCE);
       if (u->emfileFd >= 0) ::close(u->emfileFd);
       if (u->efd >= 0) ::close(u->efd);  // the ring's registration dies with the ring
       u->bufs.destroy(u->ring);
@@ -3805,16 +5618,30 @@ class Server {
       // Out of descriptors: libuv's emfile trick - momentarily free the
       // reserve fd, accept + drop the pending connection (so the peer sees a
       // close instead of a hang), reopen the reserve.
-      if (uring_->emfileFd >= 0) {
+      // Every connection that is waiting goes, not just the one this
+      // completion was about: the next accept is armed later (below), and
+      // none of them should hang until then.
+      if (uring_->emfileFd >= 0 && listenFd_ >= 0) {
         ::close(uring_->emfileFd);
-        int fd = ::accept4(listenFd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if (fd >= 0) ::close(fd);
+        for (int i = 0; i < 1024; i++) {
+          int fd = ::accept4(listenFd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+          if (fd < 0) break;
+          ::close(fd);
+        }
         uring_->emfileFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
       }
+      // An accept armed now would fail again at once, with or without a
+      // connection waiting: the kernel reserves the descriptor before it
+      // looks at the queue. Re-arming on the spot is a loop that never
+      // sleeps for as long as the process stays at its limit, so the next
+      // accept is armed when a descriptor may be free again (resumeAccept).
+      pauseAccept();
+    } else if (res == -ENOBUFS || res == -ENOMEM) {
+      pauseAccept();
     }
     // -ECANCELED (listener closing) and other errors fall through: re-arm
     // only while still listening.
-    if (!more && !listenerArmed_ && !listenerClosed_ && !closeRequested_ && listenFd_ >= 0) uringArmAccept();
+    if (!more && !listenerArmed_ && !acceptPaused_ && !listenerClosed_ && !closeRequested_ && listenFd_ >= 0) uringArmAccept();
     uringListenerDoneCheck();
   }
 
@@ -3831,7 +5658,7 @@ class Server {
   }
 
   void uringArmRecv(Connection* c) {
-    if (c->ring.recvArmed || c->ring.state >= 2) return;
+    if (c->ring.recvArmed || c->ring.state != 1) return;
     uring::abi::io_uring_sqe* s = uring_->sqe();
     if (!s) return;
     uring::prepRecv(s, c->ring.fd, uring::kBufGroup, /*multishot=*/true);
@@ -3848,8 +5675,8 @@ class Server {
       c->ring.recvArmed = false;
       c->ring.inflight--;
     }
-    if (c->ring.state >= 2) {
-      if (hasBuf) uring_->bufs.recycle(bid);
+    if (c->ring.state != 1) {
+      uringSetAside(c, cqe.res, hasBuf, bid);  // closing: dropped; paced: held for its turn
       return;
     }
     if (cqe.res == -ENOBUFS) {
@@ -3872,6 +5699,161 @@ class Server {
     onTransportData(c, p, static_cast<size_t>(cqe.res));
     uring_->bufs.recycle(bid);
     if (!more && c->ring.state < 2) uring_->rearm.push_back(c);
+  }
+
+  // ---- receive pacing ----
+  // A multishot receive completes once per buffer for as long as its socket
+  // has bytes, and a reap dispatches every completion it finds: a peer that
+  // sends without pause had megabytes of its input - each small frame of it
+  // a call into the application - served in one pass, with every timer and
+  // every other connection waiting behind it. So what one connection is
+  // served in one pass is bounded, as it is on the epoll transport (one
+  // read, of this size, per socket per loop turn). The connection that goes
+  // over the bound is paced: its multishot receive is cancelled, the
+  // completions already posted for it are copied aside in order, and from
+  // then on the loop reads its socket itself, one buffer per turn
+  // (uringServePaced), until a read finds it empty and the multishot receive
+  // takes over again.
+  //
+  // Counting starts with a connection's second completion in one batch of a
+  // reap, which an ordinary exchange never has: its requests arrive one
+  // completion at a time. The first of each batch is taken as a full buffer.
+  static constexpr uint32_t kRecvPassBytes = 64 * 1024;
+
+  MORO_NOINLINE void uringCount(Connection* c, int res, uint32_t batch) {
+    if (c->ring.state != 1 || res <= 0) return;
+    // The pass is numbered when something is first counted in it: a reap
+    // that has no second completion for anybody pays nothing for this.
+    if (uring_->inReap == 1) {
+      uring_->inReap = 2;
+      uring_->passNo++;
+    }
+    const uint32_t pass = uring_->passNo;
+    if (c->ring.counted != pass) {
+      c->ring.counted = pass;
+      c->ring.countedIn = ~batch;
+      c->ring.passBytes = 0;
+    }
+    if (c->ring.countedIn != batch) {
+      c->ring.countedIn = batch;
+      c->ring.passBytes += uring::kBufSize;
+    }
+    c->ring.passBytes += static_cast<uint32_t>(res);
+    if (c->ring.passBytes > kRecvPassBytes) uringPace(c);  // this completion is the first one held
+  }
+
+  void uringPace(Connection* c) {
+    c->ring.state = 0;
+    uring_->pace(c);
+    uringCancelRecv(c);
+  }
+
+  // Back to the multishot receive.
+  void uringUnpace(Connection* c) {
+    c->ring.state = 1;
+    uring_->unpace(c);
+  }
+
+  void uringCancelRecv(Connection* c) {
+    if (!c->ring.recvArmed || c->ring.recvCancel) return;
+    uring::abi::io_uring_sqe* s = uring_->sqe();
+    if (!s) return;
+    uring::prepCancelUserData(s, uring::tag(c, uring::kTagRecv));
+    s->user_data = uring::tag(c, uring::kTagCancel);
+    c->ring.recvCancel = true;
+    c->ring.inflight++;
+  }
+
+  // A receive completion for a connection that is not being read through
+  // its multishot receive. Closing: nothing of it is wanted. Paced: its
+  // bytes wait for their turn behind the ones already held, and an EOF or
+  // an error behind those. (Never while uringServePaced is dispatching the
+  // held bytes: completions are reaped from the loop, not from inside it.)
+  MORO_NOINLINE void uringSetAside(Connection* c, int res, bool hasBuf, uint16_t bid) {
+    if (c->ring.state == 0) {
+      if (res > 0) {
+        if (!c->ring.held) c->ring.held = new std::string();
+        static_cast<std::string*>(c->ring.held)->append(reinterpret_cast<const char*>(uring_->bufs.at(bid)), static_cast<size_t>(res));
+      } else if (res != -ECANCELED && res != -ENOBUFS) {
+        c->ring.heldEof = true;
+      }
+    }
+    if (hasBuf) uring_->bufs.recycle(bid);
+  }
+
+  // A paced connection's turn (UringLoop::onPacer): the next buffer's worth
+  // of what is held for it, or - once that is gone and its multishot receive
+  // has ended - one read of its socket. May run application code and may
+  // close the connection.
+  void uringServePaced(Connection* c) {
+    if (std::string* held = static_cast<std::string*>(c->ring.held)) {
+      if (c->ring.heldOff < held->size()) {
+        const size_t n = std::min<size_t>(held->size() - c->ring.heldOff, kRecvPassBytes);
+        char* p = &(*held)[c->ring.heldOff];
+        c->ring.heldOff += n;
+        onTransportData(c, p, n);  // (the bytes stay where they are until a later turn, or freeConnection)
+        return;
+      }
+      delete held;
+      c->ring.held = nullptr;
+      c->ring.heldOff = 0;
+    }
+    if (c->ring.heldEof) {
+      uringUnpace(c);
+      c->ring.heldEof = false;
+      if (!c->ring.eofSeen) {
+        c->ring.eofSeen = true;
+        onTransportEof(c);
+      }
+      return;
+    }
+    if (c->ring.recvArmed) {
+      // Its last completion (the cancel's) has not been reaped: the kernel
+      // may still be reading for it, and two readers would take the bytes
+      // out of order.
+      uringCancelRecv(c);
+      return;
+    }
+    if (!readBuf_) {
+      readBuf_.reset(new char[kRecvPassBytes]);
+      readBufSize_ = kRecvPassBytes;
+    }
+    const ssize_t n = ::recv(c->ring.fd, readBuf_.get(), readBufSize_, MSG_DONTWAIT);
+    if (n > 0) {
+      onTransportData(c, readBuf_.get(), static_cast<size_t>(n));
+      // A short read emptied the socket: the burst is over.
+      if (static_cast<size_t>(n) < readBufSize_ && c->ring.state == 0) {
+        uringUnpace(c);
+        uringArmRecv(c);
+      }
+      return;
+    }
+    if (n < 0 && errno == EINTR) return;
+    uringUnpace(c);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      uringArmRecv(c);
+      return;
+    }
+    if (!c->ring.eofSeen) {
+      c->ring.eofSeen = true;
+      onTransportEof(c);
+    }
+  }
+
+  // A reset that reaches the socket together with the last bytes before it
+  // is not reported by a multishot receive on a DEFER_TASKRUN ring: the two
+  // wake-ups are one by the time the receive runs, it takes the bytes, finds
+  // the socket empty and goes back to waiting for a wake-up that has already
+  // happened. The connection would stay open, a WebSocket for good. So the
+  // sweep asks each socket that has received anything since it was last
+  // asked whether it has an error pending or has been hung up, and one that
+  // has is paced: the loop's own read finds what the receive did not.
+  void uringCheckPeer(Connection* c) {
+    if (c->ring.seen == c->ring.probed || c->ring.state != 1) return;
+    c->ring.probed = c->ring.seen;
+    struct pollfd p {};
+    p.fd = c->ring.fd;
+    if (::poll(&p, 1, 0) == 1 && (p.revents & (POLLERR | POLLHUP))) uringPace(c);
   }
 
   void uringQueueWrite(Connection* c, WriteReq* wr) {
@@ -3959,15 +5941,11 @@ class Server {
   // close().
   void uringCloseConn(Connection* c) {
     if (c->ring.state >= 2) return;
+    if (c->ring.state == 0) uring_->unpace(c);
     c->ring.state = 2;
-    if (uring_->dead || c->ring.fd < 0) {
-      // No ring to complete through: synchronous close, free when the
-      // (impossible now) in-flight count is zero.
-      if (c->ring.fd >= 0) ::close(c->ring.fd);
-      c->ring.fd = -1;
-      c->ring.state = 3;
-      c->ring.inflight = 0;
-      uringFreeIfDone(c);
+    uring_->linkClosing(c);
+    if (uring_->dead) {
+      uringCloseDead(c);
       return;
     }
     if (!c->finSent) ::shutdown(c->ring.fd, SHUT_WR);  // FIN now (unless it rode with the response); errors (peer already gone) are irrelevant
@@ -3982,15 +5960,34 @@ class Server {
       uring::prepClose(s, c->ring.fd);
       s->user_data = uring::tag(c, uring::kTagClose);
       c->ring.inflight++;
+      c->ring.fd = -1;
     } else {
+      uringCloseDead(c);  // the ring died under this very call
+    }
+  }
+
+  // Close a connection whose ring is dead: no completion will report it
+  // closed. The socket is shut down before its descriptor is closed: an
+  // operation the kernel still holds for it keeps the socket itself open
+  // until the ring is gone, and has to find nothing left to do - the peer
+  // gets its FIN now, and a send whose turn came would otherwise read a
+  // buffer that is about to be freed. The Connection is not freed here (the
+  // caller is using it, as on every other transport): the loop does that
+  // (UringLoop::onUndertaker).
+  void uringCloseDead(Connection* c) {
+    if (c->ring.fd >= 0) {
+      ::shutdown(c->ring.fd, SHUT_RDWR);
       ::close(c->ring.fd);
-      c->ring.state = 3;
     }
     c->ring.fd = -1;
+    uv_idle_start(&uring_->undertaker, UringLoop::onUndertaker);
   }
 
   void uringFreeIfDone(Connection* c) {
-    if (c->ring.state == 3 && c->ring.inflight == 0) freeConnection(c);
+    if (c->ring.state == 3 && c->ring.inflight == 0) {
+      uring_->unlinkClosing(c);
+      freeConnection(c);
+    }
   }
 
   void uringCloseListener() {
@@ -4029,20 +6026,81 @@ class Server {
     checkFullyClosed();  // may delete this
   }
 
-  // The ring died underneath us: every uring connection is torn down through
-  // the normal abort path (callbacks fire once), synchronously since no CQE
-  // will ever arrive again.
-  void uringRingDied() {
+  // The ring died underneath us (UringLoop::bury). First every connection
+  // is torn down through the normal abort path (callbacks fire once) ...
+  void uringAbortAll() {
     std::vector<Connection*> live(conns_.begin(), conns_.end());
     for (Connection* c : live) abortConnection(c);
-    if (listenFd_ >= 0) {
-      ::close(listenFd_);
-      listenFd_ = -1;
-      listenerClosing_ = true;
-      listenerInflight_ = 0;
-      uringListenerDoneCheck();
+  }
+
+  // ... then, with those freed, the listener: a server that is still
+  // listening keeps its socket and carries on on the epoll transport; one
+  // that was closing is done with its listener, whose completions will not
+  // come.
+  void uringRingDied() {
+    if (listenerReaped_) return;
+    if (listenFd_ >= 0 && !listenerClosing_ && !listenerClosed_ && !closeRequested_ &&
+        uringListenerToEpoll())
+      return;
+    if (listenFd_ >= 0) ::close(listenFd_);
+    listenFd_ = -1;
+    listenerClosing_ = true;
+    listenerInflight_ = 0;
+    uringListenerDoneCheck();
+  }
+
+  // The listening socket - bound, with whatever is waiting in its queue -
+  // moves to the epoll transport, and with it the server: every connection
+  // from here on is an epoll connection. None of the io_uring kind is left
+  // at this point (bury freed them), which is what lets kind_ change. The
+  // listener's count in liveHandles_ carries over (onListenPollClosed).
+  bool uringListenerToEpoll() {
+    EpollLoop* ep = EpollLoop::get(loop_);
+    listenPoll_.data = this;
+    if (!ep || uv_poll_init(loop_, &listenPoll_, listenFd_) != 0) return false;
+    uring_->servers.erase(this);
+    uring_->release();
+    listenerInflight_ = 0;
+    listenerArmed_ = false;
+    if (acceptPaused_) resumeAccept();  // (arms nothing: the ring is dead)
+    kind_ = TransportKind::Epoll;
+    epoll_ = ep;
+    if (ep->emfileFd < 0) ep->emfileFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ep->servers.insert(this);
+    uv_poll_start(&listenPoll_, UV_READABLE, onListenPoll);
+    return true;
+  }
+
+  // accept() failed for want of a descriptor or of memory, and trying again
+  // at once would fail the same way. Accepting stops (the epoll or libuv
+  // listener is no longer watched; no io_uring accept is armed) and starts again from
+  // the sweep, or as soon as one of this server's own connections has given
+  // its descriptor back (freeConnection). The sweep timer holds the loop
+  // meanwhile, as the watched listener did.
+  void pauseAccept() {
+    if (acceptPaused_) return;
+    acceptPaused_ = true;
+    if (kind_ == TransportKind::Epoll) uv_poll_stop(&listenPoll_);
+    if (kind_ == TransportKind::Uv) uvPauseAccept();
+    if (sweepActive_) uv_ref(reinterpret_cast<uv_handle_t*>(&sweepTimer_));
+  }
+  void resumeAccept() {
+    acceptPaused_ = false;
+    if (sweepActive_) uv_unref(reinterpret_cast<uv_handle_t*>(&sweepTimer_));
+    if (kind_ == TransportKind::Uv) {
+      uvResumeAccept();
+      return;
+    }
+    if (listenFd_ < 0 || listenerClosed_ || closeRequested_) return;
+    if (kind_ == TransportKind::Epoll) {
+      if (epoll_->emfileFd < 0) epoll_->emfileFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+      uv_poll_start(&listenPoll_, UV_READABLE, onListenPoll);
+    } else if (kind_ == TransportKind::Uring) {
+      if (uring_->emfileFd < 0) uring_->emfileFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+      if (!listenerArmed_) uringArmAccept();
     }
   }
+  bool acceptPaused_ = false;
 
   int listenFd_ = -1;
   uint32_t listenerInflight_ = 0;
@@ -4229,10 +6287,7 @@ class Server {
     }
     std::unordered_set<Server*> servers;
 
-    static EpollLoop*& slot() {
-      static thread_local EpollLoop* p = nullptr;
-      return p;
-    }
+    static EpollLoop*& slot() { return loopSlots().epoll; }
 
     static EpollLoop* get(uv_loop_t* loop) {
       EpollLoop*& s = slot();
@@ -4256,6 +6311,10 @@ class Server {
     void deferCompletion(Connection* c) {
       completions.push_back(c);
       armCheck();
+    }
+    void dropCompletion(Connection* c) {
+      auto it = std::find(completions.begin(), completions.end(), c);
+      if (it != completions.end()) completions.erase(it);
     }
     // One service per socket per loop turn. The watchers are level-triggered
     // and the poll phase only records what it is told, so a socket reported
@@ -4408,6 +6467,7 @@ class Server {
     }
     listenFd_ = fd;
     liveHandles_++;  // balanced in onListenPollClosed
+    if (epoll_->emfileFd < 0) epoll_->emfileFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);  // (given back with the last listener)
     epoll_->servers.insert(this);
     uv_poll_start(&listenPoll_, UV_READABLE, onListenPoll);
     return 0;
@@ -4434,6 +6494,15 @@ class Server {
             if (d >= 0) ::close(d);
             epoll_->emfileFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
           }
+          // Without the spare (something else in the process took the
+          // descriptor while it was lent out) the connection can be neither
+          // accepted nor dropped, and the listener would report it on every
+          // loop turn: a loop that never sleeps, for as long as the process
+          // stays at its limit. The listener is left alone until a
+          // descriptor may be free again (resumeAccept).
+          if (epoll_->emfileFd < 0) pauseAccept();
+        } else if (errno == ENOBUFS || errno == ENOMEM) {
+          pauseAccept();  // the same: the connection stays queued, and so would the event
         }
         break;  // EAGAIN or an error: nothing more to accept right now
       }
@@ -4472,15 +6541,22 @@ class Server {
   // libuv reports a socket error (POLLERR) as a negative status and stops
   // the watcher; a hang-up or half-close arrives as readable / disconnect and
   // recv() then says 0 or the error, which is the EOF path either way.
+  //
+  // An error does not mean there is nothing to read: what the peer sent
+  // before it reset the connection is still in the receive queue, and the
+  // kernel hands it over before it reports the reset. So the error is served
+  // as a read, like any other input - one buffer per loop turn - and the
+  // recv() that finds the queue empty is the one that ends the connection
+  // (epollOnConn). The watcher libuv stopped is started again for the turns
+  // that takes; the error is reported again on each of them.
+  static constexpr int kEpollError = 1 << 8;  // beside the uv_poll_event bits: this service follows an error report
   static void onConnPoll(uv_poll_t* h, int status, int events) {
     Connection* c = static_cast<Connection*>(h->data);
     if (c->ep.state >= 2) return;
     if (status < 0) {
-      if (!c->ep.eofSeen) {
-        c->ep.eofSeen = true;
-        c->server->onTransportEof(c);
-      }
-      return;
+      if (c->ep.eofSeen) return;
+      uv_poll_start(&c->ep.poll, UV_READABLE | UV_DISCONNECT | (c->ep.wantOut ? UV_WRITABLE : 0), onConnPoll);
+      events = UV_READABLE | kEpollError;
     }
     c->server->epoll_->deferReady(c, events);
   }
@@ -4496,7 +6572,9 @@ class Server {
   void epollOnConn(Connection* c, int events) {
     if (events & UV_WRITABLE) {
       epollFlush(c);
-      if (c->ep.state >= 2) return;
+      // A write that failed ends the connection in this turn's completion
+      // pass (epollCompleteWrites); nothing more is read from it.
+      if (c->ep.state >= 2 || c->ep.writeError) return;
     }
     if (!(events & (UV_READABLE | UV_DISCONNECT))) return;
     ssize_t n = ::recv(c->ep.fd, readBuf_.get(), readBufSize_, 0);
@@ -4506,7 +6584,9 @@ class Server {
       onTransportData(c, readBuf_.get(), static_cast<size_t>(n));
       return;
     }
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+    // (An error report that recv() has nothing to say about would be
+    // reported again on every turn: it ends the connection, as it always did.)
+    if (n < 0 && (errno == EINTR || ((errno == EAGAIN || errno == EWOULDBLOCK) && !(events & kEpollError))))
       return;  // a half-close with the receive queue drained: the FIN arrives as recv() == 0 next
     if (!c->ep.eofSeen) {
       c->ep.eofSeen = true;
@@ -4532,10 +6612,16 @@ class Server {
   // Push the write queue as far as the socket takes it, in order. Nothing is
   // completed here: a fully-sent WriteReq stays at the head (pendingWrites
   // keeps later writes on the ordered queue) until epollCompleteWrites runs
-  // on a clean stack. A hard socket error drops the queue and aborts the
-  // connection (no JS re-entry on that path).
+  // on a clean stack. Nor is the connection torn down here for a hard socket
+  // error (the peer reset it): this may be running inside a write the
+  // application is making right now, and the teardown of a WebSocket calls
+  // onWsClose - inside wsSend() the binding may be reading the payload
+  // straight out of the V8 heap, where no JS may run. The error is kept
+  // (writeError) and epollCompleteWrites acts on it in the same loop turn,
+  // on a clean stack: where the uv and uring transports deliver a failed
+  // write. Until then the queue only collects what is written to it.
   void epollFlush(Connection* c) {
-    if (c->ep.state >= 2 || c->ep.inFlush) return;
+    if (c->ep.state >= 2 || c->ep.inFlush || c->ep.writeError) return;
     c->ep.inFlush = true;
     bool anyDone = false;
     for (WriteReq* wr = static_cast<WriteReq*>(c->ep.wqHead); wr; wr = wr->next) {
@@ -4551,11 +6637,8 @@ class Server {
           epollWantOut(c, true);
           break;
         }
-        const int e = -errno;
-        c->ep.inFlush = false;
-        epollDropQueue(c);
-        completeWrite(c, false, e);  // -> abortConnection
-        return;
+        c->ep.writeError = -errno;
+        break;
       }
       wr->sent += static_cast<size_t>(r);
       c->ep.pendingBytes -= static_cast<size_t>(r) < c->ep.pendingBytes ? static_cast<size_t>(r) : c->ep.pendingBytes;
@@ -4567,7 +6650,7 @@ class Server {
     }
     c->ep.inFlush = false;
     if (c->ep.wantOut && c->ep.pendingBytes == 0) epollWantOut(c, false);
-    if (anyDone && !c->ep.completionPending) {
+    if ((anyDone || c->ep.writeError) && !c->ep.completionPending) {
       c->ep.completionPending = true;
       epoll_->deferCompletion(c);
     }
@@ -4575,9 +6658,17 @@ class Server {
 
   // Clean stack only (EpollLoop::settle): pop every fully-sent WriteReq from
   // the head, in order, and run its completion - a terminal one finishes the
-  // response and may surface the next pipelined request.
+  // response and may surface the next pipelined request. A write that failed
+  // (epollFlush) ends the connection instead: the queue is dropped, nothing
+  // on it is completed, and the connection is aborted.
   void epollCompleteWrites(Connection* c) {
     c->ep.completionPending = false;
+    if (c->ep.writeError) {
+      const int e = c->ep.writeError;
+      epollDropQueue(c);
+      completeWrite(c, false, e);  // -> abortConnection
+      return;
+    }
     while (WriteReq* wr = static_cast<WriteReq*>(c->ep.wqHead)) {
       if (wr->sent < wr->data.size()) break;
       const bool terminal = wr->terminal;
@@ -4609,6 +6700,15 @@ class Server {
   void epollCloseConn(Connection* c) {
     if (c->ep.state >= 2) return;
     c->ep.state = 2;
+    // A completion still waiting for the check pass is taken back. Queued
+    // from the poll phase it is served in the same loop turn, before any
+    // close callback frees a Connection; queued after that turn's check pass
+    // (a write made from setImmediate) it waits for the next turn, and a
+    // connection closed in between is freed first.
+    if (c->ep.completionPending) {
+      c->ep.completionPending = false;
+      epoll_->dropCompletion(c);
+    }
     uv_poll_stop(&c->ep.poll);
     uv_close(reinterpret_cast<uv_handle_t*>(&c->ep.poll), onConnPollClosed);
   }
@@ -4634,6 +6734,12 @@ class Server {
       s->listenFd_ = -1;
     }
     s->epoll_->servers.erase(s);
+    // The spare descriptor is for listeners: with the last of them gone it
+    // goes back to the process (epollListen opens it again).
+    if (s->epoll_->servers.empty() && s->epoll_->emfileFd >= 0) {
+      ::close(s->epoll_->emfileFd);
+      s->epoll_->emfileFd = -1;
+    }
     s->liveHandles_--;
     s->checkFullyClosed();  // may delete s
   }
@@ -4653,7 +6759,9 @@ class Server {
   // free), and the binding resolves reqIds through the registry anyway.
   // kNotifyWsShed carries a wsId, not a reqId: a WebSocket that wsSend()
   // found past wsBackpressureLimit, closed with 1013 on this later turn.
-  enum : uint8_t { kNotifyAborted = 0, kNotifyWritable = 1, kNotifyWsShed = 2 };
+  // kNotifyWsGone carries a wsId too: a WebSocket whose send could not be
+  // completed (closeForFailedSend), torn down on this later turn - 1006.
+  enum : uint8_t { kNotifyAborted = 0, kNotifyWritable = 1, kNotifyWsShed = 2, kNotifyWsGone = 3 };
   struct PendingNotify {
     uint32_t reqId;
     uint8_t kind;
@@ -4678,6 +6786,11 @@ class Server {
     if (kind == kNotifyWsShed) {
       Connection* c = lookupWs(reqId);
       if (c && !c->wsClosing && !c->closing) wsClose(c, 1013, "", 0);
+      return;
+    }
+    if (kind == kNotifyWsGone) {
+      Connection* c = lookupWs(reqId);
+      if (c && !c->closing) doClose(c);
       return;
     }
     if (kind == kNotifyAborted) {
@@ -4735,20 +6848,35 @@ class Server {
   bool batchOn_ = false;
   bool wsAutoUpgrade_ = false;
   uint32_t* batchControl_ = nullptr;
+  // The connection whose HTTP/1 batch JS is looping over right now (null
+  // outside onRequestBatch, and from the moment JS returns from it).
+  Connection* batchLoopConn_ = nullptr;
   // Keyed by path and looked up with the Connection's own std::string, so the
   // hot path allocates nothing. One or two methods per path in any real app,
   // so the per-path vector is scanned linearly.
   std::unordered_map<std::string, std::vector<StaticRoute>> staticRoutes_;
   std::vector<ParamRoute> paramRoutes_;
+  uint32_t routeGen_ = 1;  // see routesChanged()
 
   // Per-loop scratch that used to be thread_local (see refreshHttpDateLine
   // and onAlloc): a Server is one per loop thread, so members are the same
   // ownership without the TLS indirection on every read and response.
   std::string dateCache_;
   time_t dateCachedAt_ = 0;
+  // The calling thread's request registry and id counter, likewise: looked
+  // up once here instead of through a TLS descriptor call (two for the map,
+  // which carries an initialisation guard) on every id, insert and erase. A
+  // Server is created, used and destroyed on one thread.
+  FlatReqMap* const reqMap_ = &globalRequests();
+  uint32_t* const reqCounter_ = &globalReqCounter();
   // Ciphertext of the TLS response being written (tlsWrite): one buffer per
   // loop, reused across responses, so a TLS reply allocates nothing.
   std::string cipherScratch_;
+  // Where wsSend deflates a message (the frame is built from it before the
+  // call returns). Capacity over kCipherScratchKeep is released after use.
+  std::string deflateScratch_;
+  TlsGather tlsGather_;        // the small TLS replies of the batch in progress (tlsCork)
+  uint32_t tlsGatherSeq_ = 0;  // the last ticket given out
   std::vector<std::string> bodyPool_;  // empty strings with capacity; see HttpParser::bodyPool
 
   // HTTP/2 (see the "HTTP/2" section).
@@ -4758,6 +6886,8 @@ class Server {
   size_t h2BatchBase_ = 0;               // where the batch call in progress starts in h2Batch_
   uint32_t h2BatchGen_ = 0;              // identifies the latest batch call
   bool h2InBatchCall_ = false;           // onRequestBatch is on the stack for an HTTP/2 batch
+  bool h2LoopOpen_ = false;              // ... and JS is still inside its loop over that batch
+  Connection* h2BatchParent_ = nullptr;  // the connection h2Batch_ is being dispatched for
   std::vector<std::pair<uint32_t, Connection*>> h2Waiters_;  // (reqId, connection) waiting for the socket to drain
   std::string h2Block_;                  // header block under construction
   std::string h2Date_;                   // the Date field, encoded; rebuilt with the Date cache
@@ -4783,8 +6913,14 @@ class Server {
   int liveHandles_ = 0;
   bool closeRequested_ = false;
   bool listenerClosed_ = false;  // stopListening() already closed the listener
+  bool listenUp_ = false;        // listen() succeeded: this server has its listener
   void (*onClosed_)(void*) = nullptr;
   void* onClosedUser_ = nullptr;
+  // libuv transport, streams stopped for the rest of a turn (uvStopReading).
+  std::vector<Connection*> uvStopped_;
+  uv_check_t uvResume_{};
+  bool uvResumeInit_ = false;  // uvResume_ is an open handle (counted in liveHandles_)
+  bool uvResumeOn_ = false;    // ... and started
 
  public:
   ServerCallbacks& callbacks() { return cb_; }
