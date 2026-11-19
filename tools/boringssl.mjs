@@ -201,6 +201,37 @@ export function llvmTool(cxx, tool) {
   return null;
 }
 
+// Whether a compiler is GCC: `cxx`, or the `c++` cmake picks when none is
+// named. clang also answers to g++-style options and may be installed under
+// that name, so the compiler is asked, not its name read.
+function isGcc(cxx) {
+  try {
+    const version = execFileSync(cxx ?? 'c++', ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return /Free Software Foundation/.test(version) && !/clang/i.test(version);
+  } catch {
+    return false;
+  }
+}
+
+// One line that names the compiler a build log came from: its version and,
+// for GCC, the instruction set it compiles for when no -march is given (what
+// its vectoriser may use, and so which of its warnings can fire).
+function describeCompiler(cxx) {
+  const text = (args) => {
+    try {
+      return execFileSync(cxx ?? 'c++', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch {
+      return '';
+    }
+  };
+  const version = text(['--version']).split('\n')[0].trim();
+  if (!version) return null;
+  if (!isGcc(cxx)) return version;
+  const target = text(['-Q', '--help=target']);
+  const march = /^\s*-march=\s+(\S+)/m.exec(target)?.[1];
+  return `${version}${march ? `, default -march=${march}` : ''}${/^\s*-mavx2\s+\[enabled\]/m.test(target) ? ', AVX2 on' : ''}`;
+}
+
 // The C compiler that goes with a C++ compiler: clang++-18 -> clang-18,
 // g++ -> gcc, /opt/homebrew/opt/llvm/bin/clang++ -> .../clang.
 function cCompilerFor(cxx) {
@@ -241,10 +272,6 @@ export function ensureBoringSsl({ arch, cxx = null, lto = false, pgo = '', pgoDi
     // upstream compiles with -Werror, and a toolchain that predefines
     // _FORTIFY_SOURCE would otherwise fail on the redefinition.
     const hardening = '-fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2';
-    // lto (tools/build.mjs asks for it, clang only): the objects are LLVM
-    // bitcode, so the engine's link optimises the library's C and C++
-    // together with the engine (the assembly is untouched), and the archives
-    // need LLVM's ar to get a symbol table.
     // What tools/build.mjs asks for on top (clang only). lto: the objects are
     // LLVM bitcode, so a later link optimises the library's C and C++ as one
     // (the assembly is untouched), and the archives need LLVM's ar to get a
@@ -255,6 +282,17 @@ export function ensureBoringSsl({ arch, cxx = null, lto = false, pgo = '', pgoDi
     if (lto) extra.push('-flto');
     if (pgo === 'generate') extra.push(`-fprofile-generate=${pgoDir}`);
     if (pgo === 'use') extra.push(`-fprofile-use=${pgoProfile}`, '-Wno-profile-instr-out-of-date', '-Wno-profile-instr-unprofiled', '-Wno-backend-plugin');
+    // GCC only: its -Wstringop-overflow is computed after vectorisation, and
+    // where the vectoriser widens a short byte loop it reports the vector
+    // store as an overflow of the buffer the scalar loop stays inside
+    // (crypto/fipsmodule/keccak: "writing 16 bytes into a region of size 9",
+    // g++ 13 and 14 on x86-64 once AVX2 is enabled). Upstream compiles with
+    // -Werror and is developed with clang, so that false positive stopped
+    // every g++ build. It stays a warning in the build log; -Wno-error=<name>
+    // is the one form GCC honours whatever -Werror follows it on the command
+    // line. clang never sees it (its own -Werror is as upstream sets it), and
+    // the release binaries are built with clang.
+    if (isGcc(cxx)) extra.push('-Wno-error=stringop-overflow');
     const hidden = ['-fvisibility=hidden -ffunction-sections -fdata-sections', hardening, ...extra].join(' ');
     config.push(`-DCMAKE_C_FLAGS=${hidden}`, `-DCMAKE_CXX_FLAGS=${hidden} -fvisibility-inlines-hidden`);
     if (lto) {
@@ -299,6 +337,8 @@ export function ensureBoringSsl({ arch, cxx = null, lto = false, pgo = '', pgoDi
   if (existsSync(stamp) && result.libs.every(existsSync)) return result;
 
   console.log(`  boringssl: building ${pin.tag} for ${platform}/${arch}${libcTag()} (${ninja ? 'ninja' : 'make'}) -> ${out}`);
+  const compiler = platform === 'win32' ? null : describeCompiler(cxx);
+  if (compiler) console.log(`  boringssl: compiler: ${compiler}`);
   rmSync(out, { recursive: true, force: true });
   mkdirSync(out, { recursive: true });
   // Upstream's configure step is chatty (it also configures test-only
