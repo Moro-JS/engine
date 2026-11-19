@@ -3801,11 +3801,11 @@ class Server {
   //    is added to the stream's state; the bytes stay in the socket and are
   //    reported on the next turn.
   //  - Windows: the stream stops reading (uv_read_stop ends libuv's loop over
-  //    it and leaves no read queued) and is started again from the check
-  //    phase of the same turn (onUvResume), so that its next read is the next
-  //    turn's. Declining a buffer there would lean on how libuv's IOCP code
-  //    happens to queue its reads; stopping and starting is its documented
-  //    interface.
+  //    it and leaves no read queued) and is started again from an idle handle
+  //    (onUvResume), so that its next read comes after the loop has been
+  //    round to its timers. Declining a buffer there would lean on how
+  //    libuv's IOCP code happens to queue its reads; stopping and starting is
+  //    its documented interface.
   // The second way works everywhere, and MORO_ENGINE_TEST_UV_READ_RESTART=1
   // (read once; for tests) selects it on POSIX too, so that what Windows runs
   // is run where the suites are.
@@ -3849,29 +3849,36 @@ class Server {
     uvStopped_.push_back(c);
     if (!uvResumeInit_) {
       uvResume_.data = this;
-      uv_check_init(loop_, &uvResume_);
+      uv_idle_init(loop_, &uvResume_);
       uvResumeInit_ = true;
       liveHandles_++;  // balanced by onServerHandleClosed (close())
     }
-    // Active only while a stream is stopped, and a reference on the loop for
-    // that long: a stopped stream holds none of its own.
+    // An idle handle, active only while a stream is stopped. It has to be
+    // one: a loop with an idle handle does not wait in its poll, and with a
+    // stream stopped it must not. On Windows libuv runs a read callback from
+    // the completions it works through before the poll, as well as after it;
+    // a stream stopped there, with a handle of any other kind to start it
+    // again, sat behind a poll that waited for the next timer or for some
+    // other socket - 64 KiB of a large upload per wake-up. (It is also what
+    // keeps the loop alive for that long: a stopped stream holds no
+    // reference of its own.)
     if (!uvResumeOn_) {
       uvResumeOn_ = true;
-      uv_check_start(&uvResume_, onUvResume);
+      uv_idle_start(&uvResume_, onUvResume);
     }
   }
 
-  // The check phase of the turn in which streams were stopped: each is
-  // started again unless it has been closed meanwhile. A closed connection
-  // has left conns_ (doClose) and is not touched; its memory is freed by the
-  // close callback, later in the loop, and should that order ever be another
-  // one the address is at worst that of a newer connection, which is reading
-  // already (UV_EALREADY). A stream that cannot be started again is ended
-  // like one whose read failed: none is left stopped.
-  static void onUvResume(uv_check_t* h) {
+  // The idle phase after streams were stopped (the same loop turn on
+  // Windows when the read came before the poll, the next turn otherwise):
+  // each is started again unless it has been closed meanwhile. A closed
+  // connection has left conns_ (doClose) and is not touched, freed or not;
+  // an address that has since become a newer connection's names a stream
+  // that is reading already (UV_EALREADY). A stream that cannot be started
+  // again is ended like one whose read failed: none is left stopped.
+  static void onUvResume(uv_idle_t* h) {
     Server* s = static_cast<Server*>(h->data);
     s->uvResumeOn_ = false;
-    uv_check_stop(&s->uvResume_);
+    uv_idle_stop(&s->uvResume_);
     std::vector<Connection*> list;
     list.swap(s->uvStopped_);
     for (Connection* c : list) {
@@ -6918,7 +6925,7 @@ class Server {
   void* onClosedUser_ = nullptr;
   // libuv transport, streams stopped for the rest of a turn (uvStopReading).
   std::vector<Connection*> uvStopped_;
-  uv_check_t uvResume_{};
+  uv_idle_t uvResume_{};
   bool uvResumeInit_ = false;  // uvResume_ is an open handle (counted in liveHandles_)
   bool uvResumeOn_ = false;    // ... and started
 

@@ -203,7 +203,7 @@ describe('one connection\'s share of a loop turn', { skip }, () => {
 
   // The libuv transport has two ways of keeping a stream to one read per
   // turn, and Windows uses the one the other platforms do not: the stream
-  // stops reading and is started again from the same turn's check phase.
+  // stops reading and an idle handle starts it again.
   // MORO_ENGINE_TEST_UV_READ_RESTART=1 selects it here as well, so the same
   // flood, in a process of its own with that set, runs the code Windows runs:
   // every message arrives, in order (a counter in each), a read's worth per
