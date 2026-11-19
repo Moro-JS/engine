@@ -309,3 +309,58 @@ describe('input received ahead of a reset', { skip: skip || keptAcrossReset }, (
     }
   });
 });
+
+// A reset the kernel knows of and the loop has not reported yet: every piece
+// a handler goes on writing is a send that fails. The pieces are held until
+// the failure is acted on, on a later pass of the loop, so they count
+// against the write high-water mark like any other output the peer has not
+// taken, and write() says there is no room - the same answer on every
+// transport. On Windows the engine counts them itself: libuv's queue size
+// there never includes a write the socket has refused, and by that size
+// alone a handler that writes for as long as write() returns true is never
+// stopped.
+describe('output written after a reset', { skip }, () => {
+  const PIECE = Buffer.alloc(65536, 0x73);
+  const CAP = 400;  // 25 MB, if nothing stops the handler
+  const until = async (cond, what) => {
+    for (let i = 0; i < 300 && !cond(); i++) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(cond(), what);
+  };
+
+  it('write() stops reporting room, and the request is then aborted, once', T, async () => {
+    let client;
+    let taken = -1;
+    let aborted = 0;
+    const sid = engine.serve(
+      {
+        onRequest(reqId) {
+          engine.writeHead(reqId, 200, null);
+          client.resetAndDestroy();
+          // The reset crosses the loopback while this thread, which is the
+          // server's loop too, waits without running it.
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+          let n = 0;
+          while (n < CAP && engine.write(reqId, PIECE)) n++;
+          taken = n;
+        },
+        onAborted() { aborted++; },
+        onWritable() {},
+      },
+      {}
+    );
+    try {
+      const port = engine.listen(sid, '127.0.0.1', 0);
+      client = net.connect(port, '127.0.0.1');
+      client.on('error', () => {});
+      client.write('GET / HTTP/1.1\r\nHost: t\r\n\r\n');
+      await until(() => taken >= 0, 'the handler ran');
+      // The default high-water mark is four of these pieces.
+      assert.ok(taken < 8, `${taken} pieces of 64 KiB were taken for a peer that is gone`);
+      await until(() => aborted === 1, 'the reset aborted the request');
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(aborted, 1);
+    } finally {
+      engine.close(sid);
+    }
+  });
+});

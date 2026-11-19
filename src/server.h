@@ -440,10 +440,11 @@ struct Connection {
   uint32_t h2HeldTicks = 0;
   uint64_t h2LastSent = 0;
 
-  // Idle-sweep bookkeeping: reset to 0 on every read, incremented each sweep while not actively running a handler; closed when it exceeds the limit.
   // libuv transport: the bytes of the writes handed to uv_write() whose
-  // callback has not run (Server::tOutputHeld).
+  // callback has not run (Server::tOutputHeld; on Windows the whole of
+  // Server::tPendingBytes).
   size_t uvQueued = 0;
+  // Idle-sweep bookkeeping: reset to 0 on every read, incremented each sweep while not actively running a handler; closed when it exceeds the limit.
   uint32_t idleTicks = 0;
   // Request-timeout bookkeeping: incremented each sweep while a request is partially received; NOT reset by activity (slow-drip defense), only when the request completes or the connection goes back to idle keep-alive.
   uint32_t requestTicks = 0;
@@ -2056,8 +2057,7 @@ class Server {
   // send that cannot be completed. Queued instead, the frame would wait for
   // the transport to report the failure on a later pass of the loop, and
   // until then every further frame for this socket - the replies to a whole
-  // read's worth of messages - would be held behind it, uncounted on a
-  // transport whose queue size no longer includes a write that has failed.
+  // read's worth of messages - would be copied and held behind it.
   // Only the errors that say the peer is gone; any other keeps the queued
   // path, as does a socket already in its closing handshake (its Close
   // frame is the last thing written to it).
@@ -4998,21 +4998,40 @@ class Server {
 
   // Bytes queued for the socket that the kernel has not accepted yet - the
   // backpressure and slow-read-progress signal at every one of its readers.
+  // A write that has failed stays in it until the failure is acted on, on a
+  // later pass of the loop: until then it is all that tells a handler which
+  // is still writing to stop. The engine's own queues keep such a write, and
+  // so does libuv's queue size everywhere but on Windows. There libuv counts
+  // only a send the kernel has left pending: one the socket refuses outright
+  // (the peer has reset the connection) is never in the size, nor is one it
+  // takes at once, though the bytes of both are held until their callbacks.
+  // By that size a handler which streams for as long as write() returns true
+  // is never told to wait once its client has gone, and every piece it goes
+  // on to write is copied and kept; a WebSocket being sent to is in the same
+  // position, and the limits on what may be queued for one connection see
+  // none of it. So on Windows the size is the engine's own count of the
+  // writes whose callback has not run (Connection::uvQueued). It differs
+  // from libuv's only by those two kinds of write, and like libuv's it gets
+  // smaller exactly when a write completes.
   size_t tPendingBytes(Connection* c) {
 #if defined(__linux__)
     if (kind_ == TransportKind::Uring) return c->ring.pendingBytes;
     if (kind_ == TransportKind::Epoll) return c->ep.pendingBytes;
 #endif
+#if defined(_WIN32)
+    return c->uvQueued;
+#else
     return uv_stream_get_write_queue_size(reinterpret_cast<uv_stream_t*>(&c->handle));
+#endif
   }
 
   // Response bytes handed to the transport and still held for it: what
   // outputBacklogged() measures. On the engine's own transports that is the
   // write queue, which keeps a write that has failed until the failure is
   // acted on. On libuv it is the engine's own count of the writes whose
-  // callback has not run - not libuv's queue size, which no longer includes a
-  // write once the socket has taken or refused it (on Windows a write that
-  // fails at once is never in it), while its bytes are held here until the
+  // callback has not run - not libuv's queue size, which no longer includes
+  // what the socket has taken of a write (and on Windows never includes a
+  // write that fails at once), while its bytes are held here until the
   // callback: the responses queued behind a reset would not be counted, and
   // the requests pipelined behind them would all be answered into memory.
   size_t tOutputHeld(Connection* c) {

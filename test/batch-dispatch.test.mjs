@@ -1254,8 +1254,8 @@ describe('batch buffers and staged ids over time', { skip }, () => {
 // at the socket; that response, and any queued behind it before the failure
 // is acted on, still count as output the peer has not taken, so the requests
 // behind are not handed over to be answered into memory. (The engine counts
-// those bytes itself on the libuv transport: libuv's own queue size leaves a
-// write out once the socket has refused it, on Windows from the start.)
+// those bytes itself on the libuv transport: on Windows libuv's own queue
+// size never includes a write the socket has refused.)
 describe('batched dispatch and a peer that has reset the connection', { skip }, () => {
   const MB = 1024 * 1024;
   const BIG = Buffer.alloc(MB, 0x61);
