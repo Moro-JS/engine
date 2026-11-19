@@ -495,7 +495,8 @@ jobs:
   # 2.28 and later, Node.js's own floor (built on the runner, they needed
   # 2.35). tools/linux-gnu-build.sh installs the toolchain, runs the build
   # with the runner's Node mounted at /opt/node, and fails if a binary needs
-  # a newer glibc. The smoke jobs below load the binaries on the runners.
+  # a newer glibc. The job then loads the binaries it built on the runner,
+  # under every supported Node.js (a plain Ubuntu, not the build image).
   linux-gnu:
     strategy:
       matrix:
@@ -524,9 +525,56 @@ jobs:
           docker run --rm -e MORO_BORINGSSL_PIN -v "$PWD:/repo" -w /repo -v "$(dirname "$(dirname "$(command -v node)")"):/opt/node:ro" \
             "$IMAGE" sh tools/linux-gnu-build.sh node tools/build.mjs --all
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: built
         with:
           name: ${{ inputs.artifact_prefix }}binaries-linux-${{ matrix.arch }}-gnu
           path: build/*.node
+      # Load smoke on the runner that built them, one step per Node.js: a job
+      # of its own each queued for a runner and downloaded the binaries to run
+      # for seconds. The steps run whatever an earlier one did, so one run
+      # reports every version; a failed build stops the job.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 20
+      - name: Smoke linux-${{ matrix.arch }}-gnu, Node 20
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 22
+      - name: Smoke linux-${{ matrix.arch }}-gnu, Node 22
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 23
+      - name: Smoke linux-${{ matrix.arch }}-gnu, Node 23
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 24
+      - name: Smoke linux-${{ matrix.arch }}-gnu, Node 24
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 25
+      - name: Smoke linux-${{ matrix.arch }}-gnu, Node 25
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 26
+      - name: Smoke linux-${{ matrix.arch }}-gnu, Node 26
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
 
   # Musl builds run the Alpine container via explicit `docker run`, not
   # `container:`: JS actions (checkout/upload-artifact) inside Alpine
@@ -553,9 +601,30 @@ jobs:
           docker run --rm -e MORO_BORINGSSL_PIN -v "$PWD:/repo" -w /repo node:24-alpine \
             sh -c "apk add --no-cache build-base clang lld llvm cmake git linux-headers && node tools/build.mjs --all"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: built
         with:
           name: ${{ inputs.artifact_prefix }}binaries-linux-${{ matrix.arch }}-musl
           path: build/*.node
+      # Load smoke in Alpine under every supported Node.js, on the runner that
+      # built them (as in linux-gnu above).
+      - name: Smoke linux-${{ matrix.arch }}-musl in Alpine, Node 20
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: docker run --rm -v "$PWD:/repo" -w /repo node:20-alpine node test/smoke.mjs
+      - name: Smoke linux-${{ matrix.arch }}-musl in Alpine, Node 22
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: docker run --rm -v "$PWD:/repo" -w /repo node:22-alpine node test/smoke.mjs
+      - name: Smoke linux-${{ matrix.arch }}-musl in Alpine, Node 23
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: docker run --rm -v "$PWD:/repo" -w /repo node:23-alpine node test/smoke.mjs
+      - name: Smoke linux-${{ matrix.arch }}-musl in Alpine, Node 24
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: docker run --rm -v "$PWD:/repo" -w /repo node:24-alpine node test/smoke.mjs
+      - name: Smoke linux-${{ matrix.arch }}-musl in Alpine, Node 25
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: docker run --rm -v "$PWD:/repo" -w /repo node:25-alpine node test/smoke.mjs
+      - name: Smoke linux-${{ matrix.arch }}-musl in Alpine, Node 26
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: docker run --rm -v "$PWD:/repo" -w /repo node:26-alpine node test/smoke.mjs
 
   # The full PGO cycle (instrument -> train -> merge -> optimise), strict: a
   # broken profile flow fails here instead of silently shipping plain builds
@@ -640,9 +709,54 @@ jobs:
           node-version: 24
       - run: node tools/build.mjs --all
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: built
         with:
           name: ${{ inputs.artifact_prefix }}binaries-windows-x64
           path: build/*.node
+      # Load smoke on the runner that built them, under every supported
+      # Node.js (as in linux-gnu above).
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 20
+      - name: Smoke win32-x64, Node 20
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 22
+      - name: Smoke win32-x64, Node 22
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 23
+      - name: Smoke win32-x64, Node 23
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 24
+      - name: Smoke win32-x64, Node 24
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 25
+      - name: Smoke win32-x64, Node 25
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 26
+      - name: Smoke win32-x64, Node 26
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
 
   # The same for the musl binaries, in release.yml's Alpine image with what it
   # installs there (compiler-rt is the profile runtime): strict, then smoke
@@ -694,71 +808,8 @@ jobs:
       - name: Smoke + every suite against the PGO-optimised binaries
         run: npm run test:smoke && npm run test:suites
 
-  # Smoke every published Linux glibc binary flavor on a real instance of its
-  # target: ubuntu = linux-gnu (x64 and, on the -arm runner, arm64); musl and
-  # Windows have their own jobs below, and both darwin flavors are smoked in
-  # the `darwin` job itself (macOS runners are scarce). Binary filenames carry
-  # platform/arch/libc/abi, so merge-multiple cannot clobber across flavors.
-  smoke:
-    needs: [linux-gnu, linux-musl]
-    strategy:
-      matrix:
-        os: [ubuntu-22.04, ubuntu-22.04-arm]
-        node: [20, 22, 23, 24, 25, 26]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: ${{ matrix.node }}
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: ${{ inputs.artifact_prefix }}binaries-*
-          merge-multiple: true
-          path: build/
-      - run: node test/smoke.mjs
-
-  # Same docker-run pattern as linux-musl (JS actions can't run in Alpine
-  # containers on arm64 runners).
-  smoke-musl:
-    needs: [linux-musl]
-    strategy:
-      matrix:
-        runner: [ubuntu-22.04, ubuntu-24.04-arm]
-        node: [20, 22, 23, 24, 25, 26]
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: ${{ inputs.artifact_prefix }}binaries-linux-*-musl
-          merge-multiple: true
-          path: build/
-      - name: Smoke test in Alpine container (musl)
-        run: |
-          docker run --rm -v "$PWD:/repo" -w /repo node:${{ matrix.node }}-alpine \
-            node test/smoke.mjs
-
-  smoke-windows:
-    needs: [windows]
-    strategy:
-      fail-fast: false
-      matrix:
-        node: [20, 22, 23, 24, 25, 26]
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: ${{ matrix.node }}
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: ${{ inputs.artifact_prefix }}binaries-windows-x64
-          path: build/
-      - run: node test/smoke.mjs
-
   # Full conformance on Windows for the running ABI — the same suite set the
-  # Linux/macOS conformance legs run (smoke excepted; smoke-windows covers load).
+  # Linux/macOS conformance legs run (smoke excepted; the windows job covers load).
   # The darwin/linux binaries get the whole suite, so the win32-x64 binary that
   # ships to users must too. Loopback-timing-sensitive suites run here; if one
   # proves flaky on the Windows runner, quarantine that single suite with a
@@ -804,9 +855,6 @@ jobs:
       - linux-gnu
       - linux-musl
       - windows
-      - smoke
-      - smoke-musl
-      - smoke-windows
       - conformance-windows
     runs-on: ubuntu-latest
     steps:
