@@ -350,7 +350,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Restored here and saved as soon as the build is done (below), not at
+      # the end of the job: a job that fails or is cancelled after building
+      # would otherwise save nothing, and the next run builds it again for
+      # both architectures (about three minutes each on this runner).
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: tlscache
         with:
           path: build/boringssl
           key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
@@ -364,23 +369,23 @@ jobs:
           node-version: 24
       - run: node tools/build.mjs --all --arch arm64
       - run: node tools/build.mjs --all --arch x64
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.tlscache.outputs.cache-hit != 'true'
+        with:
+          path: build/boringssl
+          key: ${{ steps.tlscache.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: built
         with:
           name: ${{ inputs.artifact_prefix }}binaries-darwin
           path: build/*.node
-      # Every macOS check runs here, on the runner that built the binaries:
-      # macOS runners are the scarcest GitHub has, and each job queues for one
-      # of its own (a smoke leg waiting 16 minutes for a runner was cancelled).
-      # The check steps run whatever an earlier check did, so one run reports
-      # them all; a failed build stops the job.
-      # Full conformance for the running ABI (arm64, Node 24) on the libuv
-      # transport, against the binaries built above.
-      - name: Smoke + every node --test suite (package.json test:suites)
-        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
-        env:
-          MORO_ENGINE_REQUIRE_TRANSPORT: uv
-        run: npm run test:smoke && npm run test:suites
+      # The load smoke of both darwin flavors runs here, on the runner that
+      # built them: macOS runners are the scarcest GitHub has, and each job
+      # queues for one of its own (a smoke leg waiting 16 minutes for a runner
+      # was cancelled). The suites run beside this job in conformance-macos,
+      # so that they do not wait for the build of every ABI. The smoke steps
+      # run whatever an earlier one did, so one run reports them all; a
+      # failed build stops the job.
       # Load smoke, Node 20: darwin-arm64 natively; darwin-x64 (cross-built
       # above, for Intel Macs) through Rosetta 2 under an x64 Node, so that
       # process.arch === 'x64' selects that binary.
@@ -489,6 +494,34 @@ jobs:
       - name: Smoke darwin-x64 (Rosetta 2), Node 26
         if: ${{ success() || failure() && steps.built.outcome == 'success' }}
         run: arch -x86_64 node test/smoke.mjs
+
+  # Full conformance on macOS for the running ABI (arm64, Node 24) on the
+  # libuv transport. Its own runner beside `darwin`: it builds only the one
+  # ABI it runs, so the suites start minutes before the build of every ABI
+  # there would let them. Same Homebrew-LLVM CXX setup as `darwin`.
+  conformance-macos:
+    runs-on: macos-15
+    env:
+      MORO_ENGINE_REQUIRE_TRANSPORT: uv
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/boringssl
+          key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
+      - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
+        run: |
+          brew list llvm >/dev/null 2>&1 || brew install llvm
+          command -v cmake >/dev/null || brew install cmake
+          echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+      - name: Build engine for this Node ABI
+        run: node tools/build.mjs
+      - name: Smoke + every node --test suite (package.json test:suites)
+        run: npm run test:smoke && npm run test:suites
 
   # Built as release.yml builds the shipped binaries: inside the glibc 2.28
   # image (manylinux_2_28, AlmaLinux 8) with clang 18, so they load on glibc
@@ -852,6 +885,7 @@ jobs:
       - asan-addon
       - fuzz-smoke
       - darwin
+      - conformance-macos
       - linux-gnu
       - linux-musl
       - windows
