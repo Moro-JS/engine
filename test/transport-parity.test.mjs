@@ -223,7 +223,17 @@ describe('transport parity', { skip }, () => {
 // messages of a WebSocket. The server runs in this process, so the bytes
 // and the reset behind them have both arrived by the time its loop looks at
 // the socket - the order in which a transport must not lose them.
-describe('input received ahead of a reset', { skip }, () => {
+//
+// Where the kernel keeps them, that is: Linux and macOS hand a reader what
+// was received before the reset and then the error. Windows does what the
+// TCP specification says a reset does to a connection - "All segment queues
+// should be flushed" (RFC 9293, 3.10.7.4) - so the bytes are gone before
+// anything reads them: "If the connection has been reset, a recv will fail
+// with the error WSAECONNRESET" (recv, Winsock reference). libuv's read
+// there gets that error and no bytes, and there is nothing for the engine
+// to deliver.
+const keptAcrossReset = process.platform === 'win32' && 'Windows discards what a connection had received when it is reset';
+describe('input received ahead of a reset', { skip: skip || keptAcrossReset }, () => {
   const connect = (port) =>
     new Promise((resolve, reject) => {
       const s = net.connect(port, '127.0.0.1', () => resolve(s));

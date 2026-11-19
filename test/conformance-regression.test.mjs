@@ -574,7 +574,14 @@ describe('lifecycle calls at an unexpected moment', { skip }, () => {
   // closes its server there (the last socket of a shutdown has gone) closes
   // this connection too; the teardown then went on to close it a second
   // time, which libuv answers with an abort.
-  it('close() from inside the onWsClose of a socket the engine is tearing down', T, () => {
+  //
+  // Not on Windows: the teardown here is the delivery deadline's, and that
+  // needs a send the peer is not taking. Windows loopback takes the whole
+  // 8 MiB into its own buffers, the engine has nothing queued, the deadline
+  // has nothing to close - and a child whose server was never closed does
+  // not end. (The same reason as the other tests of outbound backpressure.)
+  const stalledSend = { skip: process.platform === 'win32' && 'outbound backpressure is not reproducible on Windows loopback' };
+  it('close() from inside the onWsClose of a socket the engine is tearing down', { ...T, ...stalledSend }, () => {
     const r = run(`
       import net from 'node:net';
       const { default: engine } = await import(${JSON.stringify(ENGINE_ENTRY)});

@@ -305,7 +305,12 @@ describe('an aborted request is released before its handler is told', { skip }, 
       s.write('GET / HTTP/1.1\\r\\nHost: t\\r\\n\\r\\n');
       s.pause();
       for (let i = 0; i < 300 && waiters.size === 0; i++) await sleep(10);  // the handler is waiting for room
-      const waiting = waiters.size === 1;
+      // ... and stays waiting: the kernel holds what it wrote. (Where the
+      // peer's not reading never holds the writer up, as on Windows
+      // loopback, a wait is only the moment a write is still on its way.)
+      const writesBefore = seen.writes;
+      await sleep(200);
+      const waiting = waiters.size === 1 && seen.writes === writesBefore;
       if (how === 'client') s.destroy();
       else engine.close(sid);
       for (let i = 0; i < 200 && !seen.finished; i++) await sleep(10);
@@ -317,7 +322,7 @@ describe('an aborted request is released before its handler is told', { skip }, 
     console.log(JSON.stringify({ notify: engine.probe().notify, out }));
   `;
   for (const mode of ['deferred', 'sync']) {
-    it(`a streaming handler waiting for room finishes when its request is aborted (${mode} delivery)`, T, () => {
+    it(`a streaming handler waiting for room finishes when its request is aborted (${mode} delivery)`, T, (t) => {
       const r = spawnSync(process.execPath, ['--input-type=module', '-e', subject], {
         env: { ...process.env, MORO_ENGINE_NOTIFY: mode === 'sync' ? 'sync' : '' },
         encoding: 'utf8',
@@ -326,6 +331,11 @@ describe('an aborted request is released before its handler is told', { skip }, 
       assert.equal(r.status, 0, r.stderr.slice(0, 2000));
       const res = JSON.parse(r.stdout.trim().split('\n').pop());
       assert.equal(res.notify, mode);
+      if (process.platform === 'win32' && res.out.some((o) => !o.waiting)) {
+        // A handler never waits for room there: the scenario cannot be set up.
+        t.skip('outbound backpressure is not reproducible on Windows loopback');
+        return;
+      }
       for (const o of res.out) {
         assert.ok(o.waiting, `${o.how}: the handler was waiting for room when its request was aborted`);
         assert.equal(o.inside, true, `${o.how}: isAborted() inside onAborted`);

@@ -655,13 +655,14 @@ describe('@morojs/engine hardening conformance', { skip }, () => {
     });
   }
 
-  // Skipped on Windows: this drives outbound backpressure over 127.0.0.1, but
-  // Windows loopback has very large kernel buffers that absorb the 32 MB
-  // response whole, so the engine's write queue never backs up and the stall
-  // the sweep keys on can't be reproduced here. The defense is unchanged and
-  // verified on Unix; over a real network Windows still applies receive-window
-  // backpressure. A Windows variant that shrinks the socket buffers to force
-  // real backpressure is a follow-up.
+  // Skipped on Windows: Winsock reports the first two sends outstanding on a
+  // socket complete once it has copied them into its buffer, whatever their
+  // size and whatever SO_SNDBUF says (Microsoft, "Design issues - Sending
+  // small data segments over TCP with Winsock"), so the 32 MB response is
+  // never queued in the engine and the stall the sweep keys on does not
+  // exist there. Shrinking the socket buffers would not change that. What
+  // this means for applications on Windows is in docs/API.md (send
+  // backpressure) and docs/THREAT_MODEL.md (response-delivery budget).
   it('slow-read defense: a client that never reads its response is shed at the delivery deadline',
     { ...T, skip: process.platform === 'win32' && 'loopback absorbs the payload; outbound backpressure is not reproducible on Windows' },
     async () => {

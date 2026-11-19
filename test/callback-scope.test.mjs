@@ -284,8 +284,11 @@ test('a callback sees the same call through the loader trampolines as through th
     } finally {
       child.kill();
     }
-    const events = out.split('\n').filter((l) => l.startsWith('EV ')).map((l) => JSON.parse(l.slice(3)));
-    const reports = err.split('\n').filter((l) => l.startsWith('[morojs-engine]'));
+    // Lines end in \r\n on Windows where the engine prints them: its reports
+    // go through the C runtime's stderr, a text-mode stream there, which
+    // writes every \n as \r\n.
+    const events = out.split(/\r?\n/).filter((l) => l.startsWith('EV ')).map((l) => JSON.parse(l.slice(3)));
+    const reports = err.split(/\r?\n/).filter((l) => l.startsWith('[morojs-engine]'));
     return { answers, events, reports };
   };
 
@@ -414,7 +417,7 @@ test('close() from deep in the stack: every abort delivered or reported, and clo
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 240000 });
   assert.equal(r.status, 0, r.stderr.slice(-1500));
   const totals = JSON.parse(r.stdout.trim().split('\n').pop());
-  const reported = r.stderr.split('\n').filter((l) => /^\[morojs-engine\] handler threw: /.test(l)).length;
+  const reported = r.stderr.split(/\r?\n/).filter((l) => /^\[morojs-engine\] handler threw: /.test(l)).length;
   // (At the very top of the sweep the handler itself can run out of stack
   // before it reaches close(); everywhere else it does.)
   assert.ok(totals.closedAt >= totals.trials - 4, `close() was reached in ${totals.closedAt} of ${totals.trials} trials`);

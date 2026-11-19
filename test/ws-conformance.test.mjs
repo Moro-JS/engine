@@ -1400,6 +1400,24 @@ describe('@morojs/engine RFC 6455 WebSocket conformance', { skip }, () => {
     // buffers take on their own (a few MiB on each side at most), so most of
     // the message is certain to be waiting in the engine's write queue.
     const STALLED = 24 * MiB;
+    // That is so wherever the system takes only what fits its socket buffers.
+    // Windows does not work that way: Winsock reports a send complete once it
+    // has copied it into the socket's kernel buffer, and it copies the first
+    // two sends outstanding on a socket whatever their size ("If necessary,
+    // Winsock can buffer more than the SO_SNDBUF buffer size" - Microsoft,
+    // "Design issues - Sending small data segments over TCP with Winsock",
+    // the three rules for indicating a send completion). One message of this
+    // size, to a peer that reads nothing, is held by the system there and
+    // none of it by the engine: libuv is told the send is complete
+    // (src/win/tcp.c, uv__tcp_try_write and uv__tcp_write), wsSend() has
+    // nothing queued to report, the next send finds nothing waiting, and the
+    // delivery deadline has no unfinished write to time. The rule the engine
+    // applies is the same; what it is told about the socket is not. (The
+    // case below with two thousand replies runs there: from the third send
+    // outstanding on, Winsock holds the completion back and the queue forms.)
+    const needsQueuedSend = {
+      skip: process.platform === 'win32' && 'Winsock takes a whole send into the socket buffer: one large message leaves nothing queued in the engine',
+    };
 
     it('a client that is reading receives 1, 2 and 8 MiB messages and stays open', { timeout: 60000 }, async () => {
       const results = [];
@@ -1434,7 +1452,7 @@ describe('@morojs/engine RFC 6455 WebSocket conformance', { skip }, () => {
       }
     });
 
-    it('a client that is not reading is shed with 1013 by the next send, and onWsClose fires once', { timeout: 60000 }, async () => {
+    it('a client that is not reading is shed with 1013 by the next send, and onWsClose fires once', { timeout: 60000, ...needsQueuedSend }, async () => {
       const results = [];
       const local = startWsServer(undefined, {
         onWsMessage(wsId, data) {
@@ -1590,7 +1608,7 @@ describe('@morojs/engine RFC 6455 WebSocket conformance', { skip }, () => {
       }
     });
 
-    it('a peer that stops reading with one large message in flight is closed by responseTimeoutMs', { timeout: 60000 }, async () => {
+    it('a peer that stops reading with one large message in flight is closed by responseTimeoutMs', { timeout: 60000, ...needsQueuedSend }, async () => {
       let sent = null;
       const local = startWsServer({ responseTimeoutMs: 1000 }, {
         onWsMessage(wsId) {

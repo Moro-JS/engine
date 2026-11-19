@@ -365,9 +365,130 @@ jobs:
       - run: node tools/build.mjs --all --arch arm64
       - run: node tools/build.mjs --all --arch x64
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: built
         with:
           name: ${{ inputs.artifact_prefix }}binaries-darwin
           path: build/*.node
+      # Every macOS check runs here, on the runner that built the binaries:
+      # macOS runners are the scarcest GitHub has, and each job queues for one
+      # of its own (a smoke leg waiting 16 minutes for a runner was cancelled).
+      # The check steps run whatever an earlier check did, so one run reports
+      # them all; a failed build stops the job.
+      # Full conformance for the running ABI (arm64, Node 24) on the libuv
+      # transport, against the binaries built above.
+      - name: Smoke + every node --test suite (package.json test:suites)
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        env:
+          MORO_ENGINE_REQUIRE_TRANSPORT: uv
+        run: npm run test:smoke && npm run test:suites
+      # Load smoke, Node 20: darwin-arm64 natively; darwin-x64 (cross-built
+      # above, for Intel Macs) through Rosetta 2 under an x64 Node, so that
+      # process.arch === 'x64' selects that binary.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 20
+      - name: Smoke darwin-arm64, Node 20
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 20
+          architecture: x64 # runs via Rosetta 2 on the arm64 host
+      - name: Smoke darwin-x64 (Rosetta 2), Node 20
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: arch -x86_64 node test/smoke.mjs
+      # Load smoke, Node 22: darwin-arm64 natively; darwin-x64 (cross-built
+      # above, for Intel Macs) through Rosetta 2 under an x64 Node, so that
+      # process.arch === 'x64' selects that binary.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 22
+      - name: Smoke darwin-arm64, Node 22
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 22
+          architecture: x64 # runs via Rosetta 2 on the arm64 host
+      - name: Smoke darwin-x64 (Rosetta 2), Node 22
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: arch -x86_64 node test/smoke.mjs
+      # Load smoke, Node 23: darwin-arm64 natively; darwin-x64 (cross-built
+      # above, for Intel Macs) through Rosetta 2 under an x64 Node, so that
+      # process.arch === 'x64' selects that binary.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 23
+      - name: Smoke darwin-arm64, Node 23
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 23
+          architecture: x64 # runs via Rosetta 2 on the arm64 host
+      - name: Smoke darwin-x64 (Rosetta 2), Node 23
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: arch -x86_64 node test/smoke.mjs
+      # Load smoke, Node 24: darwin-arm64 natively; darwin-x64 (cross-built
+      # above, for Intel Macs) through Rosetta 2 under an x64 Node, so that
+      # process.arch === 'x64' selects that binary.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 24
+      - name: Smoke darwin-arm64, Node 24
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 24
+          architecture: x64 # runs via Rosetta 2 on the arm64 host
+      - name: Smoke darwin-x64 (Rosetta 2), Node 24
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: arch -x86_64 node test/smoke.mjs
+      # Load smoke, Node 25: darwin-arm64 natively; darwin-x64 (cross-built
+      # above, for Intel Macs) through Rosetta 2 under an x64 Node, so that
+      # process.arch === 'x64' selects that binary.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 25
+      - name: Smoke darwin-arm64, Node 25
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 25
+          architecture: x64 # runs via Rosetta 2 on the arm64 host
+      - name: Smoke darwin-x64 (Rosetta 2), Node 25
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: arch -x86_64 node test/smoke.mjs
+      # Load smoke, Node 26: darwin-arm64 natively; darwin-x64 (cross-built
+      # above, for Intel Macs) through Rosetta 2 under an x64 Node, so that
+      # process.arch === 'x64' selects that binary.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 26
+      - name: Smoke darwin-arm64, Node 26
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 26
+          architecture: x64 # runs via Rosetta 2 on the arm64 host
+      - name: Smoke darwin-x64 (Rosetta 2), Node 26
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: arch -x86_64 node test/smoke.mjs
 
   # Built as release.yml builds the shipped binaries: inside the glibc 2.28
   # image (manylinux_2_28, AlmaLinux 8) with clang 18, so they load on glibc
@@ -573,18 +694,16 @@ jobs:
       - name: Smoke + every suite against the PGO-optimised binaries
         run: npm run test:smoke && npm run test:suites
 
-  # Smoke every published binary flavor on a real instance of its target:
-  # macos-15 = darwin-arm64 (macos-14 retired 2026-11-02), ubuntu = linux-gnu
-  # (x64 and, on the -arm runner, arm64), alpine container = linux-musl.
-  # darwin-x64 is still BUILT (Intel Macs) but not load-smoked here: GitHub's
-  # Intel macOS runners (macos-13) are scarce and being retired, so queueing on
-  # them stalls the gate. Binary filenames carry platform/arch/libc/abi, so
-  # merge-multiple cannot clobber across flavors.
+  # Smoke every published Linux glibc binary flavor on a real instance of its
+  # target: ubuntu = linux-gnu (x64 and, on the -arm runner, arm64); musl and
+  # Windows have their own jobs below, and both darwin flavors are smoked in
+  # the `darwin` job itself (macOS runners are scarce). Binary filenames carry
+  # platform/arch/libc/abi, so merge-multiple cannot clobber across flavors.
   smoke:
-    needs: [darwin, linux-gnu, linux-musl]
+    needs: [linux-gnu, linux-musl]
     strategy:
       matrix:
-        os: [macos-15, ubuntu-22.04, ubuntu-22.04-arm]
+        os: [ubuntu-22.04, ubuntu-22.04-arm]
         node: [20, 22, 23, 24, 25, 26]
     runs-on: ${{ matrix.os }}
     steps:
@@ -638,31 +757,6 @@ jobs:
           path: build/
       - run: node test/smoke.mjs
 
-  # darwin-x64 ships cross-compiled from the arm64 build host (see the `darwin`
-  # job) but Intel macOS runners are scarce/retiring, so the main `smoke` matrix
-  # can't load-test it. Load-smoke it here under Rosetta 2 (pre-installed on
-  # GitHub's arm64 macOS runners): install an x64 Node and run the smoke through
-  # the x86_64 translation layer, so process.arch === 'x64' selects the
-  # darwin-x64 binary. Cheap, and it exercises a binary real Intel-Mac users get.
-  smoke-darwin-x64:
-    needs: [darwin]
-    strategy:
-      fail-fast: false
-      matrix:
-        node: [20, 22, 23, 24, 25, 26]
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: ${{ matrix.node }}
-          architecture: x64 # x64 Node build; runs via Rosetta 2 on the arm64 host
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: ${{ inputs.artifact_prefix }}binaries-darwin
-          path: build/
-      - run: arch -x86_64 node test/smoke.mjs
-
   # Full conformance on Windows for the running ABI — the same suite set the
   # Linux/macOS conformance legs run (smoke excepted; smoke-windows covers load).
   # The darwin/linux binaries get the whole suite, so the win32-x64 binary that
@@ -684,34 +778,6 @@ jobs:
           name: ${{ inputs.artifact_prefix }}binaries-windows-x64
           path: build/
       - run: npm run test:suites
-
-  # Full conformance on macOS for the running ABI. The darwin binaries ship to
-  # real users, so at least one darwin leg must run the whole suite (the smoke
-  # matrix above only load-tests). Same Homebrew-LLVM CXX setup as the darwin
-  # build job; same runner flavor as the darwin smoke leg (macos-15 = arm64).
-  conformance-macos:
-    runs-on: macos-15
-    env:
-      MORO_ENGINE_REQUIRE_TRANSPORT: uv
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # BoringSSL (the bundled-TLS binary) is built once per pin and toolchain.
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: build/boringssl
-          key: boringssl-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('tools/boringssl.json', 'tools/boringssl.mjs') }}
-      - name: Use Homebrew LLVM (clang 18+ for Node 25/26 V8 headers)
-        run: |
-          brew list llvm >/dev/null 2>&1 || brew install llvm
-          command -v cmake >/dev/null || brew install cmake
-          echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 24
-      - name: Build engine for this Node ABI
-        run: node tools/build.mjs
-      - name: Smoke + every node --test suite (package.json test:suites)
-        run: npm run test:smoke && npm run test:suites
 
   # ── Single required gate ────────────────────────────────────────────────────
 
@@ -741,9 +807,7 @@ jobs:
       - smoke
       - smoke-musl
       - smoke-windows
-      - smoke-darwin-x64
       - conformance-windows
-      - conformance-macos
     runs-on: ubuntu-latest
     steps:
       - name: Verify all jobs passed

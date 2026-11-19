@@ -510,6 +510,21 @@ bound is the application's: one that sends multi-megabyte messages to
 untrusted peers should cap them, or lower `responseTimeoutMs`. Bytes the
 kernel's socket buffers have already taken are not counted.
 
+On Windows that is more than a buffer's worth. Winsock reports a send
+complete once it has copied it into the socket's kernel buffer, and it copies
+the first two sends outstanding on a socket whatever their size (Microsoft,
+"Design issues - Sending small data segments over TCP with Winsock"). One or
+two messages sent to a peer that is not reading are then held by the system,
+not by the engine: `wsSend()` does not report them as queued, the next send
+does not find them waiting - the socket is shed once a third send is
+outstanding and the limit is passed - and `responseTimeoutMs`, which times
+writes the system has not completed, does not close that peer. The same holds
+for an HTTP response: one the system took whole is delivered as far as the
+engine can tell, and a peer that never reads it is closed by `idleTimeoutMs`
+instead. A WebSocket has no idle timeout: on Windows an application that
+sends large messages to peers it does not trust should cap them and close a
+socket whose peer has stopped answering.
+
 **`wsClose(wsId, code = 1000, reason = '')`** sends a Close frame and ends the
 connection. The frame is legal whatever it is given (§5.5, §7.4):
 

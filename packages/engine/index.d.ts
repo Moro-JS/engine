@@ -297,7 +297,11 @@ export interface ServeOptions {
    *  hold this many bytes across sends, or the largest single message the
    *  application sends, whichever is larger - the engine does not cap the
    *  size of one message, so an application sending very large ones to
-   *  untrusted peers should bound them. 0 = unlimited. Default 1 MiB. */
+   *  untrusted peers should bound them. On Windows the system takes the
+   *  first two sends outstanding on a socket whole into its buffer and
+   *  reports them sent: they are not counted here and responseTimeoutMs does
+   *  not time them (docs/API.md, send backpressure). 0 = unlimited. Default
+   *  1 MiB. */
   wsBackpressureLimit?: number;
   /** Write-queue level above which write()/wsSend() report backpressure
    *  (false) and onWritable is armed, and at which no further pipelined
