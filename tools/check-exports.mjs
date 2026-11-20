@@ -122,6 +122,14 @@ function compare(label, expected, actual, expectedName, actualName) {
   }
 }
 
+// index.mjs recognises the loader beside it by the header line in its first
+// 160 bytes (and otherwise requires the installed package by name).
+if (loaderJs.slice(0, 160).includes('@morojs/engine loader') && loaderMjs.includes("'@morojs/engine loader'")) {
+  console.log('ok   loader header line: index.js has what index.mjs looks for');
+} else {
+  failed = true;
+  console.error("DRIFT loader header line: index.js must contain '@morojs/engine loader' in its first 160 bytes, and index.mjs must look for it");
+}
 compare('native functions: binding vs NATIVE_API', bindingFns, nativeApi, 'src/binding.cpp', 'index.js NATIVE_API');
 compare('native functions: binding vs index.mjs', bindingFns, mjsExports, 'src/binding.cpp', 'index.mjs exports');
 compare('native functions: binding vs index.d.ts functions', bindingFns, dtsFns, 'src/binding.cpp', 'index.d.ts');

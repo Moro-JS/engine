@@ -154,6 +154,7 @@ jobs:
       - name: Checksum manifest
         run: shasum -a 256 build/*.node > SHA256SUMS.linux-${{ matrix.arch }}-gnu
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: built
         with:
           name: binaries-linux-${{ matrix.arch }}-gnu
           path: build/*.node
@@ -161,6 +162,51 @@ jobs:
         with:
           name: checksums-linux-${{ matrix.arch }}-gnu
           path: SHA256SUMS.linux-${{ matrix.arch }}-gnu
+      # Load-smoke the binaries just built under every supported Node line, on
+      # this runner (outside the build image), as ci.yml does. Once the build
+      # has succeeded, each line runs even when the one before it failed.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 20
+      - name: Smoke linux-${{ matrix.arch }}-gnu, Node 20
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 22
+      - name: Smoke linux-${{ matrix.arch }}-gnu, Node 22
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 23
+      - name: Smoke linux-${{ matrix.arch }}-gnu, Node 23
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 24
+      - name: Smoke linux-${{ matrix.arch }}-gnu, Node 24
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 25
+      - name: Smoke linux-${{ matrix.arch }}-gnu, Node 25
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 26
+      - name: Smoke linux-${{ matrix.arch }}-gnu, Node 26
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
 
   # docker-run instead of `container:`: JS actions can't run inside Alpine
   # containers on arm64 runners (no musl Node to inject). See ci.yml.
@@ -188,6 +234,7 @@ jobs:
       - name: Checksum manifest
         run: shasum -a 256 build/*.node > SHA256SUMS.linux-${{ matrix.arch }}-musl
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: built
         with:
           name: binaries-linux-${{ matrix.arch }}-musl
           path: build/*.node
@@ -195,6 +242,38 @@ jobs:
         with:
           name: checksums-linux-${{ matrix.arch }}-musl
           path: SHA256SUMS.linux-${{ matrix.arch }}-musl
+      # Load-smoke under every supported Node line, each in a fresh Alpine
+      # container (musl), as ci.yml does.
+      - name: Smoke linux-${{ matrix.arch }}-musl in Alpine, Node 20
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo node:20-alpine \
+            node test/smoke.mjs
+      - name: Smoke linux-${{ matrix.arch }}-musl in Alpine, Node 22
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo node:22-alpine \
+            node test/smoke.mjs
+      - name: Smoke linux-${{ matrix.arch }}-musl in Alpine, Node 23
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo node:23-alpine \
+            node test/smoke.mjs
+      - name: Smoke linux-${{ matrix.arch }}-musl in Alpine, Node 24
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo node:24-alpine \
+            node test/smoke.mjs
+      - name: Smoke linux-${{ matrix.arch }}-musl in Alpine, Node 25
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo node:25-alpine \
+            node test/smoke.mjs
+      - name: Smoke linux-${{ matrix.arch }}-musl in Alpine, Node 26
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo node:26-alpine \
+            node test/smoke.mjs
 
   windows:
     needs: [ref-check]
@@ -226,6 +305,7 @@ jobs:
         shell: bash
         run: sha256sum build/*.node > SHA256SUMS.windows-x64
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: built
         with:
           name: binaries-windows-x64
           path: build/*.node
@@ -233,93 +313,164 @@ jobs:
         with:
           name: checksums-windows-x64
           path: SHA256SUMS.windows-x64
+      # Load-smoke under every supported Node line, as ci.yml does.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 20
+      - name: Smoke win32-x64, Node 20
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 22
+      - name: Smoke win32-x64, Node 22
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 23
+      - name: Smoke win32-x64, Node 23
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 24
+      - name: Smoke win32-x64, Node 24
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 25
+      - name: Smoke win32-x64, Node 25
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 26
+      - name: Smoke win32-x64, Node 26
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
 
   # ── Publish gate: smoke every shipped binary + conformance per OS ───────────
-  # These mirror ci.yml's smoke/conformance jobs so a tagged build is held to the
-  # same bar as every commit before its binaries reach the registry. publish
-  # `needs:` all of them.
-
-  smoke:
-    needs: [darwin, linux-gnu, linux-musl]
-    strategy:
-      fail-fast: false
-      matrix:
-        # ubuntu-22.04-arm: the linux-arm64-gnu binaries, loaded on arm64.
-        os: [macos-15, ubuntu-22.04, ubuntu-22.04-arm]
-        node: [20, 22, 23, 24, 25, 26]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: ${{ matrix.node }}
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: binaries-*
-          merge-multiple: true
-          path: build/
-      - run: node test/smoke.mjs
-
-  smoke-musl:
-    needs: [linux-musl]
-    strategy:
-      matrix:
-        runner: [ubuntu-22.04, ubuntu-24.04-arm]
-        node: [20, 22, 23, 24, 25, 26]
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: binaries-linux-*-musl
-          merge-multiple: true
-          path: build/
-      - name: Smoke test in Alpine container (musl)
-        run: |
-          docker run --rm -v "$PWD:/repo" -w /repo node:${{ matrix.node }}-alpine \
-            node test/smoke.mjs
-
-  smoke-windows:
-    needs: [windows]
-    strategy:
-      fail-fast: false
-      matrix:
-        node: [20, 22, 23, 24, 25, 26]
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: ${{ matrix.node }}
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: binaries-windows-x64
-          path: build/
-      - run: node test/smoke.mjs
-
-  # darwin-x64 ships cross-compiled; load-smoke it under Rosetta 2 on the arm64
-  # macOS runner (Intel runners are scarce/retiring). See ci.yml.
-  smoke-darwin-x64:
+  # Held to the same bar as every commit in ci.yml before the binaries reach
+  # the registry; publish `needs:` all of it. Linux and Windows load-smoke
+  # every Node line inside their build jobs (above), as ci.yml does.
+  #
+  # macOS runners are the scarce ones, so the macOS binaries are smoked in one
+  # job: both architectures (darwin-x64 ships cross-compiled and is loaded under
+  # Rosetta 2, which the arm64 runners carry; Intel runners are scarce/retiring)
+  # under every Node line. It is a job of its own, not steps in `darwin`, so it
+  # runs beside conformance-macos instead of holding it up: the x64 Node
+  # downloads alone take about four minutes.
+  smoke-darwin:
     needs: [darwin]
-    strategy:
-      fail-fast: false
-      matrix:
-        node: [20, 22, 23, 24, 25, 26]
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: ${{ matrix.node }}
-          architecture: x64
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        id: built
         with:
           name: binaries-darwin
           path: build/
-      - run: arch -x86_64 node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 20
+      - name: Smoke darwin-arm64, Node 20
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 20
+          architecture: x64
+      - name: Smoke darwin-x64 (Rosetta 2), Node 20
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: arch -x86_64 node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 22
+      - name: Smoke darwin-arm64, Node 22
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 22
+          architecture: x64
+      - name: Smoke darwin-x64 (Rosetta 2), Node 22
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: arch -x86_64 node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 23
+      - name: Smoke darwin-arm64, Node 23
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 23
+          architecture: x64
+      - name: Smoke darwin-x64 (Rosetta 2), Node 23
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: arch -x86_64 node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 24
+      - name: Smoke darwin-arm64, Node 24
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 24
+          architecture: x64
+      - name: Smoke darwin-x64 (Rosetta 2), Node 24
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: arch -x86_64 node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 25
+      - name: Smoke darwin-arm64, Node 25
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 25
+          architecture: x64
+      - name: Smoke darwin-x64 (Rosetta 2), Node 25
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: arch -x86_64 node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 26
+      - name: Smoke darwin-arm64, Node 26
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: node test/smoke.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        with:
+          node-version: 26
+          architecture: x64
+      - name: Smoke darwin-x64 (Rosetta 2), Node 26
+        if: ${{ success() || failure() && steps.built.outcome == 'success' }}
+        run: arch -x86_64 node test/smoke.mjs
 
   # Full conformance per OS for the running ABI (behavioral gate; the smoke
-  # matrix above load-tests the shipped binaries, this proves protocol behavior).
+  # steps load-test the shipped binaries, this proves protocol behavior).
   conformance-linux:
     needs: [linux-gnu]
     strategy:
@@ -380,10 +531,7 @@ jobs:
       - linux-gnu
       - linux-musl
       - windows
-      - smoke
-      - smoke-musl
-      - smoke-windows
-      - smoke-darwin-x64
+      - smoke-darwin
       - conformance-linux
       - conformance-macos
       - conformance-windows
@@ -520,6 +668,32 @@ jobs:
               echo "publishing $name@$ver"
               npm publish "./$dir" --provenance --access public --ignore-scripts "${tag_args[@]}"
             fi
+          done
+
+      # A finished `npm publish` is not yet an installable version: npm can
+      # take minutes to serve it (for 1.2.0, linux-x64-musl appeared ten
+      # minutes after its publish returned). The meta package is what `latest`
+      # points installs at, and npm skips a missing optional dependency without
+      # an error, so published early it installs with no binary on that
+      # platform. So the meta package waits until every platform package's
+      # tarball for this version can be downloaded. If one never appears, the
+      # job fails before the meta publish, and a re-run completes the release.
+      - name: Wait until every platform package can be installed
+        run: |
+          deadline=$(( $(date +%s) + 45 * 60 ))
+          for dir in packages/engine-*/; do
+            ls "$dir"/*.node >/dev/null 2>&1 || continue
+            name=$(node -p "require('./$dir/package.json').name")
+            ver=$(node -p "require('./$dir/package.json').version")
+            until url=$(npm view --prefer-online "$name@$ver" dist.tarball 2>/dev/null) && [ -n "$url" ] && curl -fsSIo /dev/null "$url"; do
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "$name@$ver is still not downloadable from the registry; the meta package was not published"
+                exit 1
+              fi
+              echo "waiting for $name@$ver"
+              sleep 20
+            done
+            echo "$name@$ver can be installed ($url)"
           done
 
       - name: Publish meta package

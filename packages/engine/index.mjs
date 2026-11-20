@@ -19,7 +19,54 @@
 // the loader's error on every call.
 //
 // Maintenance: `npm run check:exports` diffs this list against the binding.
-import engine from './index.js';
+//
+// The loader is taken through require(), not `import engine from './index.js'`.
+// For an ESM import of a CommonJS file Node first runs its JavaScript lexer
+// over the whole source to guess the export names (which this wrapper does
+// not use: it restates them below). The loader is long enough for V8 to
+// start optimising that lexer in the middle of the run, and what the
+// optimising compiler allocates stays in the process: 5 to 18 MB of resident
+// memory on Node 20, 22 and 24.11, for nothing. require() skips the lexer
+// and returns the same module instance a CommonJS consumer gets.
+//
+// Under Node the loader is the file beside this one, and whatever goes wrong
+// while it loads is its own error to report. Bundled into one file there is
+// no such file: the installed package's loader is required by name then,
+// from where the bundle runs - which is also where the loader finds the
+// platform package with the binary. Two things tell a bundle from the
+// package: a CommonJS bundle has no import.meta.url, and an index.js that
+// merely sits beside an ESM bundle (the bundle's CommonJS twin, say) does
+// not open with the loader's header line.
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url || __filename);
+
+function loaderBesideThisFile() {
+  if (!import.meta.url) return null;
+  let file;
+  try {
+    file = require.resolve('./index.js');
+  } catch (err) {
+    if (err.code !== 'MODULE_NOT_FOUND') throw err;
+    return null;
+  }
+  // fs through require() as well: importing it would have Node build the
+  // ESM face of the whole fs module, about 2 MB for three functions.
+  const { closeSync, openSync, readSync } = require('node:fs');
+  let fd;
+  try {
+    fd = openSync(file, 'r');
+    const head = Buffer.alloc(160);
+    readSync(fd, head, 0, head.length, 0);
+    return head.includes('@morojs/engine loader') ? file : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+const engine = require(loaderBesideThisFile() ?? '@morojs/engine');
 
 export default engine;
 
