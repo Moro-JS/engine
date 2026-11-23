@@ -565,9 +565,25 @@ describe('@morojs/engine hardening conformance', { skip }, () => {
     });
   });
 
-  it('raw UTF-8 high bytes in the target are still served (lenient like Node)', T, async () => {
-    await withServer((ctx) => ctx.respond(200, null, ctx.path), async ({ port }) => {
+  // A request-target is ASCII (RFC 3986 §2): a client that means é sends
+  // %C3%A9. Raw high bytes are where an overlong form of "/" or "." gets past
+  // a path check that runs before decoding.
+  it('raw high bytes in the target are 400: UTF-8, an overlong form, a lone byte', T, async () => {
+    await withServer((ctx) => ctx.respond(200, null, ctx.path), async ({ port, requests }) => {
       // openRaw sends latin1, so \xc3\xa9 goes out as the raw UTF-8 of é
+      for (const target of ['/caf\xc3\xa9', '/\xc0\xaf', '/a?b=\xff', '/\x80']) {
+        const raw = await rawRequest(port, `GET ${target} HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`, { expectClose: true });
+        assert.equal(parseResponse(raw).status, 400, JSON.stringify(target));
+      }
+      assert.equal(requests.length, 0, 'none reaches the handler');
+      const ok = parseResponse(await rawRequest(port, `GET /caf%C3%A9 HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`));
+      assert.equal(ok.status, 200);
+      assert.equal(ok.body, '/caf%C3%A9');
+    });
+  });
+
+  it('allowNonAsciiTarget hands raw high bytes over undecoded, as before 1.2.2', T, async () => {
+    await withServer((ctx) => ctx.respond(200, null, ctx.path), { allowNonAsciiTarget: true }, async ({ port }) => {
       const raw = await rawRequest(port, `GET /caf\xc3\xa9 HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`);
       const res = parseResponse(raw);
       assert.equal(res.status, 200);

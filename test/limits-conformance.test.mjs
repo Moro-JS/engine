@@ -168,14 +168,14 @@ describe('@morojs/engine limit configurability', { skip }, () => {
   // Content-Length overflow regression (long-digit CL)
   // -------------------------------------------------------------------------
 
-  it('a 30-digit Content-Length is rejected 413 during parsing, handler never invoked', T, async () => {
+  it('a 30-digit Content-Length is rejected 400 during parsing, handler never invoked', T, async () => {
     await withServer(ok, {}, async (server) => {
       const raw = await rawRequest(
         server.port,
         `POST / HTTP/1.1${CRLF}Host: t${CRLF}Content-Length: ${'9'.repeat(30)}${CRLF}${CRLF}`,
         { expectClose: true }
       );
-      assert.equal(parseResponse(raw).status, 413, 'absurd CL must be rejected as too large');
+      assert.equal(parseResponse(raw).status, 400, 'a value no 64-bit length holds is malformed');
       assert.equal(server.requests.length, 0, 'handler must never see the request');
     });
   });

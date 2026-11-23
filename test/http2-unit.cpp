@@ -1722,7 +1722,8 @@ static void sessionHttp1Parity() {
   // ...and in the target.
   CHECK(verdict({}, {{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", std::string("/a\x01" "b")}}) == 'R');
   CHECK(verdict({}, {{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", std::string("/a\x7f")}}) == 'R');
-  CHECK(verdict({}, {{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/caf\xc3\xa9?q=\xff"}}) == 'D');
+  CHECK(verdict({}, {{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/caf\xc3\xa9?q=\xff"}}) == 'R');  // ASCII only, as on HTTP/1.1 (allowNonAsciiTarget)
+  CHECK(verdict({}, {{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/caf%C3%A9?q=%FF"}}) == 'D');
 
   // Host (RFC 9112 3.2, RFC 9110 7.2): one, of the shape host[:port] -
   // whether it arrives as Host or as :authority, which is delivered as Host.

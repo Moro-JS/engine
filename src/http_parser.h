@@ -172,6 +172,11 @@ struct HttpLimits {
   // §15.5.15). 0 = no dedicated cap: maxHeadSize still bounds the whole head
   // (431), so this is opt-in RFC-accurate signaling, not a required defense.
   size_t maxUriSize = 0;
+  // A request-target is ASCII (RFC 3986 §2; RFC 9112 §3.2): a byte of 0x80 or
+  // above in it is answered 400, as a control byte is. true takes such bytes
+  // as before 1.2.2 and hands them to the application undecoded, for clients
+  // that send UTF-8 paths without percent-encoding them.
+  bool allowNonAsciiTarget = false;
   // Close a connection after this many ms with no bytes received while not actively running a handler (slowloris defense + keep-alive reuse cap). 0 disables the idle timeout.
   size_t idleTimeoutMs = 120000;
   // Budget for receiving one complete request (head + body), measured from its first byte. Unlike idleTimeoutMs this does NOT reset on activity, so a slow-drip client trickling one byte per idle window is still bounded (slowloris defense; the equivalent of Node's server.requestTimeout, and the same 300s default). Expiry answers 408 and closes. 0 disables.
@@ -256,6 +261,12 @@ class HttpParser {
   // line was split across reads. Extensions seen in practice are a few dozen
   // bytes (a signature per chunk at most).
   static constexpr size_t kMaxChunkLine = 16 * 1024;
+  // Longest method token taken for a method at all. The longest registered
+  // one has 17 bytes (UPDATEREDIRECTREF); a token past this bound is answered
+  // 501 as soon as that many bytes of it have arrived, whatever follows and
+  // however long the line turns out to be (RFC 9112 §3: a method longer than
+  // any the server implements).
+  static constexpr size_t kMaxMethodLen = 64;
   // Spent bytes of a chunked body are dropped from the buffer once there is
   // this much of them (dropSpent, and the chunk loop in parse()).
   static constexpr size_t kChunkCompactAt = 16 * 1024;
@@ -285,6 +296,10 @@ class HttpParser {
   size_t bytesConsumed() const { return consumed_; }
 
   // True once the request line + headers are fully parsed (body may still be pending). Used to answer Expect: 100-continue before the body arrives.
+  // The request line refused last had no HTTP-version in it: whatever the
+  // peer is speaking, it is not HTTP/1.
+  bool notHttp() const { return notHttp_; }
+
   bool headParsed() const {
     return state_ != State::RequestLine && state_ != State::Headers;
   }
@@ -387,6 +402,12 @@ class HttpParser {
   static constexpr uint8_t kLightSpanned = 2;
   uint8_t light_ = 0;
   bool failed_ = false;  // parse() returned Error: the parser takes no more input
+  // The request line was refused for its method token alone (kMaxMethodLen):
+  // its status is not replaced by the head-size 431.
+  bool methodRefused_ = false;
+  bool notHttp_ = false;
+  // The request line begins with more than kMaxMethodLen token bytes.
+  static bool methodOverlong(const char* p, size_t n);
 
   // The Host value last accepted on this connection. A client repeats it on
   // every request of a keep-alive connection, and a value equal to one
@@ -607,13 +628,17 @@ inline constexpr std::array<uint8_t, 256> kHostChar = [] {
 MORO_NOINLINE inline bool validHostValue(std::string_view v) {
   const size_t n = v.size();
   size_t i = 0;
-  if (n != 0 && v[0] == '[') {
+  // An empty value names no host. It is what a request for a URI without an
+  // authority carries (RFC 9112 §3.2), and no such URI reaches an HTTP server.
+  if (n == 0) return false;
+  if (v[0] == '[') {
     i = 1;
     while (i < n && (kHostChar[static_cast<unsigned char>(v[i])] & 2)) ++i;
     if (i == 1 || i >= n || v[i] != ']') return false;
     ++i;
   } else {
     while (i < n && (kHostChar[static_cast<unsigned char>(v[i])] & 1)) ++i;
+    if (i == 0) return false;  // a port and no host before it
   }
   if (i == n) return true;
   if (v[i] != ':') return false;
@@ -737,6 +762,72 @@ inline bool validFieldLine(std::string_view line) {
 
 // The Host value was not the one seen last: check it, and remember it if it
 // passes and fits.
+inline bool HttpParser::methodOverlong(const char* p, size_t n) {
+  if (n <= kMaxMethodLen) return false;
+  for (size_t i = 0; i <= kMaxMethodLen; ++i) {
+    if (!kTokenChar[static_cast<unsigned char>(p[i])]) return false;
+  }
+  return true;
+}
+
+// What may follow the size on a chunk-size line (RFC 9112 §7.1.1):
+//   chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
+//   chunk-ext-name = token      chunk-ext-val = token / quoted-string
+// Nothing is made of an extension, but the line is held to the grammar: a
+// ";" with no name after it, a name or value that is not a token or a quoted
+// string, and whitespace that is not followed by a ";" (so also whitespace
+// at the end of the line) are refused. A recipient that takes such a line
+// reads the chunk's size where an intermediary that refuses it, or reads it
+// differently, does not, and the two then disagree about where the body
+// ends.
+inline bool chunkExtOk(const char* p, size_t n) {
+  size_t i = 0;
+  const auto bws = [&] {
+    while (i < n && (p[i] == ' ' || p[i] == '\t')) ++i;
+  };
+  const auto token = [&] {
+    const size_t start = i;
+    while (i < n && kTokenChar[static_cast<unsigned char>(p[i])]) ++i;
+    return i > start;
+  };
+  while (i < n) {
+    bws();
+    if (i >= n || p[i] != ';') return false;
+    ++i;
+    bws();
+    if (!token()) return false;
+    const size_t afterName = i;
+    bws();
+    if (i < n && p[i] == '=') {
+      ++i;
+      bws();
+      if (i < n && p[i] == '"') {
+        // quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE
+        ++i;
+        for (;;) {
+          if (i >= n) return false;
+          const unsigned char c = static_cast<unsigned char>(p[i]);
+          if (c == '"') { ++i; break; }
+          if (c == '\\') {
+            if (i + 1 >= n) return false;
+            const unsigned char q = static_cast<unsigned char>(p[i + 1]);
+            if (q != '\t' && (q < 0x20 || q == 0x7f)) return false;
+            i += 2;
+            continue;
+          }
+          if (c != '\t' && (c < 0x20 || c == 0x7f)) return false;
+          ++i;
+        }
+      } else if (!token()) {
+        return false;
+      }
+    } else {
+      i = afterName;  // the whitespace belongs to the next ";" or is refused there
+    }
+  }
+  return true;
+}
+
 MORO_NOINLINE inline bool HttpParser::hostCheck(std::string_view v) {
   if (!validHostValue(v)) return false;
   if (v.size() <= kHostSeenMax) {
@@ -784,6 +875,8 @@ inline void HttpParser::reset() {
   headerCount_ = 0;
   light_ = 0;
   failed_ = false;
+  methodRefused_ = false;
+  notHttp_ = false;
   hostCount_ = 0;
   sawClose_ = sawKeepAlive_ = false;
   teCount_ = 0;
@@ -822,24 +915,39 @@ inline bool HttpParser::parseRequestLine(std::string_view line) {
   const size_t n = line.size();
   size_t i = 0;
   while (i < n && kTokenChar[static_cast<unsigned char>(line[i])]) ++i;
-  if (i == 0 || i >= n || line[i] != ' ') return false;
+  if (i > kMaxMethodLen) {
+    errorStatus = 501;
+    methodRefused_ = true;
+    return false;
+  }
+  if (i == 0 || i >= n || line[i] != ' ') {
+    notHttp_ = i >= n;  // the line ends inside its first token
+    return false;
+  }
   std::string_view m = line.substr(0, i);
   const size_t tStart = i + 1;
   // Request-target hygiene (RFC 9112 §3.2 / RFC 3986): reject raw control
   // bytes. Only the line-terminating CRLF is stripped by the caller, so a
   // bare CR, NUL, any other C0 byte, or DEL would otherwise reach the app
   // verbatim in path/query - log-injection and downstream-desync fodder.
-  // Policy notes: high bytes (0x80+) are tolerated (raw UTF-8 paths, matching
-  // Node), and absolute-form / authority-form targets pass through opaquely
-  // (RFC 9112 §3.2.2 requires accepting absolute-form; routing on it is the
-  // app's / fronting proxy's business, again matching Node).
+  // So are bytes of 0x80 and above: a URI is ASCII (RFC 3986 §2), a client
+  // that means a non-ASCII character percent-encodes it, and a raw one is
+  // where an overlong UTF-8 form of "/" or "." hides from a path check that
+  // runs before decoding. limits.allowNonAsciiTarget takes them as before.
+  // Absolute-form / authority-form targets pass through opaquely (RFC 9112
+  // §3.2.2 requires accepting absolute-form; routing on it is the app's /
+  // fronting proxy's business, matching Node).
   size_t j = tStart;
+  const unsigned char highLimit = limits_->allowNonAsciiTarget ? 0xff : 0x7f;
   while (j < n && line[j] != ' ') {
     const unsigned char u = static_cast<unsigned char>(line[j]);
-    if (u < 0x20 || u == 0x7f) return false;  // errorStatus stays 400
+    if (u < 0x20 || u == 0x7f || u > highLimit) return false;  // errorStatus stays 400
     ++j;
   }
-  if (j >= n || j == tStart) return false;  // no second SP, or an empty target
+  if (j >= n || j == tStart) {  // no second SP, or an empty target
+    notHttp_ = j >= n;
+    return false;
+  }
   std::string_view t = line.substr(tStart, j - tStart);
   std::string_view v = line.substr(j + 1);
   if (limits_->maxUriSize && t.size() > limits_->maxUriSize) {
@@ -864,6 +972,7 @@ inline bool HttpParser::parseRequestLine(std::string_view line) {
   // HTTP-version = "HTTP/" DIGIT "." DIGIT  (RFC 9112 §2.3)
   if (v.size() != 8 || memcmp(v.data(), "HTTP/", 5) != 0 || v[6] != '.' ||
       v[5] < '0' || v[5] > '9' || v[7] < '0' || v[7] > '9') {
+    notHttp_ = v.size() < 5 || memcmp(v.data(), "HTTP/", 5) != 0;
     errorStatus = 400;
     return false;
   }
@@ -874,6 +983,13 @@ inline bool HttpParser::parseRequestLine(std::string_view line) {
   minorVersion = v[7] - '0';
   // HTTP/1.0 defaults to close unless Connection: keep-alive (resolved later)
   keepAlive = (minorVersion >= 1);
+  // asterisk-form is the target of a server-wide OPTIONS and of no other
+  // method (RFC 9112 §3.2.4). Asked last: a line that is not HTTP/1.x at all
+  // (the HTTP/2 preface, "PRI * HTTP/2.0") is answered for its version.
+  if (path.size() == 1 && path[0] == '*' && query.empty() && method != Method::OPTIONS) {
+    errorStatus = 400;
+    return false;
+  }
   return true;
 }
 
@@ -960,13 +1076,21 @@ inline void HttpParser::classifyHeader(std::string_view n, std::string_view v) {
     case 14:
       if (memcmp(n.data(), "content-length", 14) == 0 && clError_ == 0) {
         if (v.empty()) { clError_ = 400; break; }
+        // 1*DIGIT, read to its end before it is judged: a value with a
+        // non-digit in it is malformed wherever the non-digit sits, and one
+        // that no 64-bit length can hold is malformed too (400), not merely
+        // larger than this server takes (413).
         size_t parsed = 0;
+        bool tooLarge = false;
         for (char c : v) {
           if (c < '0' || c > '9') { clError_ = 400; break; }
-          parsed = parsed * 10 + static_cast<size_t>(c - '0');
-          if (parsed > limits_->maxBodySize) { clError_ = 413; break; }
+          const size_t d = static_cast<size_t>(c - '0');
+          if (parsed > (SIZE_MAX - d) / 10) { clError_ = 400; break; }
+          parsed = parsed * 10 + d;
+          if (parsed > limits_->maxBodySize) tooLarge = true;
         }
         if (clError_) break;
+        if (tooLarge) { clError_ = 413; break; }
         if (hasCL_ && parsed != cl_) { clError_ = 400; break; }
         cl_ = parsed;
         hasCL_ = true;
@@ -1128,7 +1252,7 @@ inline bool HttpParser::parseDirect(const char* data, size_t len, ParseStatus& s
   // header line, in all three paths, the size is therefore asked where a
   // line is refused, and once more where the head ends.
   if (!parseRequestLine(std::string_view(data, lineEnd))) {
-    if (nextScan > limits_->maxHeadSize) errorStatus = 431;
+    if (!methodRefused_ && nextScan > limits_->maxHeadSize) errorStatus = 431;
     buf_.append(data, len);
     st = ParseStatus::Error;
     return true;
@@ -1302,6 +1426,12 @@ MORO_ALWAYS_INLINE ParseStatus HttpParser::parseSome(const char* data, size_t le
   while (state_ == State::RequestLine || state_ == State::Headers) {
     size_t nl = buf_.find('\n', scanPos_);
     if (nl == std::string::npos) {
+      // A method token already past its bound is refused without waiting for
+      // the rest of the line (which may never end).
+      if (state_ == State::RequestLine && methodOverlong(buf_.data() + scanPos_, buf_.size() - scanPos_)) {
+        errorStatus = 501;
+        return ParseStatus::Error;
+      }
       if (buf_.size() - consumed_ > limits_->maxHeadSize) {
         errorStatus = 431;  // Request Header Fields Too Large
         return ParseStatus::Error;
@@ -1324,7 +1454,7 @@ MORO_ALWAYS_INLINE ParseStatus HttpParser::parseSome(const char* data, size_t le
         // (see parseDirect). Relative to consumed_: with deferred compaction
         // the buffer may still carry a dead prefix from prior requests,
         // which must not count toward this request's head size.
-        if (nextScan - consumed_ > limits_->maxHeadSize) errorStatus = 431;
+        if (!methodRefused_ && nextScan - consumed_ > limits_->maxHeadSize) errorStatus = 431;
         return ParseStatus::Error;
       }
       light_ = (routeHook != nullptr && routeHook(routeHookUser, method, path)) ? kLightFresh : 0;
@@ -1441,13 +1571,15 @@ MORO_ALWAYS_INLINE ParseStatus HttpParser::parseSome(const char* data, size_t le
         return ParseStatus::Error;
       }
       // chunk-size [ chunk-ext ]: chunk-size = 1*HEXDIG, at the very start
-      // of the line. Whitespace after the size is tolerated, before a ";"
-      // (BWS) or at the end of the line; what follows a ";" is not
-      // interpreted, but it may hold no control byte other than HTAB.
+      // of the line, then the extensions and nothing else (chunkExtOk). A
+      // size that no 64-bit length can hold is malformed (400); one that is
+      // only larger than this server takes is 413, once the line has been
+      // found well-formed.
       const char* const line = buf_.data() + scanPos_;
       const size_t lineLen = nl - 1 - scanPos_;
       size_t i = 0;
       size_t sz = 0;
+      bool tooLarge = false;
       for (; i < lineLen; ++i) {
         const char c = line[i];
         int d;
@@ -1455,24 +1587,21 @@ MORO_ALWAYS_INLINE ParseStatus HttpParser::parseSome(const char* data, size_t le
         else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
         else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
         else break;
+        if (sz > (SIZE_MAX >> 4)) { errorStatus = 400; return ParseStatus::Error; }
         sz = sz * 16 + static_cast<size_t>(d);
-        if (sz > limits_->maxBodySize) { errorStatus = 413; return ParseStatus::Error; }
+        if (sz > limits_->maxBodySize) tooLarge = true;
       }
-      if (i == 0) { errorStatus = 400; return ParseStatus::Error; }
+      if (i == 0 || !chunkExtOk(line + i, lineLen - i)) {
+        errorStatus = 400;
+        return ParseStatus::Error;
+      }
       // A chunk that would take the body past maxBodySize is refused here,
       // at its size line, not once its data has been received: until then
       // that data would sit in the buffer on top of the body collected so
       // far.
-      if (sz > limits_->maxBodySize - body.size()) { errorStatus = 413; return ParseStatus::Error; }
-      while (i < lineLen && (line[i] == ' ' || line[i] == '\t')) ++i;
-      if (i < lineLen) {
-        if (line[i] != ';') { errorStatus = 400; return ParseStatus::Error; }
-        for (++i; i < lineLen; ++i) {
-          if (!kValueChar[static_cast<unsigned char>(line[i])]) {
-            errorStatus = 400;
-            return ParseStatus::Error;
-          }
-        }
+      if (tooLarge || sz > limits_->maxBodySize - body.size()) {
+        errorStatus = 413;
+        return ParseStatus::Error;
       }
       chunkRemaining_ = sz;
       scanPos_ = nl + 1;

@@ -2963,6 +2963,7 @@ class Server {
     s.maxBodySize = limits_.maxBodySize;
     s.maxHeaders = limits_.maxHeaders;
     s.maxUriSize = limits_.maxUriSize;
+    s.allowNonAsciiTarget = limits_.allowNonAsciiTarget;
     h2::Host host;
     host.user = c;
     host.dispatch = [](void* user, h2::Stream& st) {
@@ -4230,6 +4231,16 @@ class Server {
       case ParseStatus::NeedMore:
         return;
       case ParseStatus::Error:
+        // The first bytes of a cleartext connection to a server that speaks
+        // HTTP/2 as well, and they are neither the HTTP/2 preface nor an
+        // HTTP/1 request line: there is no protocol to answer in, and an
+        // HTTP/1 error would reach an HTTP/2 client as a malformed frame.
+        // The connection is ended with no reply (RFC 9113 §3.4 for the one
+        // peer, RFC 9112 §2.2 for the other).
+        if (limits_.http2.enabled && !c->tls && c->reqId == 0 && !c->responseStarted && c->parser.notHttp()) {
+          doClose(c);
+          return;
+        }
         sendErrorAndClose(c, c->parser.errorStatus);
         return;
       case ParseStatus::Complete:

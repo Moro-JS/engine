@@ -1355,6 +1355,10 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
     if (opts->Get(ctx, str(iso, "reusePort")).ToLocal(&rp) && rp->IsBoolean()) {
       limits.reusePort = rp->BooleanValue(iso);
     }
+    Local<Value> na;
+    if (opts->Get(ctx, str(iso, "allowNonAsciiTarget")).ToLocal(&na) && na->IsBoolean()) {
+      limits.allowNonAsciiTarget = na->BooleanValue(iso);
+    }
 
     // options.wsDeflate: boolean (enable with defaults) or an options object.
     Local<Value> wd;

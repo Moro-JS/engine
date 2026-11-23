@@ -56,6 +56,9 @@ serve(callbacks: {
   maxHeaders?: number;         // default 100 (431 over)
   maxUriSize?: number;         // default 0 = no dedicated cap (maxHeadSize still bounds the
                                // head with 431); set to answer 414 for over-long targets
+  allowNonAsciiTarget?: boolean; // default false: a request-target or :path with a byte of
+                               // 0x80 or above is 400. true hands such bytes over undecoded,
+                               // as before 1.2.2
   responseBackpressureLimit?: number; // default 0 = unlimited. Opt-in hard cap on the
                                // not-yet-flushed HTTP outbound queue; over it the connection
                                // is closed immediately (HTTP mirror of wsBackpressureLimit).
@@ -377,9 +380,10 @@ selectTls(library: 'boringssl' | 'openssl' | 'auto', ssl?: ServeOptions['ssl']):
 - **Host** (RFC 9112 §3.2): exactly one on an HTTP/1.1 request, at most one
   on HTTP/1.0, and its value must be `uri-host [ ":" port ]` - a name or
   IPv4 address, or an IPv6 address in brackets, optionally followed by a
-  colon and digits - else 400. Underscores, a trailing dot, an empty port
-  and an empty value are accepted; whitespace, `/`, `?`, `#`, `@`, `\`,
-  non-ASCII bytes and an unbracketed IPv6 address are not.
+  colon and digits - else 400. Underscores, a trailing dot and an empty port
+  are accepted; an empty value, a port with no host before it, whitespace,
+  `/`, `?`, `#`, `@`, `\`, non-ASCII bytes and an unbracketed IPv6 address
+  are not.
   On HTTP/2 the `Host` a handler reads is the request's `:authority`, or its
   `host` field when it sent no `:authority`; each is checked the same way,
   except that an empty one makes the request malformed

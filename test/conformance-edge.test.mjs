@@ -449,10 +449,12 @@ describe('request framing: Content-Length and Transfer-Encoding', { skip }, () =
     });
   });
 
-  it('a Content-Length past 2^64 is 413, never wrapped to a small number', T, async () => {
+  it('a Content-Length past 2^64 is 400, never wrapped to a small number; the largest that fits is 413', T, async () => {
     await withServer(echo, async (server) => {
-      // 2^64 + 3 would be 3 after a wrap
-      await expectRejected(server, post('Content-Length: 18446744073709551619\r\n', 'abc'), 413, '2^64+3');
+      // 2^64 + 3 would be 3 after a wrap. No 64-bit length holds it: it is malformed, not too large.
+      await expectRejected(server, post('Content-Length: 18446744073709551619\r\n', 'abc'), 400, '2^64+3');
+      await expectRejected(server, post('Content-Length: 99999999999999999999\r\n', ''), 400, '20 nines');
+      await expectRejected(server, post('Content-Length: 18446744073709551615\r\n', 'abc'), 413, '2^64-1');
     });
   });
 
@@ -610,7 +612,7 @@ describe('request line and Host', { skip }, () => {
   it('unknown methods are handed over verbatim; a method that is not a token is 400', T, async () => {
     const seen = [];
     await withServer((ctx) => { seen.push(engine.getMethod(ctx.reqId)); ctx.respond(200, null, 'ok'); }, async (server) => {
-      for (const m of ['CONNECT', 'TRACE', 'M-SEARCH', "!#$%&'*+-.^_`|~", 'A'.repeat(300)]) {
+      for (const m of ['CONNECT', 'TRACE', 'M-SEARCH', "!#$%&'*+-.^_`|~", 'A'.repeat(64)]) {
         const r = await exchange(server, `${m} /m HTTP/1.1\r\n${H}\r\n`);
         assert.deepEqual(r.statuses, [200], m.slice(0, 20));
       }
@@ -618,6 +620,58 @@ describe('request line and Host', { skip }, () => {
       for (const m of ['G=T', 'G@T', 'G\x00T', 'G(T', 'G\xc9T', '']) {
         await expectRejected(server, `${m} /m HTTP/1.1\r\n${H}\r\n`, 400, JSON.stringify(m));
       }
+    });
+  });
+
+  // RFC 9112 §3: a method longer than any the server implements is 501. The
+  // bound is 64 bytes, and the answer does not wait for the line to end, or
+  // turn into the head-size 431 when the method alone is past maxHeadSize.
+  it('a method token of more than 64 bytes is 501, as soon as it is that long', T, async () => {
+    let calls = 0;
+    await withServer((ctx) => { calls++; ctx.respond(200, null, 'ok'); }, async (server) => {
+      for (const len of [65, 300, 100000]) {
+        await expectRejected(server, `${'A'.repeat(len)} /m HTTP/1.1\r\n${H}\r\n`, 501, `${len} bytes`);
+      }
+      await expectRejected(server, null, 501, 'never finished', { parts: ['B'.repeat(40), 'B'.repeat(40)] });
+      assert.equal(calls, 0);
+    });
+  });
+
+  // A cleartext listener that speaks HTTP/2 as well: first bytes that are
+  // neither the HTTP/2 preface nor an HTTP/1 request line are answered in
+  // neither protocol. An HTTP/1 error would reach an HTTP/2 client as a
+  // malformed frame (h2spec 3.5/2 reads it as an unexpected EOF).
+  it('with http2 on, a first line with no HTTP-version in it ends the connection without a reply', T, async () => {
+    await withServer(echo, { http2: true }, async (server) => {
+      for (const first of ['INVALID CONNECTION PREFACE\r\n\r\n', 'GARBAGE\r\n\r\n', 'GET /\r\n\r\n']) {
+        const r = await exchange(server, first, { wait: 200 });
+        assert.deepEqual(r.statuses, [], JSON.stringify(first));
+        assert.equal(r.closed, true, JSON.stringify(first));
+      }
+      // A request line that is HTTP/1 and wrong is still told so ...
+      await expectRejected(server, 'GET /x HTTP/1.9x\r\nHost: h\r\n\r\n', 400, 'bad minor version');
+      await expectRejected(server, 'GET /x HTTP/3.0\r\nHost: h\r\n\r\n', 505, 'HTTP/3.0');
+      // ... and so is a line that is not, once the connection has spoken HTTP/1.
+      const r = await exchange(server, `GET /a HTTP/1.1\r\n${H}\r\nGARBAGE\r\n\r\n`);
+      assert.deepEqual(r.statuses, [200, 400]);
+    });
+    // Without http2 the same bytes get the HTTP/1 answer they always did.
+    await withServer(echo, async (server) => {
+      await expectRejected(server, 'INVALID CONNECTION PREFACE\r\n\r\n', 400, 'no http2');
+    });
+  });
+
+  // RFC 9112 §3.2.4: asterisk-form is for a server-wide OPTIONS only.
+  it('"*" is a request-target for OPTIONS and for no other method', T, async () => {
+    const seen = [];
+    await withServer((ctx) => { seen.push(`${engine.getMethod(ctx.reqId)} ${ctx.path}`); ctx.respond(204, null, ''); }, async (server) => {
+      const r = await exchange(server, `OPTIONS * HTTP/1.1\r\n${H}\r\n`);
+      assert.deepEqual(r.statuses, [204]);
+      assert.deepEqual(seen, ['OPTIONS *']);
+      for (const m of ['GET', 'HEAD', 'POST', 'DELETE', 'TRACE']) {
+        await expectRejected(server, `${m} * HTTP/1.1\r\n${H}\r\n`, 400, m);
+      }
+      assert.equal(seen.length, 1);
     });
   });
 
@@ -650,13 +704,16 @@ describe('request line and Host', { skip }, () => {
     });
   });
 
-  it('Host: required once on HTTP/1.1 (even with an absolute-form target); an empty value is allowed', T, async () => {
+  it('Host: required once on HTTP/1.1 (even with an absolute-form target), and it names a host', T, async () => {
     await withServer(echo, async (server) => {
       await expectRejected(server, 'GET http://example.test/a HTTP/1.1\r\n\r\n', 400, 'absolute-form without Host');
       await expectRejected(server, 'GET /h HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n', 400, 'two Host lines on HTTP/1.0');
       await expectRejected(server, 'GET /h HTTP/1.1\r\nHost: t\r\nhOsT: t\r\n\r\n', 400, 'two equal Host lines');
-      const r = await exchange(server, 'GET /h HTTP/1.1\r\nHost:\r\n\r\n');
-      assert.deepEqual(r.statuses, [200]);
+      // An empty value, or a port with no host before it, names none (RFC 9112 §3.2).
+      await expectRejected(server, 'GET /h HTTP/1.1\r\nHost:\r\n\r\n', 400, 'empty Host');
+      await expectRejected(server, 'GET /h HTTP/1.1\r\nHost: \r\n\r\n', 400, 'Host of one space');
+      await expectRejected(server, 'GET /h HTTP/1.1\r\nHost: :8080\r\n\r\n', 400, 'a port alone');
+      await expectRejected(server, 'GET /h HTTP/1.0\r\nHost:\r\n\r\n', 400, 'empty Host on HTTP/1.0');
     });
   });
 
@@ -683,7 +740,7 @@ describe('request line and Host', { skip }, () => {
       const good = [
         'example.test', 'my_service:3000', 'a-b.c', '127.0.0.1:8080', '[::1]', '[2001:db8::1]:443', '[fe80::1%25en0]:80',
         '[v1.fe80::a+en1]', 'example.test.', 'xn--bcher-kva.example', 'EXAMPLE.test', 'localhost:', 'localhost:65535',
-        'a~b!$&\'()*+;=c', 'caf%C3%A9.test', ':8080', '',
+        'a~b!$&\'()*+;=c', 'caf%C3%A9.test',
       ];
       for (const host of good) {
         const r = await exchange(server, `GET /h HTTP/1.1\r\nHost: ${host}\r\n\r\n`, { wait: 60 });
@@ -736,11 +793,12 @@ describe('chunked request bodies', { skip }, () => {
     });
   });
 
-  it('a chunk size that overflows 64 bits is 413, never wrapped', T, async () => {
+  it('a chunk size that overflows 64 bits is 400, never wrapped; the largest that fits is 413', T, async () => {
     await withServer(echo, async (server) => {
-      // 0x1_0000_0000_0000_0003 is 3 after a 64-bit wrap
-      for (const size of ['ffffffffffffffff', '10000000000000000', '10000000000000003', 'f'.repeat(40) + '3']) {
-        await expectRejected(server, chunked(`${size}\r\nabc\r\n0\r\n\r\n`), 413, size);
+      await expectRejected(server, chunked('ffffffffffffffff\r\nabc\r\n0\r\n\r\n'), 413, '2^64-1');
+      // 0x1_0000_0000_0000_0003 is 3 after a 64-bit wrap. No 64-bit size holds it: malformed, not too large.
+      for (const size of ['10000000000000000', '10000000000000003', 'FFFFFFFFFFFFFFFF0', 'f'.repeat(40) + '3']) {
+        await expectRejected(server, chunked(`${size}\r\nabc\r\n0\r\n\r\n`), 400, size);
       }
     });
   });
@@ -794,12 +852,12 @@ describe('chunked request bodies', { skip }, () => {
     });
   });
 
-  it('whitespace before a chunk size is rejected (chunk-size = 1*HEXDIG); after it, it is still tolerated', T, async () => {
+  it('whitespace around a chunk size is rejected (chunk-size = 1*HEXDIG), except as BWS before a ";"', T, async () => {
     await withServer(echo, async (server) => {
-      for (const size of [' 3', '\t3', ' ', ' ;x']) {
+      for (const size of [' 3', '\t3', ' ', ' ;x', '3 ', '3\t', '3 \t ', '3;x ']) {
         await expectRejected(server, chunked(`${size}\r\nabc\r\n0\r\n\r\n`), 400, JSON.stringify(size));
       }
-      for (const size of ['3 ', '3\t', '3 ;x', '3 ; x = "y z"']) {
+      for (const size of ['3 ;x', '3\t;\tx', '3 ; x = "y z"']) {
         const r = await exchange(server, chunked(`${size}\r\nabc\r\n0\r\n\r\n`));
         assert.deepEqual(r.statuses, [200], JSON.stringify(size));
         assert.equal(r.responses[0].body, 'POST|/c|abc');
@@ -807,13 +865,26 @@ describe('chunked request bodies', { skip }, () => {
     });
   });
 
-  it('chunk extensions are not interpreted, but may hold no control byte', T, async () => {
+  // RFC 9112 §7.1.1: chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] ),
+  // a name a token, a value a token or a quoted-string.
+  it('chunk extensions are not interpreted, but are held to their grammar', T, async () => {
     await withServer(echo, async (server) => {
-      const r = await exchange(server, chunked('3;a=b;c="d e\tf";\xfc\r\nabc\r\n0;last=1\r\n\r\n'));
+      const r = await exchange(server, chunked('3;a=b;c="d e\tf\xfc";g;h="i\\"j"\r\nabc\r\n0;last=1\r\n\r\n'));
       assert.deepEqual(r.statuses, [200]);
       assert.equal(r.responses[0].body, 'POST|/c|abc');
       for (const ch of ['\x00', '\x01', '\r', '\x1b', '\x7f']) {
         await expectRejected(server, chunked(`3;a=b${ch}c\r\nabc\r\n0\r\n\r\n`), 400, `0x${ch.charCodeAt(0).toString(16)}`);
+        await expectRejected(server, chunked(`3;a="b${ch}c"\r\nabc\r\n0\r\n\r\n`), 400, `quoted 0x${ch.charCodeAt(0).toString(16)}`);
+      }
+      const bad = [
+        '3;', '3; ', '3;a;', '3;;a',          // a ";" with no name behind it
+        '3;bad[=x', '3;a b', '3;\xfc',        // a name that is not a token
+        '3;=x', '3;a=', '3;a= ',              // "=" with a side missing
+        '3;a=b c', '3;a=b[',                  // a value that is neither a token nor quoted
+        '3;a="b', '3;a="b"c', '3;a="b\\',     // a quoted value that does not end where it should
+      ];
+      for (const line of bad) {
+        await expectRejected(server, chunked(`${line}\r\nabc\r\n0\r\n\r\n`), 400, JSON.stringify(line));
       }
     });
   });

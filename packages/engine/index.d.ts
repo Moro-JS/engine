@@ -275,6 +275,12 @@ export interface ServeOptions {
    *  Default 0 = no dedicated cap (maxHeadSize still bounds the whole head with
    *  431). Feature-detect via probe().capabilities.responseLimits. */
   maxUriSize?: number;
+  /** Take a request-target (HTTP/1.1) or `:path` (HTTP/2) that holds bytes of
+   *  0x80 and above and hand them over undecoded, as every release before
+   *  1.2.2 did. Default false: such a request is answered 400 (a stream error
+   *  on HTTP/2). A request-target is ASCII (RFC 3986 §2); clients
+   *  percent-encode what is not. */
+  allowNonAsciiTarget?: boolean;
   /** Opt-in hard cap in bytes on the not-yet-flushed HTTP outbound queue (the
    *  HTTP mirror of wsBackpressureLimit); over it the connection is closed
    *  immediately. Default 0 = unlimited. Leave 0 unless response sizes are

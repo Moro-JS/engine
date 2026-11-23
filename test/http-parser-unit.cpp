@@ -397,23 +397,35 @@ int main() {
   }
 
   // --- Content-Length integer-overflow smuggling defense ---
-  // A 26-digit length overflows size_t; must be rejected (413), never wrapped
-  // to a small value that would slip past the limit and desync the body.
+  // A 26-digit length overflows size_t; must be rejected, never wrapped to a
+  // small value that would slip past the limit and desync the body. It is
+  // not a length at all, so it is malformed (400), not merely too large.
   {
     HttpParser p;  // default 10MB limit
     auto st = feed(p,
                    "POST / HTTP/1.1\r\nHost: a\r\n"
                    "Content-Length: 99999999999999999999999999\r\n\r\n");
     CHECK(st == ParseStatus::Error);
-    CHECK(p.errorStatus == 413);
+    CHECK(p.errorStatus == 400);
+    // The largest value 64 bits hold is a length, and too large; one more is not.
+    HttpParser fits;
+    CHECK(feed(fits, "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 18446744073709551615\r\n\r\n") == ParseStatus::Error);
+    CHECK(fits.errorStatus == 413);
+    HttpParser over;
+    CHECK(feed(over, "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 18446744073709551616\r\n\r\n") == ParseStatus::Error);
+    CHECK(over.errorStatus == 400);
+    // A non-digit is malformed wherever it sits, also behind a value already too large.
+    HttpParser junk;
+    CHECK(feed(junk, "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 99999999999x\r\n\r\n") == ParseStatus::Error);
+    CHECK(junk.errorStatus == 400);
   }
 
-  // --- a Content-Length just over the default limit is rejected, not wrapped ---
+  // --- a Content-Length of 2^64 is rejected, not wrapped to 0 ---
   {
     HttpParser p;
     auto st = feed(p, "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 18446744073709551616\r\n\r\n");
-    CHECK(st == ParseStatus::Error);  // 2^64, would wrap to 0
-    CHECK(p.errorStatus == 413);
+    CHECK(st == ParseStatus::Error);
+    CHECK(p.errorStatus == 400);
   }
 
   // --- oversized head -> 431 ---
@@ -498,14 +510,14 @@ int main() {
   }
 
   // --- Content-Length overflow regression: a 30-digit CL cannot wrap the
-  // accumulator into an acceptable value; it is rejected as too large while
-  // still parsing digits (413), before any body byte is consumed ---
+  // accumulator into an acceptable value; it is rejected as malformed (400),
+  // before any body byte is consumed ---
   {
     HttpParser p;
     auto st = feed(p, "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: " +
                           std::string(30, '9') + "\r\n\r\n");
     CHECK(st == ParseStatus::Error);
-    CHECK(p.errorStatus == 413);
+    CHECK(p.errorStatus == 400);
   }
 
 
@@ -562,9 +574,15 @@ int main() {
     CHECK(st == ParseStatus::Error);
   }
 
-  // --- high bytes (raw UTF-8 paths) stay tolerated, matching Node ---
+  // --- high bytes (raw UTF-8 paths) are refused; allowNonAsciiTarget hands
+  // them over undecoded, as every release before 1.2.2 did ---
   {
-    HttpParser p;
+    HttpParser strict;
+    CHECK(feed(strict, "GET /caf\303\251 HTTP/1.1\r\nHost: a\r\n\r\n") == ParseStatus::Error);
+    CHECK(strict.errorStatus == 400);
+    HttpLimits lim;
+    lim.allowNonAsciiTarget = true;
+    HttpParser p(lim);
     auto st = feed(p, "GET /caf\303\251 HTTP/1.1\r\nHost: a\r\n\r\n");
     CHECK(st == ParseStatus::Complete);
     CHECK(p.path == "/caf\303\251");
@@ -894,7 +912,7 @@ int main() {
   // --- Host = uri-host [ ":" port ] (RFC 9110 §7.2, RFC 9112 §3.2) ---
   {
     const char* good[] = {"example.test", "my_service:3000", "a-b.c", "127.0.0.1:8080", "[::1]", "[2001:db8::1]:443",
-                          "[fe80::1%25en0]", "example.test.", "EXAMPLE.test", "localhost:", ":80", "", "a~b!$&'()*+;=c",
+                          "[fe80::1%25en0]", "example.test.", "EXAMPLE.test", "localhost:", "a~b!$&'()*+;=c",
                           "caf%C3%A9.test"};
     for (const char* h : good) {
       CHECK(validHostValue(h));
@@ -903,7 +921,8 @@ int main() {
       CHECK(std::string(p.findHeader("host")) == h);
     }
     const char* bad[] = {"a b", "a/b", "a, b", "u@a", "a:99x", "a?x", "a#x", "a\\b", "a:1:2", "::1", "[::1", "::1]",
-                         "[]", "[::1]x", "[::1]:x", "[a[b]]", "a\"b", ("b\xc3\xbc" "cher.example"), "a\tb"};
+                         "[]", "[::1]x", "[::1]:x", "[a[b]]", "a\"b", ("b\xc3\xbc" "cher.example"), "a\tb",
+                         "", ":80", ":"};  // no host named
     for (const char* h : bad) {
       CHECK(!validHostValue(h));
       HttpParser p;
@@ -925,8 +944,8 @@ int main() {
       if (light) p.routeHook = +hookYes;
       const std::string longHost = std::string(60, 'a') + ".example";   // longer than the remembered size
       const std::string host255 = std::string(255, 'b');
-      for (const std::string& h : {std::string("example.test:8080"), std::string("example.test:8080"), std::string(""),
-                                   std::string(""), longHost, longHost, host255, std::string("example.test:8081")}) {
+      for (const std::string& h : {std::string("example.test:8080"), std::string("example.test:8080"), std::string("a"),
+                                   std::string("a"), longHost, longHost, host255, std::string("example.test:8081")}) {
         CHECK(feed(p, req(h)) == ParseStatus::Complete);
         p.reset();
       }
@@ -981,6 +1000,21 @@ int main() {
         "3;a\001b\r\nabc\r\n0\r\n\r\n",  // a control byte in the extension
         "3;a\rb\r\nabc\r\n0\r\n\r\n",    // a bare CR in the extension
         "3\r\r\nabc\r\n0\r\n\r\n",       // a second CR before the LF
+        "3 \r\nabc\r\n0\r\n\r\n",        // whitespace after the size and no ";" behind it
+        "3\t\r\nabc\r\n0\r\n\r\n",
+        "3;\r\nabc\r\n0\r\n\r\n",        // ";" and no extension name
+        "3; \r\nabc\r\n0\r\n\r\n",
+        "3;x;\r\nabc\r\n0\r\n\r\n",      // ... after a good one
+        "3;bad[=x\r\nabc\r\n0\r\n\r\n",  // a name that is not a token
+        "3;=x\r\nabc\r\n0\r\n\r\n",      // a value and no name
+        "3;x=\r\nabc\r\n0\r\n\r\n",      // "=" and no value
+        "3;x=a b\r\nabc\r\n0\r\n\r\n",   // a value that is neither a token nor quoted
+        "3;x=\"a\r\nabc\r\n0\r\n\r\n",   // a quoted value that does not end
+        "3;x=\"a\"b\r\nabc\r\n0\r\n\r\n", // something behind the closing quote
+        "3;x \r\nabc\r\n0\r\n\r\n",      // whitespace at the end of the line
+        "3;\xc3\xa9=1\r\nabc\r\n0\r\n\r\n", // obs-text in a name
+        "10000000000000000\r\nabc\r\n0\r\n\r\n", // 17 hex digits: no 64-bit size
+        "FFFFFFFFFFFFFFFF0\r\nabc\r\n0\r\n\r\n",
     };
     for (const char* b : bad) {
       HttpParser p;
@@ -995,9 +1029,9 @@ int main() {
     }
     const char* good[] = {
         "3\r\nabc\r\n0\r\n\r\n",
-        "3 \r\nabc\r\n0\r\n\r\n",                  // whitespace after the size is still tolerated
         "3\t;x\r\nabc\r\n0 ; y=\"a b\"\r\n\r\n",   // BWS before ";", a quoted value with SP
-        "003;\xc3\xa9=1\r\nabc\r\n0\r\n\r\n",      // obs-text in an extension
+        "3;a;b=c ; d = \"e\\\"f\"\r\nabc\r\n0\r\n\r\n", // several, BWS around "=", a quoted-pair
+        "003;x=\"\xc3\xa9\"\r\nabc\r\n0\r\n\r\n",  // obs-text inside a quoted value
         "3\r\nabc\r\n0\r\nX-T: v\r\nX-U:\r\n\r\n", // trailers
     };
     for (const char* g : good) {
@@ -1196,5 +1230,68 @@ int main() {
   CHECK(validHostValue("[v1.a,b]"));
 
   std::printf("OK - %d checks passed\n", tests);
+  // --- the request line: asterisk-form, an over-long method, a non-ASCII target ---
+  {
+    const auto status = [](const std::string& req, int& code) {
+      HttpParser p;
+      const ParseStatus st = feed(p, req);
+      code = p.errorStatus;
+      return st;
+    };
+    int code = 0;
+    // asterisk-form belongs to OPTIONS alone (RFC 9112 §3.2.4)
+    CHECK(status("OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Complete);
+    for (const char* m : {"GET", "HEAD", "POST", "DELETE", "FOO", "options"}) {
+      CHECK(status(std::string(m) + " * HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Error);
+      CHECK(code == 400);
+    }
+    CHECK(status("GET /* HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Complete);
+    CHECK(status("GET ** HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Complete);  // opaque, as before
+
+    // A method token past kMaxMethodLen is 501 - whole, split, or never
+    // finished, and however far past maxHeadSize the line runs.
+    const size_t max = HttpParser::kMaxMethodLen;
+    CHECK(status(std::string(max, 'A') + " / HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Complete);
+    for (const size_t len : {max + 1, size_t(1000), size_t(100000)}) {
+      const std::string all = std::string(len, 'A') + " / HTTP/1.1\r\nHost: h\r\n\r\n";
+      CHECK(status(all, code) == ParseStatus::Error);
+      CHECK(code == 501);
+      for (const size_t step : {size_t(1), size_t(7), size_t(4096)}) {
+        HttpParser split;
+        ParseStatus st = ParseStatus::NeedMore;
+        size_t fed = 0;
+        for (; fed < all.size() && st == ParseStatus::NeedMore; fed += step)
+          st = split.parse(all.data() + fed, step < all.size() - fed ? step : all.size() - fed);
+        CHECK(st == ParseStatus::Error);
+        CHECK(split.errorStatus == 501);
+        CHECK(fed <= max + 1 + step);  // refused as soon as the bound is passed
+      }
+    }
+    // ... on a second request of a connection, behind a first one in the same read
+    {
+      HttpParser p;
+      const std::string two = "GET / HTTP/1.1\r\nHost: h\r\n\r\n" + std::string(max + 5, 'B');
+      CHECK(feed(p, two) == ParseStatus::Complete);
+      p.reset();
+      CHECK(p.parse(nullptr, 0) == ParseStatus::Error);
+      CHECK(p.errorStatus == 501);
+    }
+    // A long line that is not a long method keeps its own answer.
+    CHECK(status("GET /" + std::string(200, 'a') + " HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Complete);
+    CHECK(status(std::string(30, 'A') + "\x01" + std::string(100, 'A') + " / HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Error);
+    CHECK(code == 400);
+
+    // A request-target is ASCII: raw UTF-8, an overlong form, a lone high byte.
+    for (const char* t : {"/caf\xc3\xa9", "/\xc0\xaf", "/a?b=\xff", "/\x80"}) {
+      CHECK(status(std::string("GET ") + t + " HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Error);
+      CHECK(code == 400);
+      HttpLimits lim;
+      lim.allowNonAsciiTarget = true;  // as before 1.2.2
+      HttpParser p(lim);
+      CHECK(feed(p, std::string("GET ") + t + " HTTP/1.1\r\nHost: h\r\n\r\n") == ParseStatus::Complete);
+    }
+    CHECK(status("GET /caf%C3%A9 HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Complete);
+  }
+
   return 0;
 }

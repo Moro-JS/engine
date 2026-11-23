@@ -588,6 +588,7 @@ struct Settings {
   size_t maxBodySize = 10 * 1024 * 1024;
   size_t maxHeaders = 100;
   size_t maxUriSize = 0;
+  bool allowNonAsciiTarget = false;
 };
 
 struct Stream {
@@ -1405,7 +1406,7 @@ class Session {
         rq.path = true;
         for (const char ch : value) {  // the request-target hygiene of the HTTP/1 parser
           const unsigned char u = static_cast<unsigned char>(ch);
-          if (u <= 0x20 || u == 0x7f) {
+          if (u <= 0x20 || u == 0x7f || (u > 0x7f && !local_.allowNonAsciiTarget)) {
             rq.bad |= kMalformed;
             return;
           }
