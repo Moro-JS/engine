@@ -276,6 +276,63 @@ struct StagedRequest {
   uint32_t routeMissGen = 0;
 };
 
+// What a connection needs only while it has a request: the parser, the
+// snapshot of the request JS was handed, and the buffers responses are built
+// and batched in. A connection between requests has none of it (Connection::rq
+// is null): the state goes back to its server's pool when the connection
+// comes to rest and is taken again when its next bytes arrive (Server::wake,
+// Server::rest), so a held keep-alive connection costs the socket and its
+// bookkeeping and nothing else, and the requests of a busy thread are parsed
+// in a handful of warm objects instead of one cold one per connection.
+// WebSockets and HTTP/2 keep theirs for as long as they live.
+struct ReqState {
+  HttpParser parser;
+  // The engine route the parser's route hook matched for the request being
+  // parsed (light mode): answerFromParser() replies from it without a second
+  // lookup. Exactly one of the two is set; fastSeg points into parser.path.
+  StaticRoute* fastStatic = nullptr;
+  ParamRoute* fastParam = nullptr;
+  const char* fastSeg = nullptr;
+  size_t fastSegLen = 0;
+  // The route-table generation (Server::routeGen_) at which the route hook
+  // looked the parser's current request up and found no engine route for it;
+  // that holds for as long as the tables are still at that generation. 0: the
+  // hook did not consult the tables. Written by every hook call except a
+  // match, and read only for a request that is not in light mode (a match
+  // puts the parser in light mode, and those requests never read it).
+  uint32_t routeMissGen = 0;
+  std::string pending;         // bytes received while a response is in flight
+
+  // Snapshot of the request currently surfaced to JS (valid for the reqId's lifetime; the parser is reset for the next request).
+  Method method = Method::OTHER;
+  std::string methodStr;
+  std::string path;
+  std::string query;
+  HeaderList headers;
+  std::string body;
+  // The body once handed to JS (binding getBody): its storage, kept so a
+  // second call hands over the same bytes again. Opaque here; cleared when
+  // the next request is surfaced.
+  std::shared_ptr<void> jsBody;
+  // The body lent to JS (binding getBodyLent): the ArrayBuffer `body` was
+  // moved into. Opaque here; released - which detaches the ArrayBuffer and
+  // frees the bytes - wherever jsBody is, and before the connection closes.
+  std::shared_ptr<void> jsLent;
+
+  // Pipelined-response corking (see dispatchBatch): while `corked`, response bytes accumulate in corkBuf and are flushed with a single write once the buffered input drains - one syscall per pipelined batch instead of one per response. batchClose records a Connection: close response inside the batch (the flush-then-close is handled by the batch loop's tail).
+  std::string corkBuf;
+
+  // The staging ring of batched dispatch (Connection::stagedHead and stagedCount index it).
+  std::vector<StagedRequest> staged;
+
+  // Reusable response-build buffer: respond()/writeHead()/write()/end() build
+  // frames here instead of a fresh local string, so a warm connection writes
+  // responses with zero allocations (see writeOutView). Oversized capacity is
+  // released after use so one huge response can't stay pinned per connection.
+  std::string scratch;
+
+};
+
 struct Connection {
   Server* server = nullptr;
   // Transport state - exactly ONE arm is live, chosen by server->kind_:
@@ -292,21 +349,6 @@ struct Connection {
     EpollConn ep;
 #endif
   };
-  HttpParser parser;
-  // The engine route the parser's route hook matched for the request being
-  // parsed (light mode): answerFromParser() replies from it without a second
-  // lookup. Exactly one of the two is set; fastSeg points into parser.path.
-  StaticRoute* fastStatic = nullptr;
-  ParamRoute* fastParam = nullptr;
-  const char* fastSeg = nullptr;
-  size_t fastSegLen = 0;
-  // The route-table generation (Server::routeGen_) at which the route hook
-  // looked the parser's current request up and found no engine route for it;
-  // that holds for as long as the tables are still at that generation. 0: the
-  // hook did not consult the tables. Written by every hook call except a
-  // match, and read only for a request that is not in light mode (a match
-  // puts the parser in light mode, and those requests never read it).
-  uint32_t routeMissGen = 0;
 #if defined(_WIN32)
   // Per-connection receive buffer (uninitialized on purpose - uv only reads
   // back what the socket filled). Windows/IOCP posts this into an overlapped
@@ -314,24 +356,17 @@ struct Connection {
   std::unique_ptr<char[]> readBuf;
   size_t readBufSize = 0;
 #endif
-  std::string pending;         // bytes received while a response is in flight
 
-  // Snapshot of the request currently surfaced to JS (valid for the reqId's lifetime; the parser is reset for the next request).
+  // The request state; null while the connection is at rest (see ReqState).
+  ReqState* rq = nullptr;
+  // At rest and counted as such (Server::resting_): an accepted connection
+  // that is still open and holds no request state.
+  bool resting = false;
+  // On Server::restQueue_: came to rest where its state could not be given
+  // back yet (a response completed outside a read).
+  bool restQueued = false;
+  // The request currently surfaced to JS (its snapshot is rq's).
   uint32_t reqId = 0;
-  Method method = Method::OTHER;
-  std::string methodStr;
-  std::string path;
-  std::string query;
-  HeaderList headers;
-  std::string body;
-  // The body once handed to JS (binding getBody): its storage, kept so a
-  // second call hands over the same bytes again. Opaque here; cleared when
-  // the next request is surfaced.
-  std::shared_ptr<void> jsBody;
-  // The body lent to JS (binding getBodyLent): the ArrayBuffer `body` was
-  // moved into. Opaque here; released - which detaches the ArrayBuffer and
-  // frees the bytes - wherever jsBody is, and before the connection closes.
-  std::shared_ptr<void> jsLent;
   bool isHead = false;
   bool reqKeepAlive = true;
   // Snapshotted with reqKeepAlive (the parser may already be on a later
@@ -373,10 +408,11 @@ struct Connection {
   // dispatched once the write queue has drained below the high-water mark
   // (Server::resumeHeld). Only ever set while writes are pending.
   bool outHeld = false;
-  uv_shutdown_t shutdownReq;   // uv arm: the FIN for a queued (non-coalesced) last write
+  // uv arm: the FIN for a queued (non-coalesced) last write. Made when one
+  // is sent; it lives until the connection does (libuv holds it until its
+  // callback, which a close brings forward).
+  uv_shutdown_t* shutdownReq = nullptr;
 
-  // Pipelined-response corking (see dispatchBatch): while `corked`, response bytes accumulate in corkBuf and are flushed with a single write once the buffered input drains - one syscall per pipelined batch instead of one per response. batchClose records a Connection: close response inside the batch (the flush-then-close is handled by the batch loop's tail).
-  std::string corkBuf;
   bool corked = false;
   bool batchClose = false;
 
@@ -388,7 +424,6 @@ struct Connection {
   // binding call until then. aheadComplete: the parser holds one more
   // complete request that found no free slot (HttpParser::parse cannot be
   // re-asked once Done, so the status is remembered here).
-  std::vector<StagedRequest> staged;
   uint32_t stagedHead = 0;
   uint32_t stagedCount = 0;
   uint32_t batchPos = 0;  // index of the active slot within the current batch call
@@ -398,11 +433,6 @@ struct Connection {
   bool undelivered = false;
   bool aheadComplete = false;
 
-  // Reusable response-build buffer: respond()/writeHead()/write()/end() build
-  // frames here instead of a fresh local string, so a warm connection writes
-  // responses with zero allocations (see writeOutView). Oversized capacity is
-  // released after use so one huge response can't stay pinned per connection.
-  std::string scratch;
 
   // WebSocket state (after a successful Upgrade)
   bool isWebSocket = false;
@@ -453,6 +483,8 @@ struct Connection {
   size_t lastWriteQueue = SIZE_MAX;
 
   ~Connection() {
+    delete rq;
+    delete shutdownReq;
     delete wsParser;
     delete tls;
     delete pmd;
@@ -613,12 +645,16 @@ class Server {
   // the request ever reaching onRequest; what the handshake carried stays
   // readable on the WebSocket through wsHeaders()/wsQuery()/remoteAddress().
   // An invalid handshake is surfaced to JS like any other request.
+  // probe().connections, for this server: the connections it holds, and how
+  // many of them are at rest.
+  size_t openConnections() const { return conns_.size(); }
+  size_t restingConnections() const { return resting_; }
   void setWsAutoUpgrade(bool on) { wsAutoUpgrade_ = on; }
   bool wsAutoUpgrade() const { return wsAutoUpgrade_; }
   // The handshake request's headers and query string, kept on the connection
   // for its WebSocket lifetime (nothing parses HTTP on it again).
-  const HeaderList& wsHeaders(Connection* c) const { return c->headers; }
-  const std::string& wsQuery(Connection* c) const { return c->query; }
+  const HeaderList& wsHeaders(Connection* c) const { return c->rq->headers; }
+  const std::string& wsQuery(Connection* c) const { return c->rq->query; }
   // The control cell JS polls between slots: the index of the slot that is
   // active within the current batch call, or the batch's count once every
   // slot has been answered. Owned by the binding (an ArrayBuffer's storage),
@@ -1011,18 +1047,18 @@ class Server {
     // every pipelined batch. (TLS must go through writeOutView so the frame is
     // encrypted before it reaches corkBuf.)
     if (c->corked && !c->tls) {
-      c->corkBuf.reserve(c->corkBuf.size() + bodyLen + headersBlock.size() +
+      c->rq->corkBuf.reserve(c->rq->corkBuf.size() + bodyLen + headersBlock.size() +
                          128);
-      appendResponse(c->corkBuf, c, status, headersBlock, customCL, body,
+      appendResponse(c->rq->corkBuf, c, status, headersBlock, customCL, body,
                      bodyLen, bodyless, tpl);
       c->responseStarted = true;
       c->responseEnded = true;
       completeCorkedResponse(c);
-      if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
+      if (c->rq->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
       return;
     }
 
-    std::string& out = c->scratch;
+    std::string& out = c->rq->scratch;
     out.clear();
     const size_t sendLen = (!c->isHead && !bodyless) ? bodyLen : 0;
     if (c->tls && sendLen > kTlsInlineBody) {
@@ -1069,7 +1105,7 @@ class Server {
                                    long long customCL, const char* body, size_t bodyLen,
                                    const ResponseTemplate* tpl) {
     if (c->tls || c->isHead || !c->reqKeepAlive || c->pendingWrites != 0) return false;
-    std::string& buf = c->corked ? c->corkBuf : c->scratch;
+    std::string& buf = c->corked ? c->rq->corkBuf : c->rq->scratch;
     if (!c->corked) {
       buf.clear();
     } else if ((c->stagedCount != 0 || c->aheadComplete) &&
@@ -1082,7 +1118,7 @@ class Server {
     writeBehind(c, buf, body, bodyLen, /*terminal=*/true);
     if (c->corked) {
       completeCorkedResponse(c);
-      if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
+      if (c->rq->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
     }
     return true;
   }
@@ -1153,9 +1189,9 @@ class Server {
   // One huge response must not pin its capacity to an idle connection; small
   // (typical) responses keep theirs so the next build is allocation-free.
   static void releaseScratch(Connection* c) {
-    if (c->scratch.capacity() > 16384) {
-      c->scratch.clear();
-      c->scratch.shrink_to_fit();
+    if (c->rq->scratch.capacity() > 16384) {
+      c->rq->scratch.clear();
+      c->rq->scratch.shrink_to_fit();
     }
   }
 
@@ -1189,7 +1225,7 @@ class Server {
       c->declaredLen = customCL;
     }
 
-    std::string& out = c->scratch;
+    std::string& out = c->rq->scratch;
     out.clear();
     appendStatusLine(out, status);
     out += dateLine();
@@ -1235,7 +1271,7 @@ class Server {
       // make), and so has a large chunk on either: it is written, or
       // encrypted, from the caller's bytes.
       if (c->tls || len >= kChunkDirect) return writeChunkApart(c, data, len);
-      std::string& out = c->scratch;
+      std::string& out = c->rq->scratch;
       out.clear();
       appendChunkSize(out, len);
       out.append(data, len);
@@ -1269,7 +1305,7 @@ class Server {
       return;
     }
 
-    std::string& out = c->scratch;
+    std::string& out = c->rq->scratch;
     out.clear();
     std::string_view direct;  // an unframed last piece, written from the caller's bytes
     if (!c->responseStarted) {
@@ -1347,7 +1383,7 @@ class Server {
     // RFC 6455 §4.2.1 item 1: the handshake is "an HTTP/1.1 or higher GET
     // request". Any other method, and HTTP/1.0, is an ordinary request
     // whatever headers it carries.
-    if (c->method != Method::GET || !c->reqHttp11) return 0;
+    if (c->rq->method != Method::GET || !c->reqHttp11) return 0;
     // Validate the upgrade (RFC 6455 §4.2.1): Upgrade: websocket, Connection: Upgrade, a Sec-WebSocket-Key, Version 13.
     std::string_view key;
     std::string_view extensions;
@@ -1358,7 +1394,7 @@ class Server {
     // (which of two keys, or of two versions, would be the one meant?).
     unsigned keyLines = 0, versionLines = 0;
     bool hasUpgrade = false, hasConnUpgrade = false, ver13 = false;
-    for (const Header h : c->headers) {
+    for (const Header h : c->rq->headers) {
       if (h.name == "upgrade" && iequals(trimOWS(h.value), "websocket"))
         hasUpgrade = true;
       else if (h.name == "connection") {
@@ -1484,12 +1520,12 @@ class Server {
     globalRequests().erase(c->reqId);
     c->reqId = 0;
     c->active = false;
-    c->jsBody.reset();
-    c->jsLent.reset();
+    c->rq->jsBody.reset();
+    c->rq->jsLent.reset();
     writeOut(c, std::move(resp), /*terminal=*/false);
 
     const uint32_t wsId = c->wsId;
-    if (cb_.onWsOpen) cb_.onWsOpen(cb_.user, c, c->path);
+    if (cb_.onWsOpen) cb_.onWsOpen(cb_.user, c, c->rq->path);
     // Frames the client sent before the 101 went out must reach the WebSocket
     // parser (copied out first: feedWebSocket may tear the connection down on a
     // protocol error, after which c and its parser must not be touched; the
@@ -1497,13 +1533,13 @@ class Server {
     // Two sources, in receive order: bytes buffered in the HTTP parser from the
     // same segment as the handshake request (leftover), then any frames the
     // client sent in later segments while an async upgrade handler had not yet
-    // responded (c->pending). c->pending's only other drain, finishResponse, is
+    // responded (c->rq->pending). c->rq->pending's only other drain, finishResponse, is
     // unreachable once the 101 is written terminal=false, so without this it
     // would be silently dropped -> WS desync.
-    std::string early(c->parser.leftover());
-    early.append(c->pending);
-    c->pending.clear();
-    c->parser = HttpParser(limits_);  // HTTP is done on this connection
+    std::string early(c->rq->parser.leftover());
+    early.append(c->rq->pending);
+    c->rq->pending.clear();
+    c->rq->parser = HttpParser(limits_);  // HTTP is done on this connection
     if (!early.empty()) feedWebSocket(c, early.data(), early.size());
     return wsId;
   }
@@ -1550,8 +1586,8 @@ class Server {
       // frame is built straight into the cork buffer, the way respond() builds
       // a corked HTTP reply, so an echo costs one append and no scratch copy.
       // The flush at the high-water mark is the one transportWrite applies.
-      encodeShortFrame(c->corkBuf, opcode, payload, /*rsv1=*/compressed);
-      if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
+      encodeShortFrame(c->rq->corkBuf, opcode, payload, /*rsv1=*/compressed);
+      if (c->rq->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
     } else {
       // Frame into the connection's reusable scratch buffer (same policy as
       // respond()'s non-corked path): a warm connection sends with zero
@@ -1560,7 +1596,7 @@ class Server {
       // reach the kernel synchronously (uv_try_write) or are copied first -
       // into a queued WriteReq, the TLS ciphertext buffer (writePlain), or
       // on a TLS connection the batch's plaintext or its corkBuf.
-      std::string& out = c->scratch;
+      std::string& out = c->rq->scratch;
       out.clear();
       encodeShortFrame(out, opcode, payload, /*rsv1=*/compressed);
       if (c->tls) {
@@ -1574,7 +1610,7 @@ class Server {
     if (compressed && deflated.capacity() > kCipherScratchKeep) std::string().swap(deflated);
     // Frames corked for this read's batch (feedWebSocket) are queued too:
     // they leave with the flush, so the backpressure signal counts them.
-    size_t q = tPendingBytes(c) + c->corkBuf.size() + gathered;
+    size_t q = tPendingBytes(c) + c->rq->corkBuf.size() + gathered;
     if (backlog && limits_.wsBackpressureLimit && q > limits_.wsBackpressureLimit) {
       // Slow/stalled consumer - shed it (1013 Try Again Later) so its queued
       // frames can't grow memory without bound (limits_.wsBackpressureLimit,
@@ -1735,7 +1771,7 @@ class Server {
       // record per 16 KiB at the flush, where each reply used to be a record
       // of its own, with its own header, tag and pass through the cipher
       // set-up.
-      std::string& cork = c->corkBuf;
+      std::string& cork = c->rq->corkBuf;
       const bool direct = cork.empty() && tlsDirectOk(c) && c->stagedCount == 0 &&
                           !c->aheadComplete && tlsGather_.conn != c;
       if (!direct && (tlsGather_.conn == c || tlsCompany(c))) {
@@ -1840,12 +1876,12 @@ class Server {
     TlsGather& g = tlsGather_;
     const size_t n = head.size() + body.size();
     const bool mine = tlsGathering(c);
-    if (n > kTlsGatherMax || (!mine && (!c->corkBuf.empty() || !c->tls->writable()))) {
+    if (n > kTlsGatherMax || (!mine && (!c->rq->corkBuf.empty() || !c->tls->writable()))) {
       if (mine) {
         tlsUngather(c);
         if (c->closing) return;
       }
-      std::string& cork = c->corkBuf;
+      std::string& cork = c->rq->corkBuf;
       const size_t mark = cork.size();
       const bool ok =
           (head.empty() || c->tls->writePlain(head.data(), head.size(), cork, !body.empty())) &&
@@ -1909,20 +1945,20 @@ class Server {
     }
     // The usual batch is under a record's worth and nothing has been sealed
     // yet: it is encrypted straight into the cork buffer.
-    if (g.sealed.empty() && c->corkBuf.empty()) {
-      if (!tlsSeal(c, c->corkBuf)) return false;
+    if (g.sealed.empty() && c->rq->corkBuf.empty()) {
+      if (!tlsSeal(c, c->rq->corkBuf)) return false;
       g.conn = nullptr;
-      return !c->corkBuf.empty();
+      return !c->rq->corkBuf.empty();
     }
     if (!tlsSeal(c, g.sealed)) return false;
     g.conn = nullptr;
-    if (c->corkBuf.empty()) c->corkBuf.swap(g.sealed);
-    else c->corkBuf.append(g.sealed);
+    if (c->rq->corkBuf.empty()) c->rq->corkBuf.swap(g.sealed);
+    else c->rq->corkBuf.append(g.sealed);
     g.sealed.clear();
     // The buffers are one per loop and keep what a batch of small replies
     // needs; a batch that grew past that gives its memory back.
     if (g.sealed.capacity() > kCipherScratchKeep) std::string().swap(g.sealed);
-    return !c->corkBuf.empty();
+    return !c->rq->corkBuf.empty();
   }
 
   MORO_NOINLINE void tlsFlushGathered(Connection* c) {
@@ -1946,7 +1982,7 @@ class Server {
     } else if (len >= kChunkDirect) {
       tlsWriteChunk(c, data, len, /*last=*/false);
     } else {
-      std::string& out = c->scratch;
+      std::string& out = c->rq->scratch;
       out.clear();
       appendChunkSize(out, len);
       out.append(data, len);
@@ -1965,18 +2001,18 @@ class Server {
   // scratch first, every byte of it was copied once more than the kernel's
   // own copy, into memory allocated for the chunk and released after it.
   void writeChunkDirect(Connection* c, const char* data, size_t len, bool last) {
-    std::string& buf = c->corked ? c->corkBuf : c->scratch;
+    std::string& buf = c->corked ? c->rq->corkBuf : c->rq->scratch;
     if (!c->corked) buf.clear();
     appendChunkSize(buf, len);
     writeBehind(c, buf, data, len, /*terminal=*/last,
                 last ? std::string_view("\r\n0\r\n\r\n", 7) : std::string_view("\r\n", 2));
     if (!c->corked) return;
     if (last) completeCorkedResponse(c);
-    if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
+    if (c->rq->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
   }
 
   void tlsWriteChunk(Connection* c, const char* data, size_t len, bool last) {
-    std::string& out = c->scratch;
+    std::string& out = c->rq->scratch;
     out.clear();
     out.reserve(2 * kTlsRecord + 32);  // both ends at their largest: one allocation
     appendChunkSize(out, len);
@@ -2002,7 +2038,7 @@ class Server {
       tlsUngather(c);
       if (c->closing) return;
     }
-    std::string& out = c->corked ? c->corkBuf : cipherScratch_;
+    std::string& out = c->corked ? c->rq->corkBuf : cipherScratch_;
     if (!c->corked) out.clear();
     const size_t mark = out.size();
     const bool direct = mark == 0 && tlsDirectOk(c) &&
@@ -2163,7 +2199,7 @@ class Server {
       tlsWrite(c, std::string_view(bytes, n), payload, /*terminal=*/false);
       return;
     }
-    std::string& buf = c->corked ? c->corkBuf : c->scratch;
+    std::string& buf = c->corked ? c->rq->corkBuf : c->rq->scratch;
     if (!c->corked) buf.clear();
     buf.append(bytes, n);
     writeBehind(c, buf, payload.data(), payload.size(), /*terminal=*/false);
@@ -2174,16 +2210,16 @@ class Server {
   //
   // Fast path (the "cork" equivalent): when nothing is already queued, hand the bytes straight to the kernel with uv_try_write - for a small response on a non-backpressured socket (the overwhelmingly common case) this skips the WriteReq heap allocation, libuv's write-request queue, AND the deferred completion callback entirely. Ordering is safe because the fast path only runs with an empty write queue (pendingWrites == 0; uv_try_write itself also refuses to interleave with queued data).
   //
-  // A TERMINAL write completed synchronously must also complete the response (finishResponse - previously always deferred to onWrite). That is only taken when no pipelined bytes are buffered (c->pending and the parser's leftover are empty), so finishResponse just resets per-request state and cannot re-enter a JS handler from inside the current respond()/end() crossing. With buffered pipelined data the write falls through to the queued path and completes on a clean stack, exactly as before.
+  // A TERMINAL write completed synchronously must also complete the response (finishResponse - previously always deferred to onWrite). That is only taken when no pipelined bytes are buffered (c->rq->pending and the parser's leftover are empty), so finishResponse just resets per-request state and cannot re-enter a JS handler from inside the current respond()/end() crossing. With buffered pipelined data the write falls through to the queued path and completes on a clean stack, exactly as before.
   void transportWrite(Connection* c, std::string&& data, bool terminal) {
     if (c->closing) return;
     if (data.empty() && !terminal) return;
 
     // Corked (inside dispatchBatch): accumulate instead of writing. A terminal write completes the response's bookkeeping synchronously - safe because the batch loop surfaces the NEXT request only after the current handler returns, so this never re-enters JS from inside a respond()/end() crossing. The buffer is bounded: it flushes at the write high-water mark.
     if (c->corked) {
-      if (!data.empty()) c->corkBuf += data;
+      if (!data.empty()) c->rq->corkBuf += data;
       if (terminal) completeCorkedResponse(c);
-      if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
+      if (c->rq->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
       return;
     }
 
@@ -2192,7 +2228,7 @@ class Server {
     // which splits it into <= 1 GiB segments (see kMaxWriteChunk).
     if (c->pendingWrites == 0 && data.size() <= kMaxWriteChunk) {
       const bool canFinishSync =
-          !terminal || (c->pending.empty() && c->parser.leftover().empty() &&
+          !terminal || (c->rq->pending.empty() && c->rq->parser.leftover().empty() &&
                         c->stagedCount == 0 && !c->aheadComplete);
       if (canFinishSync) {
         if (data.empty()) {
@@ -2238,16 +2274,16 @@ class Server {
     if (c->closing) return;
     if (data.empty() && !terminal) return;  // nothing owed (a TLS reply that went out directly)
     if (c->corked) {
-      if (!data.empty()) c->corkBuf.append(data);
+      if (!data.empty()) c->rq->corkBuf.append(data);
       if (terminal) completeCorkedResponse(c);
-      if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
+      if (c->rq->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
       return;
     }
     // See transportWrite: the single-buffer fast path is skipped for an
     // oversized payload so queueWrite can split it into <= 1 GiB segments.
     if (c->pendingWrites == 0 && data.size() <= kMaxWriteChunk) {
       const bool canFinishSync =
-          !terminal || (c->pending.empty() && c->parser.leftover().empty() &&
+          !terminal || (c->rq->pending.empty() && c->rq->parser.leftover().empty() &&
                         c->stagedCount == 0 && !c->aheadComplete);
       if (canFinishSync) {
         if (data.empty()) {
@@ -2424,8 +2460,8 @@ class Server {
     uint32_t oldId = c->reqId;
     reqMap_->erase(oldId);
     c->active = false;
-    c->jsBody.reset();  // a body JS kept lives on in JS; nothing pins it to an idle connection
-    c->jsLent.reset();
+    c->rq->jsBody.reset();  // a body JS kept lives on in JS; nothing pins it to an idle connection
+    c->rq->jsLent.reset();
     recycleBody(c);
 
     if (!c->reqKeepAlive) {
@@ -2440,18 +2476,20 @@ class Server {
       // no parse - the parser holds whatever follows them.
       if (c->stagedCount > 0 || c->aheadComplete) dispatchBatch(c, ParseStatus::NeedMore, /*parsed=*/false);
       else dispatchBatch(c, parseNext(c), /*parsed=*/true);
+      queueRest(c);
       return;
     }
-    c->parser.reset();
+    c->rq->parser.reset();
     dispatchBatchSequential(c, parseNext(c));
+    queueRest(c);
   }
 
   // Corked variant of finishResponse: same per-request bookkeeping, but no write happened yet (the bytes sit in corkBuf) and the next pipelined request is surfaced by dispatchBatch's loop, not from here. A Connection: close response just flags the batch; the loop's tail closes after the flush.
   void completeCorkedResponse(Connection* c) {
     reqMap_->erase(c->reqId);
     c->active = false;
-    c->jsBody.reset();
-    c->jsLent.reset();
+    c->rq->jsBody.reset();
+    c->rq->jsLent.reset();
     recycleBody(c);
     if (!c->reqKeepAlive) {
       c->batchClose = true;
@@ -2459,7 +2497,7 @@ class Server {
     }
     resetResponseState(c);
     if (!batchOn_) {
-      c->parser.reset();
+      c->rq->parser.reset();
       return;
     }
     // Batched: the parser was reset when this request was staged and may
@@ -2481,11 +2519,11 @@ class Server {
       // write queue has drained. The response just completed is still in the
       // cork buffer; once that has reached the mark it is written out first
       // (the caller would do it next), so that the check counts it.
-      if (c->corkBuf.size() >= limits_.writeHighWaterMark) {
+      if (c->rq->corkBuf.size() >= limits_.writeHighWaterMark) {
         flushCork(c);
         if (c->closing) return;  // the write failed or went over a limit; the loop has been told
       }
-      if ((wsAutoUpgrade_ && c->staged[c->stagedHead].upgrade) || holdForOutput(c)) {
+      if ((wsAutoUpgrade_ && c->rq->staged[c->stagedHead].upgrade) || holdForOutput(c)) {
         if (batchControl_ && batchLoopConn_ == c) *batchControl_ = c->batchPos + 1 + c->stagedCount;
         return;
       }
@@ -2509,7 +2547,7 @@ class Server {
   // nothing - every read of a request body still arriving ends with one -
   // costs a comparison and no call.
   MORO_ALWAYS_INLINE void flushCork(Connection* c) {
-    if (c->corkBuf.empty() || c->closing) {
+    if (c->rq->corkBuf.empty() || c->closing) {
       // Nothing corked - unless the batch's small TLS replies are still to
       // be sealed (tlsCork): their records are put here, and written.
       if (tlsGather_.conn == c) tlsFlushGathered(c);
@@ -2522,23 +2560,23 @@ class Server {
     // A single huge corked response (respond() appends the whole frame to
     // corkBuf) can exceed one uv_buf_t; defer it to the queued path below,
     // which splits into <= 1 GiB segments (see kMaxWriteChunk).
-    if (c->pendingWrites == 0 && c->corkBuf.size() <= kMaxWriteChunk) {
+    if (c->pendingWrites == 0 && c->rq->corkBuf.size() <= kMaxWriteChunk) {
       int n = (c->batchClose && !c->tls && !c->isWebSocket)
-                  ? tTryWriteLast(c, c->corkBuf.data(), c->corkBuf.size())
-                  : tTryWrite(c, c->corkBuf.data(), c->corkBuf.size());
-      if (n == static_cast<int>(c->corkBuf.size())) {
-        c->corkBuf.clear();
+                  ? tTryWriteLast(c, c->rq->corkBuf.data(), c->rq->corkBuf.size())
+                  : tTryWrite(c, c->rq->corkBuf.data(), c->rq->corkBuf.size());
+      if (n == static_cast<int>(c->rq->corkBuf.size())) {
+        c->rq->corkBuf.clear();
         // Don't pin a large batch's capacity to an idle keep-alive connection
         // (same 16 KiB watermark as releaseScratch / the parser body / WS
         // message_).
-        if (c->corkBuf.capacity() > 16384) c->corkBuf.shrink_to_fit();
+        if (c->rq->corkBuf.capacity() > 16384) c->rq->corkBuf.shrink_to_fit();
         return;
       }
-      if (n > 0) c->corkBuf.erase(0, static_cast<size_t>(n));
+      if (n > 0) c->rq->corkBuf.erase(0, static_cast<size_t>(n));
       // UV_EAGAIN / error: queue the remainder below (a real socket error surfaces through uv_write/onWrite exactly as on the uncorked path).
     }
     std::string out;
-    out.swap(c->corkBuf);
+    out.swap(c->rq->corkBuf);
     const bool was = c->corked;
     c->corked = false;  // the queued path, not the cork branch
     transportWrite(c, std::move(out), /*terminal=*/false);
@@ -2590,7 +2628,7 @@ class Server {
           st = parseNext(c);
           continue;
         }
-        if (c->parser.light()) {  // see handleParse: its route is gone; never stage a headerless request
+        if (c->rq->parser.light()) {  // see handleParse: its route is gone; never stage a headerless request
           sendErrorAndClose(c, 500);
           parsed = false;
           break;
@@ -2658,15 +2696,15 @@ class Server {
   // the parser still holds. (Inlined into the dispatch loops, where it runs
   // once per pipelined request.)
   MORO_ALWAYS_INLINE ParseStatus parseNext(Connection* c) {
-    if (!c->pending.empty()) {
+    if (!c->rq->pending.empty()) {
       std::string p;
-      p.swap(c->pending);
-      return c->parser.parse(p.data(), p.size());
+      p.swap(c->rq->pending);
+      return c->rq->parser.parse(p.data(), p.size());
     }
     // Nothing buffered and no partial request: the next one comes with the
     // next read, which is what an empty parse() call would report.
-    if (!c->parser.midRequest()) return ParseStatus::NeedMore;
-    return c->parser.parse(nullptr, 0);
+    if (!c->rq->parser.midRequest()) return ParseStatus::NeedMore;
+    return c->rq->parser.parse(nullptr, 0);
   }
 
   // Move the parser's complete request into the next staged slot and reset
@@ -2678,32 +2716,32 @@ class Server {
     // time a request is staged behind another (it pipelines): one that sends
     // a request at a time - most of them, and every connection that carries
     // a single request - never constructs and destroys the rest.
-    if (c->staged.empty()) c->staged.resize(1);
+    if (c->rq->staged.empty()) c->rq->staged.resize(1);
     // An empty ring starts over at its first slot: a connection that sends
     // one request at a time then uses the same slot for every one of them,
     // where walking the ring spread its header and path strings over sixteen
     // sets of buffers, each cold by the time its turn came round again.
     if (c->stagedCount == 0) c->stagedHead = 0;
-    else if (c->staged.size() < kMaxStaged) growStaged(c);
-    StagedRequest& sr = c->staged[(c->stagedHead + c->stagedCount) % kMaxStaged];
+    else if (c->rq->staged.size() < kMaxStaged) growStaged(c);
+    StagedRequest& sr = c->rq->staged[(c->stagedHead + c->stagedCount) % kMaxStaged];
     c->stagedCount++;
-    const bool upgrade = c->parser.hasUpgrade();
-    sr.expectContinue = !c->sentContinue && c->parser.expectContinue();
+    const bool upgrade = c->rq->parser.hasUpgrade();
+    sr.expectContinue = !c->sentContinue && c->rq->parser.expectContinue();
     sr.reqId = nextReqId();
-    sr.method = c->parser.method;
+    sr.method = c->rq->parser.method;
     // Swap, not copy (see surfaceRequest): the slot's previous buffers become
     // the parser's scratch for the next request.
-    swapField(sr.methodStr, c->parser.methodStr);
-    sr.path.swap(c->parser.path);
-    swapField(sr.query, c->parser.query);
-    sr.headers.swap(c->parser.headers);
-    swapField(sr.body, c->parser.body);
+    swapField(sr.methodStr, c->rq->parser.methodStr);
+    sr.path.swap(c->rq->parser.path);
+    swapField(sr.query, c->rq->parser.query);
+    sr.headers.swap(c->rq->parser.headers);
+    swapField(sr.body, c->rq->parser.body);
     sr.isHead = (sr.method == Method::HEAD);
-    sr.reqKeepAlive = c->parser.keepAlive;
-    sr.reqHttp11 = c->parser.minorVersion >= 1;
+    sr.reqKeepAlive = c->rq->parser.keepAlive;
+    sr.reqHttp11 = c->rq->parser.minorVersion >= 1;
     sr.upgrade = upgrade;
-    sr.routeMissGen = c->routeMissGen;  // a staged request is never an engine-answered one
-    c->parser.reset();
+    sr.routeMissGen = c->rq->routeMissGen;  // a staged request is never an engine-answered one
+    c->rq->parser.reset();
     return !sr.reqKeepAlive || upgrade;
   }
 
@@ -2711,24 +2749,24 @@ class Server {
   // slot keeps its place (index 0, where an empty ring starts), so the ring
   // arithmetic needs no change; no reference to a slot is held across a call
   // to stageRequest.
-  MORO_NOINLINE void growStaged(Connection* c) { c->staged.resize(kMaxStaged); }
+  MORO_NOINLINE void growStaged(Connection* c) { c->rq->staged.resize(kMaxStaged); }
 
   // The head staged slot becomes the active request: fields swapped in, id
   // registered, static routes answered right here (which, inside a corked
   // batch, completes it synchronously and activates the next slot in turn).
   void activateStaged(Connection* c) {
-    StagedRequest& sr = c->staged[c->stagedHead];
+    StagedRequest& sr = c->rq->staged[c->stagedHead];
     c->stagedHead = (c->stagedHead + 1) % kMaxStaged;
     c->stagedCount--;
     c->reqId = sr.reqId;
-    c->method = sr.method;
-    swapField(c->methodStr, sr.methodStr);
-    c->path.swap(sr.path);
-    swapField(c->query, sr.query);
-    c->headers.swap(sr.headers);
-    swapField(c->body, sr.body);
-    c->jsBody.reset();
-    c->jsLent.reset();
+    c->rq->method = sr.method;
+    swapField(c->rq->methodStr, sr.methodStr);
+    c->rq->path.swap(sr.path);
+    swapField(c->rq->query, sr.query);
+    c->rq->headers.swap(sr.headers);
+    swapField(c->rq->body, sr.body);
+    c->rq->jsBody.reset();
+    c->rq->jsLent.reset();
     c->isHead = sr.isHead;
     c->reqKeepAlive = sr.reqKeepAlive;
     c->reqHttp11 = sr.reqHttp11;
@@ -2767,12 +2805,12 @@ class Server {
   MORO_NOINLINE void activateUnderNewId(Connection* c) {
     c->stagedHead = (c->stagedHead + kMaxStaged - 1) % kMaxStaged;
     c->stagedCount++;
-    StagedRequest& sr = c->staged[c->stagedHead];
-    c->methodStr.swap(sr.methodStr);
-    c->path.swap(sr.path);
-    c->query.swap(sr.query);
-    c->headers.swap(sr.headers);
-    c->body.swap(sr.body);
+    StagedRequest& sr = c->rq->staged[c->stagedHead];
+    c->rq->methodStr.swap(sr.methodStr);
+    c->rq->path.swap(sr.path);
+    c->rq->query.swap(sr.query);
+    c->rq->headers.swap(sr.headers);
+    c->rq->body.swap(sr.body);
     c->active = false;
     const uint32_t id = nextReqId();
     sr.reqId = id;
@@ -2812,7 +2850,7 @@ class Server {
   // here to give, and neither is one lent with getBodyLent.
   static constexpr size_t kBodyPoolSize = 8;
   static constexpr size_t kBodyPoolKeep = 64 * 1024;
-  void recycleBody(Connection* c) { recycleBodyBuffer(c->body); }
+  void recycleBody(Connection* c) { recycleBodyBuffer(c->rq->body); }
   void recycleBodyBuffer(std::string& b) {
     if (b.capacity() < HttpParser::kOwnBodyCapacity) return;
     b.clear();
@@ -2865,12 +2903,12 @@ class Server {
       if (st != ParseStatus::Complete) break;  // NeedMore: await more bytes
       if (holdForOutput(c)) break;  // answered into a queue the peer is not draining; resumeHeld goes on
       // Response corked and completed synchronously - surface the next buffered pipelined request (completeCorkedResponse already reset the parser; reads cannot interleave while this loop runs).
-      if (!c->pending.empty()) {
+      if (!c->rq->pending.empty()) {
         std::string p;
-        p.swap(c->pending);
-        st = c->parser.parse(p.data(), p.size());
-      } else if (c->parser.midRequest()) {
-        st = c->parser.parse(nullptr, 0);
+        p.swap(c->rq->pending);
+        st = c->rq->parser.parse(p.data(), p.size());
+      } else if (c->rq->parser.midRequest()) {
+        st = c->rq->parser.parse(nullptr, 0);
       } else {
         break;  // nothing buffered: the next request comes with the next read
       }
@@ -2920,26 +2958,26 @@ class Server {
     // ("PRI * HTTP/2.0"); it usually arrives whole, and `pending` - unused
     // until a request is in flight - holds a partial one.
     const std::string_view magic = h2::kPreface;
-    const size_t have = c->pending.size();
+    const size_t have = c->rq->pending.size();
     const size_t cmp = std::min(len, magic.size() - have);
     if (memcmp(data, magic.data() + have, cmp) != 0) {
       c->proto = 1;
       if (have == 0) return true;
       // What looked like the start of a preface was not: it is HTTP/1 input.
       std::string all;
-      all.swap(c->pending);
+      all.swap(c->rq->pending);
       all.append(data, len);
       dispatchPlaintext(c, all.data(), all.size());
       return false;
     }
     if (have + cmp < magic.size()) {
-      c->pending.append(data, len);
+      c->rq->pending.append(data, len);
       return false;
     }
     h2Start(c);
     if (have != 0) {
       std::string all;
-      all.swap(c->pending);
+      all.swap(c->rq->pending);
       all.append(data, len);
       h2Feed(c, all.data(), all.size());
     } else {
@@ -3077,6 +3115,7 @@ class Server {
       sc = new Connection();
     }
     sc->server = this;
+    if (sc->rq == nullptr) takeRq(sc);
     return sc;
   }
 
@@ -3088,16 +3127,16 @@ class Server {
     sc->h2Parent = c;
     sc->h2s = &st;
     sc->proto = 2;
-    sc->method = st.method;
+    sc->rq->method = st.method;
     // Swapped, as a staged HTTP/1 request is: the stream gets this
     // Connection's previous buffers for the next request it assembles.
-    sc->methodStr.swap(st.methodStr);
-    sc->path.swap(st.path);
-    sc->query.swap(st.query);
-    sc->headers.swap(st.headers);
-    sc->body.swap(st.body);
+    sc->rq->methodStr.swap(st.methodStr);
+    sc->rq->path.swap(st.path);
+    sc->rq->query.swap(st.query);
+    sc->rq->headers.swap(st.headers);
+    sc->rq->body.swap(st.body);
     st.headerCount = 0;
-    sc->isHead = (sc->method == Method::HEAD);
+    sc->isHead = (sc->rq->method == Method::HEAD);
     sc->reqKeepAlive = true;
     sc->reqHttp11 = true;
     sc->requestTicks = 0;
@@ -3177,8 +3216,8 @@ class Server {
       *batchControl_ = sc->batchPos + 1;  // the next slot, or the count when it was the last
     }
     sc->active = false;
-    sc->jsBody.reset();
-    sc->jsLent.reset();
+    sc->rq->jsBody.reset();
+    sc->rq->jsLent.reset();
     recycleBody(sc);
     if (sc->h2s != nullptr && p != nullptr && p->h2 != nullptr) p->h2->release(*sc->h2s);
     if (sc->wantDrain) h2ForgetWaiter(sc->reqId);
@@ -3195,9 +3234,9 @@ class Server {
     sc->bodyBytesSent = 0;
     sc->wantDrain = false;
     sc->abortNotified = false;
-    sc->methodStr.clear();
-    sc->path.clear();
-    sc->query.clear();
+    sc->rq->methodStr.clear();
+    sc->rq->path.clear();
+    sc->rq->query.clear();
     // Reused when there is room, deleted at the next sweep otherwise - never
     // here, where a caller further up the stack may still be reading it.
     (h2Free_.size() < kH2FreeMax ? h2Free_ : h2Dead_).push_back(sc);
@@ -3672,15 +3711,103 @@ class Server {
   uv_poll_t uvListenPoll_{};
 #endif
 
+  // ---- request state (ReqState) ----
+  // A connection holds one from its first bytes until it comes to rest:
+  // nothing of a request left on it in either direction. The pool is this
+  // server's and small: a thread serves one read at a time, so the states in
+  // use at once are the requests handlers are holding and the responses
+  // still being written, and a state that comes back is the next one out,
+  // warm. What a pooled state still holds of its last request is what a
+  // connection held of its own last request before: buffers, emptied or
+  // overwritten before they are read. A burst of requests held at once
+  // (handlers that answer later) can leave up to kRqPoolMax behind; the
+  // sweep brings the pool back to kRqPoolKeep.
+  static constexpr size_t kRqPoolMax = 256;
+  static constexpr size_t kRqPoolKeep = 32;
+  MORO_ALWAYS_INLINE void wake(Connection* c) {
+    if (c->rq != nullptr) return;
+    takeRq(c);
+    if (c->resting) {
+      c->resting = false;
+      resting_--;
+    }
+  }
+  void takeRq(Connection* c) {
+    ReqState* rq;
+    if (!rqPool_.empty()) {
+      rq = rqPool_.back();
+      rqPool_.pop_back();
+    } else {
+      rq = new ReqState();
+      rq->parser = HttpParser(limits_);
+      rq->parser.routeHook = &Server::routeHook;
+      rq->parser.bodyPool = &bodyPool_;
+    }
+    rq->parser.routeHookUser = c;
+    c->rq = rq;
+  }
+  // At rest: a connection between requests, with nothing received and
+  // unparsed, nothing staged, nothing being built or written, and no
+  // request a handler still holds. That includes one that has sent nothing
+  // yet, or only its TLS handshake (what an undecided connection has sent of
+  // an HTTP/2 preface is in `pending`, which keeps it awake). WebSockets and
+  // HTTP/2 never are (their handshake request and their frames live in the
+  // state).
+  MORO_ALWAYS_INLINE bool atRest(const Connection* c) const {
+    if (c->active || c->pendingWrites != 0 || c->proto == 2 || c->stagedCount != 0) return false;
+    if (c->closing || c->isWebSocket || c->corked || c->aheadComplete || c->undelivered ||
+        c->responseStarted || c->inputClosed || c->lingering || c->outHeld || c->closeAfterFlush ||
+        c->batchClose || c->h2 != nullptr || c->h2Parent != nullptr) {
+      return false;
+    }
+    const ReqState* rq = c->rq;
+    return rq->parser.idle() && rq->pending.empty() && rq->corkBuf.empty() && !rq->jsBody && !rq->jsLent;
+  }
+  // A response completed outside a read of its connection (a handler that
+  // answered later, a write the socket finished later) and left it at rest.
+  // The frames above this one may still read the state, so it is given back
+  // at the next point with none of them on the stack: the start of the next
+  // read on this server, or the sweep.
+  void queueRest(Connection* c) {
+    if (c == reading_ || c->restQueued || c->rq == nullptr || !atRest(c)) return;
+    c->restQueued = true;
+    restQueue_.push_back(c);
+  }
+  MORO_NOINLINE void drainRest() {
+    std::vector<Connection*> queued;
+    queued.swap(restQueue_);
+    for (Connection* c : queued) {
+      c->restQueued = false;
+      rest(c);
+    }
+    queued.clear();
+    if (restQueue_.empty()) restQueue_.swap(queued);  // keep the capacity
+  }
+  // Called where a connection may have come to rest and nothing further up
+  // the stack reads its request state: the end of a read, and the sweep.
+  MORO_ALWAYS_INLINE void rest(Connection* c) {
+    ReqState* rq = c->rq;
+    if (rq == nullptr || !atRest(c)) return;
+    c->rq = nullptr;
+    c->resting = true;
+    resting_++;
+    rq->fastStatic = nullptr;
+    rq->fastParam = nullptr;
+    rq->fastSeg = nullptr;
+    rq->fastSegLen = 0;
+    rq->routeMissGen = 0;
+    if (rqPool_.size() < kRqPoolMax) rqPool_.push_back(rq);
+    else delete rq;
+  }
+
   // Transport-neutral tail of accepting a connection: protocol state, TLS
   // session, registry. The caller then starts reads its own way.
   void attachConnection(Connection* c) {
-    c->parser = HttpParser(limits_);
-    c->parser.routeHook = &Server::routeHook;
-    c->parser.routeHookUser = c;
-    c->parser.bodyPool = &bodyPool_;
+    // No request state yet: the first bytes take it (wake).
     if (tlsEnabled_) c->tls = new TlsSession(tlsCtx_.ctx());
     conns_.insert(c);
+    c->resting = true;
+    resting_++;
   }
 
   static void onAlloc(uv_handle_t* handle, size_t suggested, uv_buf_t* buf) {
@@ -3773,16 +3900,23 @@ class Server {
   MORO_NOINLINE void onPlainRead(Connection* c, char* base, size_t nread) {
     if (c->inputClosed) return;
     c->idleTicks = 0;
+    if (!restQueue_.empty()) drainRest();
+    wake(c);
+    reading_ = c;
     if (c->proto != 1) {
       // HTTP/2, or a connection whose first bytes have yet to say which
       // (h2Decide) - unless HTTP/2 is off, which settles it here.
       if (c->proto != 0 || limits_.http2.enabled) {
         onOtherProtocol(c, base, nread);
+        reading_ = nullptr;
+        rest(c);
         return;
       }
       c->proto = 1;
     }
     dispatchHttp1(c, base, nread);
+    reading_ = nullptr;
+    rest(c);
   }
   MORO_NOINLINE void onOtherProtocol(Connection* c, char* base, size_t nread) {
     dispatchPlaintext(c, base, nread);
@@ -3922,6 +4056,15 @@ class Server {
   // provided buffer). The buffer is consumed before this returns - the
   // parser/pending/TLS/WS layers copy what they keep (see onAlloc).
   void onTransportData(Connection* c, char* base, size_t nread) {
+    if (c->inputClosed) return;
+    if (!restQueue_.empty()) drainRest();
+    wake(c);
+    reading_ = c;
+    transportData(c, base, nread);
+    reading_ = nullptr;
+    rest(c);
+  }
+  MORO_ALWAYS_INLINE void transportData(Connection* c, char* base, size_t nread) {
     Server* s = this;
     // Lingering close: the exchange is over and our FIN is out; whatever the
     // peer still writes (typically a request it sent before seeing the FIN)
@@ -4032,11 +4175,11 @@ class Server {
       // parser, and one request (or one write queue's worth) is taken out of
       // it; counting `pending` alone let a peer add another maxPendingBytes
       // per response for as long as it liked.
-      if (c->pending.size() + c->parser.leftover().size() + len > maxPending_) {
+      if (c->rq->pending.size() + c->rq->parser.leftover().size() + len > maxPending_) {
         doClose(c);
         return;
       }
-      c->pending.append(data, len);
+      c->rq->pending.append(data, len);
       return;
     }
     // Nothing queued on the connection in either direction and the parser
@@ -4044,11 +4187,11 @@ class Server {
     // its cache) or, failing that, the same dispatch as below with the
     // parse it already did.
     if (!c->tls && !c->closing && c->stagedCount == 0 && !c->aheadComplete &&
-        c->pendingWrites == 0 && c->corkBuf.empty() && c->parser.idle() && hasEngineRoutes()) {
+        c->pendingWrites == 0 && c->rq->corkBuf.empty() && c->rq->parser.idle() && hasEngineRoutes()) {
       fastLane(c, data, len);
       return;
     }
-    ParseStatus st = c->parser.parse(data, len);
+    ParseStatus st = c->rq->parser.parse(data, len);
     dispatchBatch(c, st);
   }
 
@@ -4141,7 +4284,7 @@ class Server {
               encodeFrame(out, WsOpcode::Pong, payload);
               writeOut(c, std::move(out), /*terminal=*/false);
               // Bound the outgoing queue: a peer flooding Pings while never reading our Pongs would otherwise grow libuv's write buffer without limit (OOM). Shed it, same as wsSend's backpressure cap.
-              size_t q = tPendingBytes(c) + c->corkBuf.size() + tlsGatheredBytes(c);
+              size_t q = tPendingBytes(c) + c->rq->corkBuf.size() + tlsGatheredBytes(c);
               if (limits_.wsBackpressureLimit && q > limits_.wsBackpressureLimit)
                 wsClose(c, 1013, "", 0);
               break;
@@ -4208,7 +4351,7 @@ class Server {
     if (st == ParseStatus::Complete && !c->active && !c->tls && hasEngineRoutes() &&
         answerFromParser(c))
       return;
-    if (st == ParseStatus::Complete && c->parser.light()) {
+    if (st == ParseStatus::Complete && c->rq->parser.light()) {
       // The route hook said "engine route" when this request's line was
       // parsed, so its headers were never stored, and the route is no longer
       // there: the application took it out of the tables before the rest of
@@ -4219,8 +4362,8 @@ class Server {
     }
 
     // Answer Expect: 100-continue before the (already fully-buffered) body - the parser reads the whole body before Complete, so on NeedMore with the head parsed we know a body is pending.
-    if (!c->sentContinue && c->parser.headParsed()) {
-      if (c->parser.expectContinue()) {
+    if (!c->sentContinue && c->rq->parser.headParsed()) {
+      if (c->rq->parser.expectContinue()) {
         c->sentContinue = true;
         std::string cont = "HTTP/1.1 100 Continue\r\n\r\n";
         writeOut(c, std::move(cont), /*terminal=*/false);
@@ -4237,11 +4380,11 @@ class Server {
         // HTTP/1 error would reach an HTTP/2 client as a malformed frame.
         // The connection is ended with no reply (RFC 9113 §3.4 for the one
         // peer, RFC 9112 §2.2 for the other).
-        if (limits_.http2.enabled && !c->tls && c->reqId == 0 && !c->responseStarted && c->parser.notHttp()) {
+        if (limits_.http2.enabled && !c->tls && c->reqId == 0 && !c->responseStarted && c->rq->parser.notHttp()) {
           doClose(c);
           return;
         }
-        sendErrorAndClose(c, c->parser.errorStatus);
+        sendErrorAndClose(c, c->rq->parser.errorStatus);
         return;
       case ParseStatus::Complete:
         surfaceRequest(c);
@@ -4252,18 +4395,18 @@ class Server {
   void surfaceRequest(Connection* c) {
     // Snapshot the request so the reqId stays valid across async responses. Skip ids still bound to live requests: the uint32 counter wraps after 2^32 requests (~12h at 100k rps) and a collision with a still-open long-lived request (e.g. an SSE stream) would silently rebind it.
     c->reqId = nextReqId();
-    c->method = c->parser.method;
+    c->rq->method = c->rq->parser.method;
     // Swap, don't copy: the parser is reset before its next request anyway (reset() clears every swapped-in field, keeping its heap capacity), so the previous snapshot's buffers become the parser's scratch for the NEXT request - snapshots are allocation-free on a warm connection.
-    swapField(c->methodStr, c->parser.methodStr);
-    c->path.swap(c->parser.path);
-    swapField(c->query, c->parser.query);
-    c->headers.swap(c->parser.headers);
-    swapField(c->body, c->parser.body);
-    c->jsBody.reset();
-    c->jsLent.reset();
-    c->isHead = (c->method == Method::HEAD);
-    c->reqKeepAlive = c->parser.keepAlive;
-    c->reqHttp11 = c->parser.minorVersion >= 1;
+    swapField(c->rq->methodStr, c->rq->parser.methodStr);
+    c->rq->path.swap(c->rq->parser.path);
+    swapField(c->rq->query, c->rq->parser.query);
+    c->rq->headers.swap(c->rq->parser.headers);
+    swapField(c->rq->body, c->rq->parser.body);
+    c->rq->jsBody.reset();
+    c->rq->jsLent.reset();
+    c->isHead = (c->rq->method == Method::HEAD);
+    c->reqKeepAlive = c->rq->parser.keepAlive;
+    c->reqHttp11 = c->rq->parser.minorVersion >= 1;
     c->active = true;
     c->requestTicks = 0;  // the request-receive budget is per request
     reqMap_->insert(c->reqId, c);
@@ -4273,18 +4416,18 @@ class Server {
     // the only thing skipped is the trip through JS.
     // Not looked up again when the route hook found no engine route at the
     // request line and the tables have not changed since.
-    if (hasEngineRoutes() && c->routeMissGen != routeGen_ && tryStaticRoute(c)) return;
+    if (hasEngineRoutes() && c->rq->routeMissGen != routeGen_ && tryStaticRoute(c)) return;
     // The engine's own upgrade (wsAutoUpgrade): a valid WebSocket handshake
     // is answered here and onWsOpen fired; the request never reaches JS. So
     // is one whose only fault is its protocol version (426). Any other
     // request with an Upgrade header is surfaced as usual.
-    if (wsAutoUpgrade_ && c->parser.hasUpgrade() && autoUpgrade(c)) return;
+    if (wsAutoUpgrade_ && c->rq->parser.hasUpgrade() && autoUpgrade(c)) return;
     if (cb_.onRequest) cb_.onRequest(cb_.user, c);
   }
 
   bool tryStaticRoute(Connection* c) {
-    const int32_t m = static_cast<int32_t>(c->method);
-    auto it = staticRoutes_.find(c->path);
+    const int32_t m = static_cast<int32_t>(c->rq->method);
+    auto it = staticRoutes_.find(c->rq->path);
     if (it != staticRoutes_.end()) {
       for (const StaticRoute& r : it->second) {
         if (r.method != m) continue;
@@ -4319,7 +4462,7 @@ class Server {
     if (paramRoutes_.empty()) return false;
     const char* seg = nullptr;
     size_t len = 0;
-    const ParamRoute* r = findParamRoute(c->path, m, seg, len);
+    const ParamRoute* r = findParamRoute(c->rq->path, m, seg, len);
     if (!r) return false;
     respond(c, r->tpl.status, r->tpl.headers, r->tpl.customCL, seg, len);
     return true;
@@ -4338,13 +4481,13 @@ class Server {
   // and body land in the Connection's fast* fields.
   bool matchEngineRoute(Connection* c, Method method, const std::string& path) {
     const int32_t m = static_cast<int32_t>(method);
-    c->fastStatic = nullptr;
-    c->fastParam = nullptr;
+    c->rq->fastStatic = nullptr;
+    c->rq->fastParam = nullptr;
     auto it = staticRoutes_.find(path);
     if (it != staticRoutes_.end()) {
       for (StaticRoute& r : it->second) {
         if (r.method != m) continue;
-        c->fastStatic = &r;
+        c->rq->fastStatic = &r;
         return true;
       }
     }
@@ -4353,9 +4496,9 @@ class Server {
     size_t len = 0;
     const ParamRoute* r = findParamRoute(path, m, seg, len);
     if (!r) return false;
-    c->fastParam = const_cast<ParamRoute*>(r);
-    c->fastSeg = seg;
-    c->fastSegLen = len;
+    c->rq->fastParam = const_cast<ParamRoute*>(r);
+    c->rq->fastSeg = seg;
+    c->rq->fastSegLen = len;
     return true;
   }
 
@@ -4369,16 +4512,16 @@ class Server {
     Connection* c = static_cast<Connection*>(user);
     Server* s = c->server;
     if (c->active || c->stagedCount > 0 || c->tls || !s->hasEngineRoutes()) {
-      c->routeMissGen = 0;
+      c->rq->routeMissGen = 0;
       return false;
     }
     if (s->matchEngineRoute(c, method, path)) return true;
-    c->routeMissGen = s->routeGen_;  // no engine route, for as long as the tables stay as they are
+    c->rq->routeMissGen = s->routeGen_;  // no engine route, for as long as the tables stay as they are
     return false;
   }
 
   bool answerFromParser(Connection* c) {
-    HttpParser& p = c->parser;
+    HttpParser& p = c->rq->parser;
     // A light request was matched when its request line was parsed, and the
     // fast* fields point into the route tables. That match is used as it is
     // only when the request completed in the same parse call (nothing ran in
@@ -4391,14 +4534,14 @@ class Server {
     // A request the hook found no route for (not light) is not looked up
     // again while the tables are at the generation of that lookup.
     if (!p.lightFresh()) {
-      if (!p.light() && c->routeMissGen == routeGen_) return false;
+      if (!p.light() && c->rq->routeMissGen == routeGen_) return false;
       if (!matchEngineRoute(c, p.method, p.path)) {
-        c->routeMissGen = routeGen_;
+        c->rq->routeMissGen = routeGen_;
         return false;
       }
     }
     // The framing inputs appendResponse reads from the Connection.
-    c->method = p.method;
+    c->rq->method = p.method;
     c->isHead = (p.method == Method::HEAD);
     c->reqKeepAlive = p.keepAlive;
     c->reqHttp11 = p.minorVersion >= 1;
@@ -4408,27 +4551,27 @@ class Server {
     // the route and the Date line: served from the route's cache, rebuilt
     // only when the Date cache ticks. Every other shape is framed as before.
     const bool plain = c->reqKeepAlive && c->reqHttp11 && !c->isHead;
-    std::string& out = c->corkBuf;
+    std::string& out = c->rq->corkBuf;
     if (plain && plainFrameable(c)) {
       appendPlainFrame(c);
-    } else if (StaticRoute* r = c->fastStatic) {
+    } else if (StaticRoute* r = c->rq->fastStatic) {
       const bool bodyless = isBodyless(r->tpl.status);
       out.reserve(out.size() + r->body.size() + r->tpl.headers.size() + 128);
       appendResponse(out, c, r->tpl.status, r->tpl.headers, r->tpl.customCL, r->body.data(),
                      isContentless(r->tpl.status) ? 0 : r->body.size(), bodyless);
     } else {
-      ParamRoute* pr = c->fastParam;
+      ParamRoute* pr = c->rq->fastParam;
       const bool bodyless = isBodyless(pr->tpl.status);
-      out.reserve(out.size() + c->fastSegLen + pr->tpl.headers.size() + 128);
-      appendResponse(out, c, pr->tpl.status, pr->tpl.headers, pr->tpl.customCL, c->fastSeg,
-                     isContentless(pr->tpl.status) ? 0 : c->fastSegLen, bodyless);
+      out.reserve(out.size() + c->rq->fastSegLen + pr->tpl.headers.size() + 128);
+      appendResponse(out, c, pr->tpl.status, pr->tpl.headers, pr->tpl.customCL, c->rq->fastSeg,
+                     isContentless(pr->tpl.status) ? 0 : c->rq->fastSegLen, bodyless);
     }
     // Same per-request bookkeeping completeCorkedResponse does for a
     // surfaced request, minus the registry: nothing was registered.
     resetResponseState(c);
     if (!p.keepAlive) c->batchClose = true;
     p.reset();
-    if (c->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
+    if (c->rq->corkBuf.size() >= limits_.writeHighWaterMark) flushCork(c);
     return true;
   }
 
@@ -4438,12 +4581,12 @@ class Server {
   // parameter route its cached head up to Content-Length (a bodyless status
   // there is framed the general way).
   bool plainFrameable(Connection* c) const {
-    return c->fastStatic != nullptr || !isContentless(c->fastParam->tpl.status);
+    return c->rq->fastStatic != nullptr || !isContentless(c->rq->fastParam->tpl.status);
   }
 
   void appendPlainFrame(Connection* c) {
-    std::string& out = c->corkBuf;
-    if (StaticRoute* r = c->fastStatic) {
+    std::string& out = c->rq->corkBuf;
+    if (StaticRoute* r = c->rq->fastStatic) {
       dateLine();  // refresh dateCachedAt_
       if (r->frameAt != dateCachedAt_ || r->frame.empty()) {
         r->frame.clear();
@@ -4455,7 +4598,7 @@ class Server {
       out += r->frame;
       return;
     }
-    ParamRoute* pr = c->fastParam;
+    ParamRoute* pr = c->rq->fastParam;
     const std::string& date = dateLine();
     if (pr->headAt != dateCachedAt_ || pr->head.empty()) {
       pr->head.clear();
@@ -4466,9 +4609,9 @@ class Server {
       pr->headAt = dateCachedAt_;
     }
     out += pr->head;
-    appendDecimal(out, c->fastSegLen);
+    appendDecimal(out, c->rq->fastSegLen);
     out += "\r\n\r\n";
-    out.append(c->fastSeg, c->fastSegLen);
+    out.append(c->rq->fastSeg, c->rq->fastSegLen);
   }
 
   // ---- fast lane ----
@@ -4483,11 +4626,11 @@ class Server {
   // exactly as before, with the parse it did. Every request is parsed and
   // routed; nothing is answered from a previous request's bytes.
   void fastLane(Connection* c, const char* data, size_t len) {
-    HttpParser& p = c->parser;
+    HttpParser& p = c->rq->parser;
     ParseStatus st = p.parse(data, len);
     if (st == ParseStatus::Complete && p.light() && p.keepAlive && p.minorVersion >= 1 &&
         p.method != Method::HEAD && p.leftover().empty() && plainFrameable(c)) {
-      c->method = p.method;
+      c->rq->method = p.method;
       answerPlain(c);  // fastSeg points into p.path until the reset below
       p.reset();
       return;
@@ -4495,7 +4638,7 @@ class Server {
     dispatchBatch(c, st);
   }
 
-  // The plain-shape reply for the route in c->fastStatic / c->fastParam:
+  // The plain-shape reply for the route in c->rq->fastStatic / c->rq->fastParam:
   // framed from the route cache into corkBuf and written at once. (Holding
   // a readiness round's replies and sending them in one burst was measured
   // too: it wakes the client less often but leaves the server idle until
@@ -4522,9 +4665,10 @@ class Server {
   void sendErrorAndClose(Connection* c, int status) {
     if (c->inputClosed) return;
     c->inputClosed = true;
-    c->pending.clear();  // never parsed now
+    wake(c);
+    c->rq->pending.clear();  // never parsed now
     c->reqKeepAlive = false;
-    std::string& out = c->scratch;
+    std::string& out = c->rq->scratch;
     out.clear();
     appendStatusLine(out, status);
     out += dateLine();
@@ -4577,8 +4721,9 @@ class Server {
       } else
 #endif
       {
-        c->shutdownReq.data = c;
-        if (uv_shutdown(&c->shutdownReq, reinterpret_cast<uv_stream_t*>(&c->handle), onShutdownDone) != 0) {
+        if (c->shutdownReq == nullptr) c->shutdownReq = new uv_shutdown_t();
+        c->shutdownReq->data = c;
+        if (uv_shutdown(c->shutdownReq, reinterpret_cast<uv_stream_t*>(&c->handle), onShutdownDone) != 0) {
           doClose(c);
           return;
         }
@@ -4626,7 +4771,7 @@ class Server {
       if (!bye.empty()) tTryWrite(c, bye.data(), bye.size());
     }
     c->closing = true;
-    c->jsLent.reset();  // a lent body ends with the connection, whatever state the request was in
+    if (c->rq) c->rq->jsLent.reset();  // a lent body ends with the connection, whatever state the request was in
     // Closed from inside JS's loop over its own batch (a handler closed the
     // server, or the connection went over a limit): the slots still staged
     // die with it, so the loop is told its batch is over and takes no
@@ -4660,6 +4805,10 @@ class Server {
     // closed a second time here (libuv aborts on a handle closed twice).
     if (tIsClosing(c)) return;
     conns_.erase(c);
+    if (c->resting) {
+      c->resting = false;
+      resting_--;
+    }
     tCloseConn(c);
   }
 
@@ -4693,6 +4842,15 @@ class Server {
       c->ep.wqHead = c->ep.wqTail = nullptr;
     }
 #endif
+    if (c->restQueued) {
+      for (size_t i = 0; i < restQueue_.size(); i++) {
+        if (restQueue_[i] == c) {
+          restQueue_[i] = restQueue_.back();
+          restQueue_.pop_back();
+          break;
+        }
+      }
+    }
     delete c;
     // One fewer live transport handle; may complete a pending server shutdown.
     liveHandles_--;
@@ -4714,6 +4872,8 @@ class Server {
     if (!closeRequested_ || liveHandles_ > 0) return;
     void (*cb)(void*) = onClosed_;
     void* user = onClosedUser_;
+    for (ReqState* rq : rqPool_) delete rq;
+    rqPool_.clear();
     delete this;
     if (cb) cb(user);
   }
@@ -4738,12 +4898,20 @@ class Server {
     std::vector<Connection*> stale;
     std::vector<Connection*> overdue;
     std::vector<Connection*> stalled;
+    s->drainRest();
+    while (s->rqPool_.size() > kRqPoolKeep) {
+      delete s->rqPool_.back();
+      s->rqPool_.pop_back();
+    }
     s->h2Reap();
 #if defined(__linux__)
     if (s->acceptPaused_) s->resumeAccept();
 #endif
     for (Connection* c : s->conns_) {
       if (c->closing) continue;
+      // A connection that came to rest outside a read and has not been seen
+      // to since (a response the socket took a while to accept).
+      s->rest(c);
 #if defined(__linux__)
       if (s->kind_ == TransportKind::Uring) s->uringCheckPeer(c);
 #endif
@@ -4823,8 +4991,9 @@ class Server {
         // A TLS handshake in progress counts as mid-request: the same requestTimeoutMs budget bounds handshake slow-drip (a stalled or byte-trickled ClientHello) with no extra knob.
         // So does a cleartext connection whose first bytes are a part of the
         // HTTP/2 preface still waiting for the rest.
-        bool mid = c->parser.midRequest() || (c->tls && !c->tls->handshakeDone()) ||
-                   (c->proto == 0 && !c->pending.empty());
+        const ReqState* rq = c->rq;  // null: at rest, nothing received
+        bool mid = (rq && rq->parser.midRequest()) || (c->tls && !c->tls->handshakeDone()) ||
+                   (c->proto == 0 && rq && !rq->pending.empty());
         if (!mid)
           c->requestTicks = 0;
         else if (++c->requestTicks >= reqLimit)
@@ -6915,6 +7084,10 @@ class Server {
   TlsGather tlsGather_;        // the small TLS replies of the batch in progress (tlsCork)
   uint32_t tlsGatherSeq_ = 0;  // the last ticket given out
   std::vector<std::string> bodyPool_;  // empty strings with capacity; see HttpParser::bodyPool
+  std::vector<ReqState*> rqPool_;      // request states of connections at rest; see wake/rest
+  size_t resting_ = 0;                 // connections in conns_ that are at rest
+  std::vector<Connection*> restQueue_; // at rest, their state to be given back; see queueRest
+  Connection* reading_ = nullptr;      // the connection whose read is on the stack
 
   // HTTP/2 (see the "HTTP/2" section).
   std::vector<Connection*> h2Free_;      // request Connections ready for reuse

@@ -679,6 +679,7 @@ const NATIVE_API = new Set([
   'wsGetHeaders',
   'wsGetQuery',
   'wsGetRemoteAddress',
+  'trimMemory',
 ]);
 
 module.exports = new Proxy(

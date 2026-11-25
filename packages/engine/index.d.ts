@@ -67,6 +67,11 @@ export interface EngineCapabilities {
    *  exist: the engine can perform valid WebSocket upgrades itself, firing
    *  onWsOpen without the request ever reaching onRequest. */
   wsAutoUpgrade: boolean;
+  /** trimMemory() exists. */
+  memoryTrim: boolean;
+  /** A connection between requests holds no parser and no request buffers:
+   *  an idle keep-alive connection costs its socket and its bookkeeping. */
+  restingConnections: boolean;
   /** Engine-side upgrades (setWsAutoUpgrade) are safe together with batched
    *  dispatch (onRequestBatch). Engines 1.1.15 to 1.1.21 report
    *  wsAutoUpgrade and batchDispatch without this flag and must not be given
@@ -171,6 +176,11 @@ export interface EngineProbeResult {
    *  registered eventfd) or 'coop-taskrun' (the 1.1.6 mode). The probe tries
    *  defer first; MORO_ENGINE_URING_TASKRUN=coop|defer pins one. */
   transportMode?: 'uv' | 'epoll' | 'defer-taskrun' | 'coop-taskrun';
+  /** The connections held by the servers of the calling thread, and how many
+   *  of them are at rest: between requests, holding no parser and no request
+   *  buffers (capabilities.restingConnections). WebSockets, HTTP/2 connections
+   *  and connections with a request in progress are open and not at rest. */
+  connections?: { open: number; resting: number };
   /** Per-thread fast/slow hit counters per hot entry point - present only when
    *  MORO_ENGINE_FASTCALL_STATS=1 was set when the addon loaded (test/CI proof
    *  that the fast path is taken). */
@@ -633,6 +643,16 @@ export function wsGetQuery(wsId: number): string | undefined;
 /** The peer's address, as getRemoteAddress() gives it for a request. */
 export function wsGetRemoteAddress(wsId: number): string | undefined;
 
+/**
+ * Give back the memory this thread's start-up left behind: one synchronous,
+ * memory-reducing collection of the calling isolate's heap, and on glibc the
+ * free pages of the allocator. Call it once per isolate after start-up (a
+ * server that has just loaded holds about as much free heap as live heap,
+ * and keeps it while it is quiet), never on a request path. The heap grows
+ * again as load needs it. Feature-detect via probe().capabilities.memoryTrim.
+ */
+export function trimMemory(): void;
+
 /** Non-throwing load diagnostics. Never throws. */
 export function probe(): EngineProbeResult;
 /**
@@ -710,6 +730,7 @@ declare const engine: {
   wsGetHeaders: typeof wsGetHeaders;
   wsGetQuery: typeof wsGetQuery;
   wsGetRemoteAddress: typeof wsGetRemoteAddress;
+  trimMemory: typeof trimMemory;
   probe: typeof probe;
   selectTls: typeof selectTls;
   version: string;

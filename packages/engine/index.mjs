@@ -113,3 +113,4 @@ export let setWsAutoUpgrade = (...a) => (setWsAutoUpgrade = engine.setWsAutoUpgr
 export let wsGetHeaders = (...a) => (wsGetHeaders = engine.wsGetHeaders)(...a);
 export let wsGetQuery = (...a) => (wsGetQuery = engine.wsGetQuery)(...a);
 export let wsGetRemoteAddress = (...a) => (wsGetRemoteAddress = engine.wsGetRemoteAddress)(...a);
+export let trimMemory = (...a) => (trimMemory = engine.trimMemory)(...a);

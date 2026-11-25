@@ -24,6 +24,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__GLIBC__)
+#include <malloc.h>  // malloc_trim
+#endif
+
 #include "fast_api.h"
 #include "server.h"
 #include "text.h"
@@ -823,7 +827,7 @@ static void cbOnRequest(void* user, Connection* c) {
   JsServer* js = static_cast<JsServer*>(user);
   if (js->tearingDown) return;
   // (Static routes were already answered by Server::surfaceRequest.)
-  invokeJs(js, js->onRequest, c->reqId, true, static_cast<int32_t>(c->method), c->path);
+  invokeJs(js, js->onRequest, c->reqId, true, static_cast<int32_t>(c->rq->method), c->rq->path);
 }
 
 // The batch buffers, created on first need (getBatchBuffers() or the first
@@ -884,19 +888,19 @@ static inline uint32_t fillBatchDescriptors(JsServer* js, Isolate* iso, Local<Co
   if (count > Server::kMaxStaged) count = Server::kMaxStaged;
   uint32_t* d = js->desc;
   d[0] = c->reqId;
-  d[1] = static_cast<uint32_t>(c->method);
-  d[2] = pathIndexFor(js, iso, ctx, c->path);
+  d[1] = static_cast<uint32_t>(c->rq->method);
+  d[2] = pathIndexFor(js, iso, ctx, c->rq->path);
   if (c->h2Parent != nullptr) {
     // An HTTP/2 batch: independent requests, each on its own Connection.
     for (uint32_t k = 1; k < count; k++) {
       const Connection* r = js->server->h2BatchAt(k);
       d[3 * k] = r->reqId;
-      d[3 * k + 1] = static_cast<uint32_t>(r->method);
-      d[3 * k + 2] = pathIndexFor(js, iso, ctx, r->path);
+      d[3 * k + 1] = static_cast<uint32_t>(r->rq->method);
+      d[3 * k + 2] = pathIndexFor(js, iso, ctx, r->rq->path);
     }
   } else {
     for (uint32_t k = 1; k < count; k++) {
-      const StagedRequest& sr = c->staged[(c->stagedHead + k - 1) % Server::kMaxStaged];
+      const StagedRequest& sr = c->rq->staged[(c->stagedHead + k - 1) % Server::kMaxStaged];
       d[3 * k] = sr.reqId;
       d[3 * k + 1] = static_cast<uint32_t>(sr.method);
       d[3 * k + 2] = pathIndexFor(js, iso, ctx, sr.path);
@@ -1606,17 +1610,17 @@ static void GetMethod(const FunctionCallbackInfo<Value>& args) {
   static const char* const kMethodNames[] = {"GET",   "POST", "PUT",
                                              "DELETE", "PATCH", "HEAD",
                                              "OPTIONS"};
-  if (c->method == Method::OTHER) {
-    args.GetReturnValue().Set(str(args.GetIsolate(), c->methodStr));
+  if (c->rq->method == Method::OTHER) {
+    args.GetReturnValue().Set(str(args.GetIsolate(), c->rq->methodStr));
   } else {
     args.GetReturnValue().Set(str(
-        args.GetIsolate(), kMethodNames[static_cast<uint8_t>(c->method)]));
+        args.GetIsolate(), kMethodNames[static_cast<uint8_t>(c->rq->method)]));
   }
 }
 
 static void GetQuery(const FunctionCallbackInfo<Value>& args) {
   Connection* c = connFrom(args);
-  args.GetReturnValue().Set(str(args.GetIsolate(), c ? c->query : std::string()));
+  args.GetReturnValue().Set(str(args.GetIsolate(), c ? c->rq->query : std::string()));
 }
 
 static void GetHeaders(const FunctionCallbackInfo<Value>& args) {
@@ -1627,12 +1631,12 @@ static void GetHeaders(const FunctionCallbackInfo<Value>& args) {
   // Array::New's length is an int and is only a capacity hint (Set() below
   // grows the array by index regardless). Clamp the hint so headers.size()*2
   // can't cast negative if a config raised maxHeaders past 2 GiB.
-  size_t hint = c->headers.size() * 2;
+  size_t hint = c->rq->headers.size() * 2;
   if (hint > static_cast<size_t>(INT_MAX)) hint = static_cast<size_t>(INT_MAX);
   Local<Array> arr = Array::New(iso, static_cast<int>(hint));
   JsServer* js = jsServerFor(c->server);
   uint32_t idx = 0;
-  for (const Header h : c->headers) {
+  for (const Header h : c->rq->headers) {
     // Names come from a small bounded set in practice - serve them from the
     // per-server interning cache (same pattern and lifetime as pathCache).
     Local<String> nameStr;
@@ -1665,8 +1669,8 @@ static void GetHeader(const FunctionCallbackInfo<Value>& args) {
   if (*name == nullptr) return;
   Connection* c = connFrom(args);
   if (!c) return;
-  // The snapshot (c->headers) is the source of truth; the parser has already moved its fields out and may have been reset for the next request.
-  for (const auto& h : c->headers) {
+  // The snapshot (c->rq->headers) is the source of truth; the parser has already moved its fields out and may have been reset for the next request.
+  for (const auto& h : c->rq->headers) {
     if (h.name.size() == static_cast<size_t>(name.length()) &&
         iequals(h.name, std::string_view(*name, name.length()))) {
       args.GetReturnValue().Set(str(iso, h.value));
@@ -1702,16 +1706,16 @@ static void GetBody(const FunctionCallbackInfo<Value>& args) {
     args.GetReturnValue().SetNull();
     return;
   }
-  if (c->jsBody) {
+  if (c->rq->jsBody) {
     args.GetReturnValue().Set(
-        ArrayBuffer::New(iso, std::static_pointer_cast<BackingStore>(c->jsBody)));
+        ArrayBuffer::New(iso, std::static_pointer_cast<BackingStore>(c->rq->jsBody)));
     return;
   }
-  if (c->jsLent) {
+  if (c->rq->jsLent) {
     // The bytes are on loan (getBodyLent) and will be taken back with the
     // request: this caller, who asked for bytes to keep, gets its own copy.
     // Nothing is left to copy once JS has transferred the loan away.
-    Local<ArrayBuffer> lent = static_cast<LentBody*>(c->jsLent.get())->buffer.Get(iso);
+    Local<ArrayBuffer> lent = static_cast<LentBody*>(c->rq->jsLent.get())->buffer.Get(iso);
     const size_t n = lent->ByteLength();
     if (n == 0) {
       args.GetReturnValue().SetNull();
@@ -1722,15 +1726,15 @@ static void GetBody(const FunctionCallbackInfo<Value>& args) {
     args.GetReturnValue().Set(copy);
     return;
   }
-  if (c->body.empty()) {
+  if (c->rq->body.empty()) {
     args.GetReturnValue().SetNull();
     return;
   }
-  auto* holder = new std::string(std::move(c->body));
-  c->body.clear();
+  auto* holder = new std::string(std::move(c->rq->body));
+  c->rq->body.clear();
   std::shared_ptr<BackingStore> store = ArrayBuffer::NewBackingStore(
       holder->data(), holder->size(), FreeBodyHolder, holder);
-  c->jsBody = std::static_pointer_cast<void>(store);
+  c->rq->jsBody = std::static_pointer_cast<void>(store);
   args.GetReturnValue().Set(ArrayBuffer::New(iso, std::move(store)));
 }
 
@@ -1740,11 +1744,11 @@ static void GetBody(const FunctionCallbackInfo<Value>& args) {
 static void GetBodyType(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
   Connection* c = connFrom(args);
-  if (!c || (c->body.empty() && !c->jsBody && !c->jsLent)) {
+  if (!c || (c->rq->body.empty() && !c->rq->jsBody && !c->rq->jsLent)) {
     args.GetReturnValue().SetNull();
     return;
   }
-  for (const auto& h : c->headers) {
+  for (const auto& h : c->rq->headers) {
     if (h.name.size() == 12 && iequals(h.name, std::string_view("content-type", 12))) {
       args.GetReturnValue().Set(str(iso, h.value));
       return;
@@ -1769,15 +1773,15 @@ static void GetBodyType(const FunctionCallbackInfo<Value>& args) {
 static void GetBodyText(const FunctionCallbackInfo<Value>& args) {
   Isolate* iso = args.GetIsolate();
   Connection* c = connFrom(args);
-  if (!c || c->jsBody || c->jsLent ||
-      c->body.size() > static_cast<size_t>(v8::String::kMaxLength) ||
-      !text::isAscii(reinterpret_cast<const uint8_t*>(c->body.data()), c->body.size())) {
+  if (!c || c->rq->jsBody || c->rq->jsLent ||
+      c->rq->body.size() > static_cast<size_t>(v8::String::kMaxLength) ||
+      !text::isAscii(reinterpret_cast<const uint8_t*>(c->rq->body.data()), c->rq->body.size())) {
     args.GetReturnValue().SetNull();
     return;
   }
   Local<String> out;
-  if (!String::NewFromOneByte(iso, reinterpret_cast<const uint8_t*>(c->body.data()),
-                              v8::NewStringType::kNormal, static_cast<int>(c->body.size()))
+  if (!String::NewFromOneByte(iso, reinterpret_cast<const uint8_t*>(c->rq->body.data()),
+                              v8::NewStringType::kNormal, static_cast<int>(c->rq->body.size()))
            .ToLocal(&out)) {
     args.GetReturnValue().SetNull();
     return;
@@ -1837,26 +1841,26 @@ static void GetBodyLent(const FunctionCallbackInfo<Value>& args) {
     args.GetReturnValue().SetNull();
     return;
   }
-  if (c->jsLent) {
-    args.GetReturnValue().Set(static_cast<LentBody*>(c->jsLent.get())->buffer.Get(iso));
+  if (c->rq->jsLent) {
+    args.GetReturnValue().Set(static_cast<LentBody*>(c->rq->jsLent.get())->buffer.Get(iso));
     return;
   }
-  if (c->jsBody) {
+  if (c->rq->jsBody) {
     // Already handed over for keeps: the same bytes, and nothing to lend.
     args.GetReturnValue().Set(
-        ArrayBuffer::New(iso, std::static_pointer_cast<BackingStore>(c->jsBody)));
+        ArrayBuffer::New(iso, std::static_pointer_cast<BackingStore>(c->rq->jsBody)));
     return;
   }
-  if (c->body.empty()) {
+  if (c->rq->body.empty()) {
     args.GetReturnValue().SetNull();
     return;
   }
-  auto* holder = new std::string(std::move(c->body));
-  c->body.clear();
+  auto* holder = new std::string(std::move(c->rq->body));
+  c->rq->body.clear();
   Local<ArrayBuffer> buffer = ArrayBuffer::New(
       iso, ArrayBuffer::NewBackingStore(holder->data(), holder->size(), FreeBodyHolder, holder));
   auto* lent = new LentBody{iso, v8::Global<ArrayBuffer>(iso, buffer), holder, c->server};
-  c->jsLent = std::shared_ptr<void>(static_cast<void*>(lent), ReleaseLentBody);
+  c->rq->jsLent = std::shared_ptr<void>(static_cast<void*>(lent), ReleaseLentBody);
   args.GetReturnValue().Set(buffer);
 }
 
@@ -2196,6 +2200,22 @@ static void WsGetQuery(const FunctionCallbackInfo<Value>& args) {
 }
 
 // wsGetRemoteAddress(wsId) -> the peer's address, as getRemoteAddress() gives it.
+// trimMemory(): give back what this thread's start-up left behind. V8 is
+// told memory is low, which collects everything collectable and shrinks the
+// heap to what is live (the young generation back to its smallest size, free
+// pages unmapped); glibc is then asked to return the free pages of its
+// arenas. A heap that has just loaded an application holds about as much
+// committed-and-free as it holds live, and nothing gives that back while the
+// process is quiet: a server waiting for requests keeps it for good, once
+// per isolate. One synchronous collection, so it belongs after start-up and
+// not on a request path; the heap grows again as load needs it.
+static void TrimMemory(const FunctionCallbackInfo<Value>& args) {
+  args.GetIsolate()->LowMemoryNotification();
+#if defined(__GLIBC__)
+  malloc_trim(0);
+#endif
+}
+
 static void WsGetRemoteAddress(const FunctionCallbackInfo<Value>& args) {
   Connection* c = wsFrom(args);
   if (!c) return;
@@ -2261,7 +2281,7 @@ static void GetPath(const FunctionCallbackInfo<Value>& args) {
     args.GetReturnValue().Set(str(iso, ""));
     return;
   }
-  args.GetReturnValue().Set(str(iso, c->path));
+  args.GetReturnValue().Set(str(iso, c->rq->path));
 }
 
 // ---- diagnostics ----
@@ -2353,6 +2373,11 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   // it. Engines that report wsAutoUpgrade and batchDispatch without this
   // flag (1.1.15 to 1.1.21) must not be given both.
   setCap("wsAutoUpgradeBatch", true);
+  // trimMemory() exists.
+  setCap("memoryTrim", true);
+  // A connection between requests holds no parser and no request buffers
+  // (Server::rest): what a held keep-alive connection costs is its socket.
+  setCap("restingConnections", true);
   // idleTimeoutMs does not close a connection whose response is still being
   // written to a peer that is reading it; responseTimeoutMs governs that
   // (Server::onSweep). Engines without this flag count a response answered
@@ -2399,6 +2424,21 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
     setFa("compiledV8", str(iso, std::to_string(V8_MAJOR_VERSION) + "." + std::to_string(V8_MINOR_VERSION)));
     setFa("runtimeV8", str(iso, std::to_string(g_runtimeV8Major) + "." + std::to_string(g_runtimeV8Minor)));
     set("fastApi", fa);
+  }
+  {
+    // The connections this thread's servers hold, and how many of them are
+    // at rest (between requests: no parser, no request buffers).
+    size_t open = 0, resting = 0;
+    for (const auto& entry : threadState().servers) {
+      const JsServer* js = entry.second;
+      if (js == nullptr || js->server == nullptr) continue;
+      open += js->server->openConnections();
+      resting += js->server->restingConnections();
+    }
+    Local<Object> conns = Object::New(iso);
+    (void)conns->Set(ctx, str(iso, "open"), Number::New(iso, static_cast<double>(open))).FromMaybe(false);
+    (void)conns->Set(ctx, str(iso, "resting"), Number::New(iso, static_cast<double>(resting))).FromMaybe(false);
+    set("connections", conns);
   }
   if (g_countCalls) {
     // Per-thread fast/slow hit counters (MORO_ENGINE_FASTCALL_STATS=1 at load).
@@ -2483,6 +2523,7 @@ static const ExportDef kExports[] = {
     {"wsGetHeaders", WsGetHeaders, nullptr, nullptr},
     {"wsGetQuery", WsGetQuery, nullptr, nullptr},
     {"wsGetRemoteAddress", WsGetRemoteAddress, nullptr, nullptr},
+    {"trimMemory", TrimMemory, nullptr, nullptr},
     {"probe", Probe, nullptr, nullptr},
     // Loader-internal (leading underscore: not in NATIVE_API, not typed).
     {"_batchDone", BatchDone, MORO_FAST_BATCH_DONE},

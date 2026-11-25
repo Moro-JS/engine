@@ -250,6 +250,8 @@ endWith(reqId, chunk: string | ArrayBuffer | Uint8Array | Buffer): void; // exac
 //     batchDispatch: boolean,   // onRequestBatch / getBatchBuffers() / getPath()
 //     wsAutoUpgrade: boolean,   // setWsAutoUpgrade() and the wsGet*() handshake accessors
 //     wsAutoUpgradeBatch: boolean, // setWsAutoUpgrade() may be combined with onRequestBatch (see "WebSocket")
+//     memoryTrim: boolean,      // trimMemory() exists
+//     restingConnections: boolean, // a connection between requests holds no parser or request buffers
 //     idleSparesDrainingResponse: boolean, // idleTimeoutMs never closes a connection whose response is
 //                               // still being written to a peer that reads it (responseTimeoutMs governs
 //                               // that). Without the flag (before 1.2.0) a response given before the
@@ -259,6 +261,8 @@ endWith(reqId, chunk: string | ArrayBuffer | Uint8Array | Buffer): void; // exac
 // fastApi: { compiled, installed, reason, compiledV8, runtimeV8 } - why fast calls are on/off
 //   reason: 'ok' | 'not-compiled' | 'env-disabled' (MORO_ENGINE_FASTCALL=0) |
 //           'sync-notify' (MORO_ENGINE_NOTIFY=sync) | 'v8-mismatch'
+// connections: { open, resting } - the calling thread's servers: connections held, and how many
+//                               // are between requests (see "Memory")
 // fastCallStats: { <fn>: { fast, slow } } - only with MORO_ENGINE_FASTCALL_STATS=1 at load
 // transport: 'epoll' | 'uring' | 'uv' - the I/O transport: epoll on Linux by default (the
 //   engine's own readiness loop), io_uring when MORO_ENGINE_TRANSPORT=uring and the kernel and
@@ -458,6 +462,7 @@ setWsAutoUpgrade(serverId, on: boolean): void;   // the engine answers handshake
 wsGetHeaders(wsId): string[] | undefined;        // the handshake's headers, query and peer,
 wsGetQuery(wsId): string | undefined;            // for the socket's lifetime
 wsGetRemoteAddress(wsId): string | undefined;
+trimMemory(): void;                              // once per isolate after start-up: see "Memory"
 // serve() callbacks gain: onWsOpen(wsId, path), onWsMessage(wsId, data, isBinary),
 // onWsClose(wsId, code)
 ```
@@ -595,6 +600,34 @@ parameter, the same parameter twice, a value on `server_no_context_takeover`
 or `client_no_context_takeover`, or window bits outside 9..15 or written with
 a leading zero. The next offer in the list is then considered. Several
 `Sec-WebSocket-Extensions` lines are read as one list (RFC 6455 §9.1).
+
+## Memory
+
+**A connection between requests holds no request state**
+(`capabilities.restingConnections`, 1.2.3). The parser, the snapshot of the
+request a handler was given, and the buffers responses are built and batched
+in belong to a request, not to a connection: a connection takes them from its
+server's pool when bytes arrive and gives them back when it comes to rest
+(nothing received and unparsed, nothing staged, no response being built or
+written, no request a handler still holds; a connection that has sent
+nothing yet, or only its TLS handshake, is at rest too). Measured on Linux, a held HTTP/1.1
+keep-alive connection costs 480 bytes of engine memory where it cost about
+1.8 KB (the connection structure was 1,376 bytes and its buffers stayed with
+it), 136 MB less for every 100,000 connections held. A thread serves one read
+at a time, so the states in use are the requests handlers are holding and the
+responses still on their way out, and a busy thread parses in a handful of
+warm ones. A WebSocket and an HTTP/2 connection keep theirs for as long as
+they live. Nothing is configured, and nothing changes on the wire.
+
+**`trimMemory()`** (`capabilities.memoryTrim`, 1.2.3) gives back what an
+isolate's start-up left behind: one memory-reducing collection of the calling
+isolate's heap (V8's low-memory notification) and, on glibc, the allocator's
+free pages. A heap that has just loaded an application holds about as much
+committed-and-free memory as live memory and keeps it while the process is
+quiet. Measured on a worker thread that had loaded a framework and an
+application: 24.0 MB of heap before, 14.1 MB after. It is a synchronous
+collection, so call it once per isolate after start-up, not on a request
+path; the heap grows again as load needs it.
 
 ## Adding a native export (maintainers)
 
