@@ -709,7 +709,15 @@ all connections hold together is counted as well:
   `CONTINUATION` frames and input it has kept) and of the response bytes
   its peer has not taken (the write queue, and what HTTP/2 flow control is
   holding back). Not counted: what a handler holds once a request is its
-  own, the JS heap, and what the kernel buffers for a socket.
+  own, the JS heap, and what the kernel buffers for a socket. On Windows
+  the last of these is more than a buffer's worth: Winsock takes the first
+  two sends outstanding on a socket whole, whatever their size, and reports
+  them complete (see `wsSend`, "On Windows"), so a response the system has
+  taken that way is held by the system and is in no queue of the engine's.
+  It is not counted, a peer that never reads it is not closed by the rule
+  for peers that stop (`idleTimeoutMs` closes it), and the count and both
+  rules begin with the third send outstanding on a connection. Requests
+  still arriving are counted there as everywhere.
 - *The bound.* `memoryBudget` is for the process: unset, an eighth of the
   memory the process may use (the cgroup limit of its container when there
   is one, the machine's memory otherwise); `Infinity` for none. It is

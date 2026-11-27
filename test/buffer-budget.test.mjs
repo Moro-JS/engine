@@ -87,6 +87,21 @@ const echoSize = {
 
 const skip = engine.probe().capabilities.bufferBudget ? false : 'this engine build has no buffer budget';
 
+// The cases that need response bytes to wait in the engine's write queue
+// behind a peer that takes none, or takes them slowly. Wherever the system
+// takes only what fits its socket buffers the rest of a large response is
+// queued in the engine, and counted. Windows does not work that way: Winsock
+// reports a send complete once it has copied it into the socket's kernel
+// buffer, and it copies the first two sends outstanding on a socket whatever
+// their size (Microsoft, "Design issues - Sending small data segments over
+// TCP with Winsock"; libuv src/win/tcp.c, uv__tcp_try_write and
+// uv__tcp_write). One response of any size is then held by the system and
+// none of it by the engine: there is nothing in the queue to count, to see
+// drain or to close a peer for, and the budget's rules for unread responses
+// begin with the third send outstanding on a connection (docs/API.md,
+// "Memory"). The rules themselves are the same there.
+const needsQueuedResponse = process.platform === 'win32' && 'Winsock takes a whole send into the socket buffer: one large response leaves nothing queued in the engine';
+
 describe('buffer budget: what the probe reports', { skip }, () => {
   it('a thread with no server has no share; a server gives it one', async () => {
     assert.equal(budget().limit, Infinity);
@@ -307,7 +322,7 @@ describe('buffer budget: peers that hold it and move nothing', { skip }, () => {
 });
 
 describe('buffer budget: responses a peer does not read', { skip }, () => {
-  it('are counted, and the peers that take none of them are closed at the sweep once the thread is short', async () => {
+  it('are counted, and the peers that take none of them are closed at the sweep once the thread is short', { skip: needsQueuedResponse }, async () => {
     // Larger than what the kernel takes for a peer that is not reading (on
     // Linux up to some 10 MiB between the two sockets' buffers), so that
     // most of it stays queued in the engine.
@@ -548,7 +563,7 @@ describe('buffer budget: responses a peer is reading', { skip }, () => {
   // free, over a megabyte when the buffer has grown - so the client here
   // reads some two megabytes a second: a step in every sweep interval.)
   for (const responseTimeoutMs of [0, 30000]) {
-    it(`a slow download that keeps moving is not closed while the thread is short (responseTimeoutMs ${responseTimeoutMs})`, { timeout: 60000 }, async () => {
+    it(`a slow download that keeps moving is not closed while the thread is short (responseTimeoutMs ${responseTimeoutMs})`, { timeout: 60000, skip: needsQueuedResponse }, async () => {
       const limit = 128 * MiB; // an eighth of it is more than the download drains by while it is watched
       const download = Buffer.alloc(40 * MiB, 0x63);
       let heldReqs = 0;

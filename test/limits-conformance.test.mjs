@@ -371,20 +371,36 @@ describe('per-connection memory', { skip }, () => {
       sock.write(`POST /amp HTTP/1.1${CRLF}Host: t${CRLF}Transfer-Encoding: chunked${CRLF}${CRLF}`);
       // 100 KB of body in 1-byte chunks, each with a 1000-byte extension: ~96 MB on the wire.
       const block = Buffer.from(('1;' + 'e'.repeat(1000) + '\r\nX\r\n').repeat(1000), 'latin1');
+      // Two measures of the same thing. What the engine holds for the
+      // connection, by its own count (probe().bufferBudget, 1.2.4): the
+      // parser's input buffer and the body are in it, on every build. And
+      // the process's RSS - which under the sanitizers is no measure of
+      // what is held: ASan keeps every freed block in quarantine (256 MB of
+      // them), so RSS there follows what has been allocated and freed. On
+      // io_uring that is the bytes set aside when a burst is paced, some
+      // 0.5 MB each time the sender lets the socket run empty between two
+      // blocks: a hundred times that, and 170 MB of freed strings, on a
+      // runner where the two happen to take turns that way.
+      const held = () => engine.probe().bufferBudget?.held ?? 0;
+      const sanitized = engine.probe().testFaults === true;
       const before = process.memoryUsage().rss;
       let peak = before;
+      let heldPeak = held();
       for (let i = 0; i < 100 && !sock.destroyed; i++) {
         if (!sock.write(block)) await new Promise((resolve) => sock.once('drain', resolve));
+        heldPeak = Math.max(heldPeak, held());
         if (i % 10 === 9) peak = Math.max(peak, process.memoryUsage().rss);
       }
       await delay(200);
       peak = Math.max(peak, process.memoryUsage().rss);
+      heldPeak = Math.max(heldPeak, held());
       sock.write('0\r\n\r\n');
       await waitFor(() => got.includes('\r\n\r\nok'), { timeout: 10000, message: `no response: ${JSON.stringify(got.slice(0, 40))}` });
       sock.destroy();
       assert.equal(seen, 100000, 'the body itself arrives whole');
+      assert.ok(heldPeak < 2 * MB, `the engine held ${heldPeak} bytes for the connection while a 100 KB body was received`);
       const grown = peak - before;
-      assert.ok(grown < 48 * MB, `RSS grew by ${(grown / MB).toFixed(0)} MB while a 100 KB body was received`);
+      if (!sanitized) assert.ok(grown < 48 * MB, `RSS grew by ${(grown / MB).toFixed(0)} MB while a 100 KB body was received`);
     });
   });
 
