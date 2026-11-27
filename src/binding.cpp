@@ -77,6 +77,10 @@ struct CallbackScopeFor {
 struct JsServer {
   Isolate* isolate;
   Global<Context> context;
+#if NODE_MAJOR_VERSION >= 27
+  // Taken once in serve(), so node::MakeCallback does not look it up on every call.
+  node::Environment* env = nullptr;
+#endif
   Global<Function> onRequest;
   Global<Function> onRequestBatch;
   // Depth of cbOnWsRead: while > 0 the context and Node callback scope of
@@ -708,6 +712,19 @@ static void printThrown(Isolate* iso, Local<Value> value, const char* where) {
 // delivered from inside upgradeToWebSocket(), an onAborted delivered from
 // inside close()) drain nothing themselves; the outermost one does. Cost per
 // call: an async-context push/pop and, with an empty queue, one cheap check.
+// node::MakeCallback with the server's resource object, and its Environment
+// where Node takes one (nodejs/node#66510).
+static inline MaybeLocal<Value> makeCallback(JsServer* js, Isolate* iso, Local<Function> f,
+                                             int argc, Local<Value>* argv) {
+#if NODE_MAJOR_VERSION >= 27
+  return node::MakeCallback(js->env, js->asyncResource.Get(iso), f, argc, argv,
+                            node::async_context{0, 0});
+#else
+  return node::MakeCallback(iso, js->asyncResource.Get(iso), f, argc, argv,
+                            node::async_context{0, 0});
+#endif
+}
+
 inline CallbackScopeFor::CallbackScopeFor(JsServer* js, Isolate* iso)
     : scope(iso,
             js->asyncResource.IsEmpty() ? Object::New(iso) : js->asyncResource.Get(iso),
@@ -820,8 +837,7 @@ static void invokeJs(JsServer* js, Global<Function>& fn, uint32_t reqId,
     argv[2] = pathStringFor(js, iso, path);
     argc = 3;
   }
-  (void)node::MakeCallback(iso, js->asyncResource.Get(iso), fn.Get(iso), argc, argv,
-                           node::async_context{0, 0});
+  (void)makeCallback(js, iso, fn.Get(iso), argc, argv);
 }
 
 static void cbOnRequest(void* user, Connection* c) {
@@ -957,8 +973,7 @@ static void cbOnRequestBatch(void* user, Connection* c, uint32_t count) {
   ThreadState& t = threadState();
   JsServer* const outer = t.batchJs;
   t.batchJs = js;
-  (void)node::MakeCallback(iso, js->asyncResource.Get(iso), js->onRequestBatch.Get(iso), 1, argv,
-                           node::async_context{0, 0});
+  (void)makeCallback(js, iso, js->onRequestBatch.Get(iso), 1, argv);
   t.batchJs = outer;
   js->server->batchLoopReturned();
 }
@@ -1293,6 +1308,9 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
   JsServer* js = new JsServer();
   js->isolate = iso;
   js->context.Reset(iso, ctx);
+#if NODE_MAJOR_VERSION >= 27
+  js->env = node::GetCurrentEnvironment(ctx);
+#endif
   js->asyncResource.Reset(iso, Object::New(iso));
   js->viaTrampoline = args.Length() >= 3 && args[2]->IsTrue();
   {
