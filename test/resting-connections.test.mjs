@@ -448,6 +448,13 @@ describe('what a pooled request state holds', { skip }, () => {
   // Heads within 16 KiB leave no mark on a state, and many of them can still
   // grow every buffer of the ring by some kilobytes: the sweep measures
   // what the pool holds and frees a state over the bound.
+  //
+  // It is the ring that takes a state over the bound here: sixteen slots
+  // that have each held a large path, a large query and a large header
+  // block. With batch dispatch switched off (MORO_ENGINE_BATCH=0) no slot is
+  // ever filled; a state then holds what its parser and its snapshot have
+  // grown to, some 70 KiB, which is within the bound - it is kept, rightly,
+  // and the bound is what there is to check.
   it('states grown a little at a time, by many requests under the mark, are freed at the next sweep', { timeout: 60000 }, async () => {
     await settled();
     const srv = serve({ batch: true, options: { requestTimeoutMs: 600 } }); // the sweep runs every 300 ms
@@ -462,7 +469,9 @@ describe('what a pooled request state holds', { skip }, () => {
       await delay(700);
       const now = states();
       assert.ok(now.bytes <= now.pooled * KEEP, `after a sweep the pool holds ${now.bytes} bytes in ${now.pooled} states`);
-      assert.ok(now.bytes < 256 * 1024, `${now.bytes} bytes kept`);
+      if (engine.probe().capabilities.batchDispatch) {
+        assert.ok(now.bytes < 256 * 1024, `${now.bytes} bytes kept: the states the ring took over the bound are still pooled`);
+      }
       await Promise.all(cs.map((c) => c.close()));
     } finally {
       srv.close();
