@@ -108,6 +108,8 @@ class HeaderList {
     fields_.swap(o.fields_);
     text_.swap(o.text_);
   }
+  // The storage the list holds on to, used or not.
+  size_t retained() const { return text_.capacity() + fields_.capacity() * sizeof(Field); }
 
   // One field whose name is lowercase already (HTTP/2).
   void add(std::string_view name, std::string_view value) {
@@ -189,6 +191,14 @@ struct HttpLimits {
   size_t maxConnections = 0;
   // Cap on bytes buffered for a single connection while its response is in flight (pipelined-request flood defense). 0 = use maxHeadSize + maxBodySize.
   size_t maxPendingBytes = 0;
+  // What the process may hold in buffers for its peers, all connections of
+  // all its servers together: requests still being received and responses
+  // their peers have not taken (Server, "Buffer budget"). Every limit above
+  // is per connection, and their sum over the connections a server accepts
+  // is far more memory than a host has. 0 = an eighth of the memory the
+  // process may use (its cgroup limit, or the machine's); SIZE_MAX = no
+  // budget.
+  size_t memoryBudget = 0;
   // Bind with SO_REUSEPORT so several engine instances (worker threads or processes) can listen on one port and the kernel load-balances accepts. POSIX only; a no-op on Windows, which has no equivalent semantics.
   bool reusePort = false;
   // WebSocket: cap on a complete (reassembled) message payload.
@@ -219,7 +229,7 @@ class HttpParser {
   // copy of the struct. The referenced limits must outlive the parser (the
   // Server's limits_ member does; the default lives for the process).
   explicit HttpParser(const HttpLimits& limits = defaultHttpLimits())
-      : limits_(&limits) {}
+      : limits_(&limits), leanHead_(limits.maxHeadSize < kLeanHead ? limits.maxHeadSize : kLeanHead) {}
 
   // Parsed request view, valid until reset().
   Method method = Method::OTHER;
@@ -270,6 +280,13 @@ class HttpParser {
   // Spent bytes of a chunked body are dropped from the buffer once there is
   // this much of them (dropSpent, and the chunk loop in parse()).
   static constexpr size_t kChunkCompactAt = 16 * 1024;
+  // A head past this size is noted (largeHead()): the path, query and field
+  // storage it was parsed into may have grown past what is worth keeping
+  // between requests, and whoever keeps parsers for reuse looks at what this
+  // one holds (retained()) before keeping it. The mark every other buffer
+  // of a request is held to (16 KiB): a browser's head with its cookies is
+  // well within it, and pays nothing for the note.
+  static constexpr size_t kLeanHead = 16 * 1024;
 
   using RouteHook = bool (*)(void* user, Method m, const std::string& path);
   RouteHook routeHook = nullptr;
@@ -298,7 +315,15 @@ class HttpParser {
   // True once the request line + headers are fully parsed (body may still be pending). Used to answer Expect: 100-continue before the body arrives.
   // The request line refused last had no HTTP-version in it: whatever the
   // peer is speaking, it is not HTTP/1.
-  bool notHttp() const { return notHttp_; }
+  bool notHttp() const { return (lineNote_ & kNotHttp) != 0; }
+  // ... and it was the first line of its connection. expectFirstLine() is
+  // called before a connection's first bytes are parsed; the next reset() -
+  // the first request is complete, the peer has spoken HTTP/1 - ends it. A
+  // line refused after that is an HTTP/1 peer's mistake and is answered as
+  // one. (Kept in the byte reset() clears anyway: a request pays nothing for
+  // it.)
+  void expectFirstLine() { lineNote_ = kFirstLine; }
+  bool firstLineNotHttp() const { return lineNote_ == (kFirstLine | kNotHttp); }
 
   bool headParsed() const {
     return state_ != State::RequestLine && state_ != State::Headers;
@@ -310,10 +335,53 @@ class HttpParser {
   // Nothing buffered and no request in progress: the next read starts a
   // request at its first byte (what the server's fast lane needs).
   bool idle() const { return buf_.empty() && state_ == State::RequestLine; }
+  // idle(), and no head past kLeanHead has completed since clearLargeHead():
+  // the two bytes lie side by side, and one comparison answers for both.
+  inline bool idleLean() const;
+  bool largeHead() const { return largeHead_ != 0; }
+  void clearLargeHead() { largeHead_ = 0; }
+  // Heap storage this parser holds on to between requests: the buffers a
+  // request is parsed into keep their capacity for the next one.
+  size_t retained() const {
+    return heapOf(buf_) + heapOf(methodStr) + heapOf(path) + heapOf(query) + heapOf(body) + headers.retained();
+  }
+  // The same without asking each string whether its text sits inside the
+  // object: an upper estimate (fifteen bytes a string at the most), for the
+  // one question it answers - is this state small enough to keep - which is
+  // asked on the path of a request (Server::restLarge).
+  size_t retainedAtMost() const {
+    return buf_.capacity() + methodStr.capacity() + path.capacity() + query.capacity() + body.capacity() +
+           headers.retained();
+  }
+  // A string's heap allocation (none while its text sits inside the object).
+  static size_t heapOf(const std::string& s) { return s.capacity() >= sizeof(std::string) ? s.capacity() : 0; }
 
   // Bytes held in the accumulation buffer: input not parsed yet, plus what
   // has been parsed and not dropped yet (diagnostics and tests).
   size_t buffered() const { return buf_.size(); }
+  // Heap storage of the request being received - the input buffer and the
+  // body: what the peer has made this parser hold, as the server's buffer
+  // budget counts it.
+  size_t memory() const { return heapOf(buf_) + heapOf(body); }
+  // The same by content: the bytes of the request being received - input
+  // not yet parsed, and the body collected so far - whatever the capacity of
+  // the buffers they are in (a pooled parser keeps what an earlier request
+  // grew them to).
+  size_t arriving() const { return buf_.size() - consumed_ + body.size(); }
+  // The connection is being closed for what it holds: give that storage back
+  // now, and parse nothing more.
+  // The connection is closing: nothing more is parsed (parse() reports an
+  // error from here on). Nothing is freed - a caller up the stack may still
+  // be reading the request this parser holds.
+  void stop() { failed_ = true; }
+  void abandon() {
+    std::string().swap(buf_);
+    std::string().swap(body);
+    consumed_ = 0;
+    scanPos_ = 0;
+    directBody_ = false;
+    failed_ = true;
+  }
 
   const char* findHeader(std::string_view lowercaseName) const;
 
@@ -371,6 +439,10 @@ class HttpParser {
     headEnd_ = 0;
   }
   bool parseRequestLine(std::string_view line);
+  // A request-target that does not begin with "/" (see the definition).
+  static bool targetFormOk(Method method, std::string_view methodStr, std::string_view target);
+  // A complete head of `size` bytes, past leanHead_ (see the definition).
+  bool headOver(size_t size);
   // `at`: where the line starts in the buffer that holds it (data for the
   // in-place scan, buf_ otherwise), so a stored field is marked as ranges of
   // that buffer until the head is complete (HeaderList::mark).
@@ -389,10 +461,15 @@ class HttpParser {
   int scanLightHeaders(const unsigned char* d, size_t len, size_t& pos);
 
   const Limits* limits_;
+  // The size a complete head is compared with: kLeanHead, or maxHeadSize
+  // when that is the smaller. One comparison per request, where the
+  // maxHeadSize check alone used to be; headOver() tells the two apart.
+  size_t leanHead_;
   std::string buf_;
   size_t consumed_ = 0;
   size_t scanPos_ = 0;      // where line scanning resumes within buf_
   State state_ = State::RequestLine;
+  uint8_t largeHead_ = 0;   // directly behind state_: idleLean() reads the two as one
   // Field lines of the current request seen so far (stored or, in light mode, only scanned).
   size_t headerCount_ = 0;
   // This request's headers are scanned, not stored: 0 no, kLightFresh since
@@ -405,7 +482,14 @@ class HttpParser {
   // The request line was refused for its method token alone (kMaxMethodLen):
   // its status is not replaced by the head-size 431.
   bool methodRefused_ = false;
-  bool notHttp_ = false;
+  // kNotHttp: the request line refused last had no HTTP-version in it.
+  // kFirstLine: that line is the first of its connection (expectFirstLine).
+  static constexpr uint8_t kFirstLine = 1;
+  static constexpr uint8_t kNotHttp = 2;
+  uint8_t lineNote_ = 0;
+  void noteNotHttp(bool is) {
+    lineNote_ = static_cast<uint8_t>((lineNote_ & kFirstLine) | (is ? kNotHttp : 0));
+  }
   // The request line begins with more than kMaxMethodLen token bytes.
   static bool methodOverlong(const char* p, size_t n);
 
@@ -449,6 +533,17 @@ class HttpParser {
   bool directBody_ = false;
   size_t chunkTrailerStart_ = 0;  // buf_ index where the chunk trailer began
 };
+
+// Read as one, in so many words: written as two tests joined, the two bytes
+// were loaded one by one and put together before the comparison - four
+// instructions for two, on every request that leaves its connection at rest.
+inline bool HttpParser::idleLean() const {
+  static_assert(offsetof(HttpParser, largeHead_) == offsetof(HttpParser, state_) + 1,
+                "largeHead_ lies directly behind state_");
+  uint16_t both;
+  std::memcpy(&both, reinterpret_cast<const unsigned char*>(this) + offsetof(HttpParser, state_), sizeof both);
+  return buf_.empty() && both == 0;
+}
 
 // ---- small helpers (header-inline for the single-TU addon build) ----
 
@@ -876,7 +971,7 @@ inline void HttpParser::reset() {
   light_ = 0;
   failed_ = false;
   methodRefused_ = false;
-  notHttp_ = false;
+  lineNote_ = 0;
   hostCount_ = 0;
   sawClose_ = sawKeepAlive_ = false;
   teCount_ = 0;
@@ -921,7 +1016,7 @@ inline bool HttpParser::parseRequestLine(std::string_view line) {
     return false;
   }
   if (i == 0 || i >= n || line[i] != ' ') {
-    notHttp_ = i >= n;  // the line ends inside its first token
+    noteNotHttp(i >= n);  // the line ends inside its first token
     return false;
   }
   std::string_view m = line.substr(0, i);
@@ -945,7 +1040,7 @@ inline bool HttpParser::parseRequestLine(std::string_view line) {
     ++j;
   }
   if (j >= n || j == tStart) {  // no second SP, or an empty target
-    notHttp_ = j >= n;
+    noteNotHttp(j >= n);
     return false;
   }
   std::string_view t = line.substr(tStart, j - tStart);
@@ -972,7 +1067,7 @@ inline bool HttpParser::parseRequestLine(std::string_view line) {
   // HTTP-version = "HTTP/" DIGIT "." DIGIT  (RFC 9112 §2.3)
   if (v.size() != 8 || memcmp(v.data(), "HTTP/", 5) != 0 || v[6] != '.' ||
       v[5] < '0' || v[5] > '9' || v[7] < '0' || v[7] > '9') {
-    notHttp_ = v.size() < 5 || memcmp(v.data(), "HTTP/", 5) != 0;
+    noteNotHttp(v.size() < 5 || memcmp(v.data(), "HTTP/", 5) != 0);
     errorStatus = 400;
     return false;
   }
@@ -983,14 +1078,53 @@ inline bool HttpParser::parseRequestLine(std::string_view line) {
   minorVersion = v[7] - '0';
   // HTTP/1.0 defaults to close unless Connection: keep-alive (resolved later)
   keepAlive = (minorVersion >= 1);
-  // asterisk-form is the target of a server-wide OPTIONS and of no other
-  // method (RFC 9112 §3.2.4). Asked last: a line that is not HTTP/1.x at all
-  // (the HTTP/2 preface, "PRI * HTTP/2.0") is answered for its version.
-  if (path.size() == 1 && path[0] == '*' && query.empty() && method != Method::OPTIONS) {
+  // The target has one of four forms (RFC 9112 §3.2). Origin-form, which
+  // begins with "/", is what a request to an origin server carries, and its
+  // first byte settles it; the other three are told apart out of line.
+  // Asked last: a line that is not HTTP/1.x at all (the HTTP/2 preface,
+  // "PRI * HTTP/2.0") is answered for its version.
+  if (t[0] != '/' && !targetFormOk(method, methodStr, t)) {
     errorStatus = 400;
     return false;
   }
   return true;
+}
+
+// A request-target that does not begin with "/" (RFC 9112 §3.2):
+//  - asterisk-form (§3.2.4) is exactly "*" - nothing behind it, no query -
+//    and the target of a server-wide OPTIONS and of no other method;
+//  - authority-form (§3.2.3) is CONNECT's, and whatever CONNECT names is
+//    handed over as it always was;
+//  - absolute-form (§3.2.2) begins with a scheme (RFC 3986 §3.1) and "://",
+//    and is passed through opaquely (routing on it is the application's or
+//    the fronting proxy's business).
+// Anything else is no request-target: "abc", "*x", "?q", "host:80/path".
+// Such a target used to be handed over as the path, to code written for
+// paths that begin with "/".
+MORO_NOINLINE inline bool HttpParser::targetFormOk(Method method, std::string_view methodStr,
+                                                   std::string_view t) {
+  if (t.size() == 1 && t[0] == '*') return method == Method::OPTIONS;
+  if (method == Method::OTHER && methodStr == "CONNECT") return true;
+  const auto alpha = [](unsigned char c) { return static_cast<unsigned char>((c | 0x20) - 'a') < 26; };
+  if (!alpha(static_cast<unsigned char>(t[0]))) return false;
+  size_t i = 1;
+  for (; i < t.size(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(t[i]);
+    if (!alpha(c) && !(c >= '0' && c <= '9') && c != '+' && c != '-' && c != '.') break;
+  }
+  return t.size() - i >= 3 && t[i] == ':' && t[i + 1] == '/' && t[i + 2] == '/';
+}
+
+// A complete head larger than leanHead_: refused when it is over maxHeadSize
+// (431, the answer the comparison with maxHeadSize always gave), noted
+// otherwise (kLeanHead). Returns true for the refusal.
+MORO_NOINLINE inline bool HttpParser::headOver(size_t size) {
+  if (size > limits_->maxHeadSize) {
+    errorStatus = 431;
+    return true;
+  }
+  largeHead_ = 1;
+  return false;
 }
 
 inline bool HttpParser::parseHeaderLine(std::string_view line, size_t at) {
@@ -1211,10 +1345,7 @@ inline int HttpParser::scanLightHeaders(const unsigned char* d, size_t len, size
     ++headerCount_;
     pos = next;
   }
-  if (pos > limits_->maxHeadSize) {
-    errorStatus = 431;
-    return -1;
-  }
+  if (pos > leanHead_ && headOver(pos)) return -1;
   return 1;
 }
 
@@ -1339,8 +1470,7 @@ inline bool HttpParser::parseDirectStored(const char* data, size_t len, size_t p
   }
   // The same checks the buffered path applies at the blank line, on the
   // head's true size.
-  if (pos > limits_->maxHeadSize) {
-    errorStatus = 431;
+  if (pos > leanHead_ && headOver(pos)) {
     buf_.append(data, len);
     st = ParseStatus::Error;
     return true;
@@ -1471,10 +1601,7 @@ MORO_ALWAYS_INLINE ParseStatus HttpParser::parseSome(const char* data, size_t le
         // already hold the request's body when a buffered batch is replayed
         // in one parse() call, and those bytes must not count against the
         // head limit.
-        if (headEnd_ - consumed_ > limits_->maxHeadSize) {
-          errorStatus = 431;
-          return ParseStatus::Error;
-        }
+        if (headEnd_ - consumed_ > leanHead_ && headOver(headEnd_ - consumed_)) return ParseStatus::Error;
         // The fields are copied out of buf_ in one piece (a light request
         // stored nothing and has no consumer of `headers`).
         if (!light_) headers.commit(buf_.data(), headBase_, headEnd_);

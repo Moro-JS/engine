@@ -33,6 +33,10 @@ serve(callbacks: {
   requestTimeoutMs?: number;   // default 300000; 0 disables. Budget for receiving ONE
                                // complete request from its first byte - does NOT reset
                                // on activity (slow-drip slowloris defense). Expiry: 408 + close.
+                               // Both are full budgets: the timeout never comes before the
+                               // time has passed, and comes within two sweep intervals after
+                               // it (an interval is half the shortest timeout set, between
+                               // 250 ms and 1 s)
   responseTimeoutMs?: number;  // default 300000; 0 disables. Budget for DELIVERING queued
                                // outbound bytes: resets on drain progress (the write queue
                                // shrank since the last sweep, or a write completed), so only a
@@ -46,6 +50,10 @@ serve(callbacks: {
                                // while it cannot be dispatched (a handler is running, or the
                                // responses already given are waiting on the peer), counted
                                // across responses; over it the connection is closed
+  memoryBudget?: number;       // 1.2.4 (capabilities.bufferBudget). Bytes the PROCESS may hold in
+                               // buffers for its peers, all connections of all servers together.
+                               // Default: an eighth of the memory the process may use (its cgroup
+                               // limit, or the machine's). Infinity = no budget. See "Memory"
   reusePort?: boolean;         // default false. SO_REUSEPORT so several engine instances
                                // (cluster workers / worker threads) share one port with
                                // kernel-balanced accepts. POSIX only; ignored on Windows.
@@ -252,6 +260,7 @@ endWith(reqId, chunk: string | ArrayBuffer | Uint8Array | Buffer): void; // exac
 //     wsAutoUpgradeBatch: boolean, // setWsAutoUpgrade() may be combined with onRequestBatch (see "WebSocket")
 //     memoryTrim: boolean,      // trimMemory() exists
 //     restingConnections: boolean, // a connection between requests holds no parser or request buffers
+//     bufferBudget: boolean,    // 1.2.4: the memoryBudget option and probe().bufferBudget (see "Memory")
 //     idleSparesDrainingResponse: boolean, // idleTimeoutMs never closes a connection whose response is
 //                               // still being written to a peer that reads it (responseTimeoutMs governs
 //                               // that). Without the flag (before 1.2.0) a response given before the
@@ -263,6 +272,16 @@ endWith(reqId, chunk: string | ArrayBuffer | Uint8Array | Buffer): void; // exac
 //           'sync-notify' (MORO_ENGINE_NOTIFY=sync) | 'v8-mismatch'
 // connections: { open, resting } - the calling thread's servers: connections held, and how many
 //                               // are between requests (see "Memory")
+// requestStates: { pooled, bytes } - 1.2.4: request states kept for the requests to come (the
+//                               // calling thread's servers), and the buffer storage they hold
+//                               // (see "Memory"); absent on engines before 1.2.4
+// bufferBudget: { held, limit, shed, evicted } - 1.2.4: the calling thread's buffer budget: bytes
+//                               // its connections hold in buffers for their peers, the thread's
+//                               // share of memoryBudget (Infinity when there is none), and the
+//                               // connections closed for it (see "Memory")
+// turns: { cut, waiting } - 1.2.4: the calling thread's loop under load: turns that used up their
+//                               // time slice, and sockets waiting for a later turn now (see "A
+//                               // loop that falls behind"); zeros unless the transport is epoll
 // fastCallStats: { <fn>: { fast, slow } } - only with MORO_ENGINE_FASTCALL_STATS=1 at load
 // transport: 'epoll' | 'uring' | 'uv' - the I/O transport: epoll on Linux by default (the
 //   engine's own readiness loop), io_uring when MORO_ENGINE_TRANSPORT=uring and the kernel and
@@ -313,6 +332,16 @@ selectTls(library: 'boringssl' | 'openssl' | 'auto', ssl?: ServeOptions['ssl']):
 
 - **Keep-alive** and connection lifecycle are engine concerns; the adapter
   never sees them. `Connection: close` / HTTP/1.0 handled natively.
+- **The last response of a connection** (`Connection: close`, HTTP/1.0, an
+  error response, an HTTP/2 `GOAWAY` after a connection error) is followed
+  by the server's FIN, not by a close: the socket stays open with its input
+  discarded until the peer has closed its side, for at most two seconds
+  (RFC 9112 §9.6). A peer that is still sending - the rest of an upload that
+  was answered 413, requests pipelined behind the response - therefore reads
+  the response instead of a connection reset. Over TLS (1.2.4) the server's
+  `close_notify` goes out first, then the FIN, and the same wait: what the
+  peer sends meanwhile is dropped as it arrives, without being decrypted.
+  Up to 1.2.3 a TLS connection was closed right after its `close_notify`.
 - **Entering a callback**: `onRequest`, `onRequestBatch`, `onAborted` and
   `onWritable` are called with `this` the global object, inside a Node
   callback scope on one resource object per server
@@ -381,6 +410,35 @@ selectTls(library: 'boringssl' | 'openssl' | 'auto', ssl?: ServeOptions['ssl']):
   interpreted and may hold no control byte; trailer lines must be field lines
   and are then dropped, never merged into the headers. Anything else is a
   400. The trailer section is bounded by `maxHeadSize` (431).
+- **Request line** (RFC 9112 §3). The method is a token of at most 64 bytes;
+  a longer one is 501, as soon as that many bytes of it have arrived. The
+  request-target has one of the four forms of §3.2 and is 400 otherwise:
+  origin-form, which begins with `/` (what every request to an origin server
+  but the next three carries); absolute-form, a scheme followed by `://`
+  (`GET http://host/path`), which is accepted and handed over as it came -
+  path and query are split at the first `?`, and routing on it is the
+  application's business; authority-form for `CONNECT`, whose target is
+  handed over as it came; and asterisk-form, exactly `*`, for `OPTIONS` and
+  no other method. So `GET abc`, `GET *x`, `GET ?q`, `GET *` and `*?q` with
+  any method (a query makes it something other than asterisk-form) are 400,
+  and a handler that is given a path is given one that begins with `/`
+  unless the request was `OPTIONS *`, a `CONNECT`, or carried an absolute
+  URI. The target is ASCII: a byte of 0x80 or above, like a control byte, is
+  400 unless `allowNonAsciiTarget` is set. The version is `HTTP/1.` and a
+  digit (any other major version is 505).
+  On HTTP/2 the same rules hold for `:method` and `:path`, and a request that
+  breaks one is malformed (`RST_STREAM(PROTOCOL_ERROR)`; the connection goes
+  on): a `:method` of more than 64 bytes, and a `:path` that neither begins
+  with `/` nor is the `*` of an `OPTIONS` request. There is no absolute-form
+  there (the scheme and authority have pseudo-header fields of their own) and
+  no authority-form (`CONNECT` is not served).
+  With `http2` on, a cleartext connection whose first line is neither the
+  HTTP/2 preface nor an HTTP/1 request line (it has no HTTP-version in it)
+  is closed without a reply: there is no protocol to answer in. Only the
+  first line: once a request has been parsed on a connection - whether a
+  handler or an engine route answered it - the connection has spoken HTTP/1,
+  and a later line of that kind is answered 400 behind the responses already
+  given.
 - **Host** (RFC 9112 §3.2): exactly one on an HTTP/1.1 request, at most one
   on HTTP/1.0, and its value must be `uri-host [ ":" port ]` - a name or
   IPv4 address, or an IPv6 address in brackets, optionally followed by a
@@ -562,8 +620,8 @@ has closed its side; a peer that never does is cut after two seconds (the
 same lingering close an HTTP `Connection: close` response ends with). A peer
 that was still sending therefore receives the Close and its status code
 instead of a connection reset. Nothing that arrives after the Close is
-delivered. A TLS connection is closed after its `close_notify`, without the
-linger.
+delivered. A TLS connection ends the same way (1.2.4): its `close_notify`
+goes out behind the Close frame and ahead of the FIN.
 
 **Delivery guarantee (re-entrant open).** `upgradeToWebSocket()` invokes
 `onWsOpen` **synchronously and re-entrantly**: the callback has already run by
@@ -619,6 +677,122 @@ responses still on their way out, and a busy thread parses in a handful of
 warm ones. A WebSocket and an HTTP/2 connection keep theirs for as long as
 they live. Nothing is configured, and nothing changes on the wire.
 
+**What a pooled state may hold** (1.2.4). A state keeps the capacity of its
+buffers for the next request, and the peer decides how far some of them grow:
+the path, the query and the header fields of a request are each stored in a
+buffer of their own, up to `maxHeadSize`, in the parser, in the snapshot a
+handler reads and in each of the sixteen slots pipelined requests are staged
+in. A state holding more than 128 KiB of buffer storage is freed instead of
+kept: at once when its connection comes to rest behind a request head of more
+than 16 KiB, and at the next sweep otherwise (the sweep measures every pooled
+state, so many requests with smaller heads cannot add up past the bound
+either). Up to 256 states are kept after a burst of requests held at once;
+the sweep brings the pool back to 32, and the ones it keeps are the ones
+holding least. `probe().requestStates` is `{ pooled, bytes }`: how many
+states the calling thread's servers keep for the requests to come, and the
+storage they hold. The request objects an HTTP/2 server keeps for reuse are
+counted in it and held to the same bound.
+
+**The buffer budget** (`memoryBudget`, `capabilities.bufferBudget`, 1.2.4).
+Every limit above is a limit on one connection: `maxBodySize` on its request,
+`maxPendingBytes` on its unread input, `wsMaxMessageSize` on its message, the
+write high-water mark on its responses. A server accepts as many connections
+as it has descriptors for, and ten thousand peers that each send most of a
+10 MiB body, or each ask for a large response and read none of it, stay
+within all of those and have the process hold a hundred gigabytes. So what
+all connections hold together is counted as well:
+
+- *What is counted.* For each connection, the storage of the request it is
+  still receiving (the parser's input buffer and the body, input kept behind
+  a response in flight, a WebSocket message being reassembled, an HTTP/2
+  session's bodies in flight, a header block still arriving in
+  `CONTINUATION` frames and input it has kept) and of the response bytes
+  its peer has not taken (the write queue, and what HTTP/2 flow control is
+  holding back). Not counted: what a handler holds once a request is its
+  own, the JS heap, and what the kernel buffers for a socket.
+- *The bound.* `memoryBudget` is for the process: unset, an eighth of the
+  memory the process may use (the cgroup limit of its container when there
+  is one, the machine's memory otherwise); `Infinity` for none. It is
+  divided evenly among the threads that have a server listening, and a
+  thread's share is never below the largest single message its servers
+  accept (`maxHeadSize + maxBodySize`, or `wsMaxMessageSize`), so a request
+  that was accepted before there was a budget is still accepted on an idle
+  thread whatever the limits are set to - and a budget set below that is
+  raised to it. Servers of one thread share its share; the largest
+  `memoryBudget` among them is the one that counts.
+- *Over it: requests.* Where a connection's read ends on a thread that is
+  over its share, the connection is closed if what it has sent and no
+  handler has been given yet comes to more than 16 KiB: an HTTP/1 request
+  still arriving, with no response of that connection ahead of the answer,
+  is answered `503` with `Connection: close` (and its buffers are released
+  at once); a WebSocket whose message is being reassembled is closed with
+  code 1013; an HTTP/2 connection is sent `GOAWAY`. What is measured there
+  is the bytes the peer has sent, not the storage they are in, so a request
+  of up to 16 KiB is never refused for the budget, whatever the buffers it
+  is parsed into held for an earlier request: the small requests of a busy
+  server, a health check among them, are served while it is full. Nor is a
+  connection refused for the response bytes it is owed itself: a request
+  pipelined behind a large response is refused only if the thread is over
+  its share without them. Nothing waits for room: a connection made to wait
+  keeps its descriptor and what the kernel has buffered for it, and when
+  every holder is waiting none of them completes.
+- *Over it: responses.* Response bytes are counted, and they are never the
+  reason a connection is closed where they are queued: nothing says, at that
+  moment, whether the peer is reading. A response of any size to a peer that
+  takes it is delivered whole, as it was before there was a budget, also
+  when it is larger than the thread's share. While it drains it is part of
+  what the thread holds, so a thread kept over its share by responses
+  refuses requests of more than 16 KiB on its other connections until they
+  have gone out (`responseBackpressureLimit` is the cap on what one
+  connection may be owed, for an application that wants one). A peer that
+  takes none of what it is owed is closed at the sweep:
+- *Peers that fill it and stop.* At each sweep, while less than an eighth of
+  the share is free, a connection that has more than 4 KiB of requests still
+  arriving or of responses not taken, and has moved nothing in either
+  direction for a whole sweep interval, is closed - unless a handler holds
+  its request and nothing is queued for it (on HTTP/2: unless a handler
+  holds one of its requests and no response is waiting on a window). Moving
+  is bytes read from the peer, a write that completed, a write queue shorter
+  than at the sweep before, or an HTTP/2 window opened for a held response,
+  with or without `responseTimeoutMs`: a download that keeps moving is not
+  closed by this rule, and neither is an idle WebSocket for the buffer a
+  delivered message left behind. For a response the kernel has the last
+  word: a socket takes from the engine's queue in steps (on Linux, once a
+  third of its send buffer is free: over a megabyte for a buffer that has
+  grown), so the queue of a peer that reads a few hundred kilobytes a second
+  can stand still for sweeps on end. Before such a connection is closed the
+  engine asks the kernel how much of its output the peer has not
+  acknowledged (Linux and macOS), and less than at the sweep before is
+  movement: a peer that is reading is not closed for the size of those
+  steps, and one that reads nothing - its window shut, the send buffer full
+  - still is, at the same sweep as before. Two limits remain. On Windows
+  there is no such count, and the queue alone is looked at. And nothing on a
+  server shows a peer to be reading while that peer's own TCP stack keeps
+  the news to itself: one that acknowledges nothing and opens no window for
+  a whole sweep interval (the sweep runs every second at the default
+  timeouts; some stacks announce a window only once a quarter of their
+  receive buffer has been read) counts as having moved nothing, at a moment
+  when the thread is nearly out of room. Only then: with room to spare
+  nothing is closed by this rule, and `responseTimeoutMs` gives a slow
+  reader its full time. Without the rule, a peer that
+  sends most of a body and then nothing, or asks for responses and reads
+  none of them, would keep the budget full until `requestTimeoutMs` or
+  `responseTimeoutMs`, five minutes by default, and every connection that
+  needed room in that time would be the one closed.
+
+`probe().bufferBudget` is `{ held, limit, shed, evicted }` for the calling
+thread: the bytes counted now (by the capacity of the buffers, which is what
+is allocated), the thread's share (`Infinity` when it has none), connections
+closed because their requests needed room there was none of, and
+connections closed at the sweep for holding buffer memory without moving a
+byte. A connection is counted where its read ends, when it then holds bytes
+of its peer's or for it, and where a write is queued for it or completes;
+the sweep counts every connection afresh, and with it the storage a request
+state has kept from earlier requests (`probe().requestStates`), which is the
+engine's and not a peer's doing. Nothing is paid for the budget on the path
+of a request that is answered within the read that brought it: such a
+connection is at rest when the read ends and has nothing counted.
+
 **`trimMemory()`** (`capabilities.memoryTrim`, 1.2.3) gives back what an
 isolate's start-up left behind: one memory-reducing collection of the calling
 isolate's heap (V8's low-memory notification) and, on glibc, the allocator's
@@ -628,6 +802,65 @@ quiet. Measured on a worker thread that had loaded a framework and an
 application: 24.0 MB of heap before, 14.1 MB after. It is a synchronous
 collection, so call it once per isolate after start-up, not on a request
 path; the heap grows again as load needs it.
+
+## A loop that falls behind
+
+(1.2.4, the epoll transport.) A loop turn serves every socket that has
+something to read, and what a socket's service costs is whatever its bytes
+ask for: one request, or a read buffer full of pipelined ones, or a body
+whose handler takes milliseconds. With thousands of sockets ready at once a
+turn takes seconds, and everything else the loop does waits for it: its
+timers, the connections waiting to be accepted, the request of a client that
+has just connected. A flood of requests that each look reasonable then makes
+a server unreachable without exhausting anything.
+
+So a turn has a time slice of 50 ms. A turn that fits in it - which is every
+turn of a loop that is keeping up - is served exactly as before, and reads
+the clock only once per 32 sockets served. A turn that does not fit ends
+there, and until everything has been caught up with:
+
+- sockets wait their turn on two queues. One for sockets that were not
+  served in the turn before - a connection just accepted, or one that has
+  been quiet: they go first, within half of each slice, taken from both
+  ends of their queue - the oldest for the first half of that time, and one
+  of them whatever the clock says, then the newest. One for the sockets
+  that were served in the turn before and are ready again: oldest first,
+  for the rest of the slice. So the busy connections take turns among
+  themselves, and what a newcomer waits for is the first service of the
+  newcomers around it, not the work the busy ones have brought. Nobody
+  waits for ever behind connections that came later: when every service
+  takes a slice by itself, the order is the order of arrival;
+- a service reads less than a whole 64 KiB buffer once more than 256 sockets
+  wait - proportionally less, down to 1 KiB - so that a round over all of
+  them takes about as long whatever their number; the bytes not read stay in
+  the socket for its next turn;
+- the listener is given up to 1,024 connections per turn instead of 64, so
+  that a wave of connects does not sit in the listen queue ahead of the
+  client that connects next;
+- a waiting socket is not polled (its turn comes from the queue), and the
+  loop does not sleep while any waits.
+
+Nothing is dropped, and nothing is served less often than the load allows:
+the order of service is what changes, and only while turns do not fit their
+slice. Nor is a connection timed out for the time its socket waits: a sweep
+counts nothing towards `idleTimeoutMs` or `requestTimeoutMs`, towards the
+deadline of an HTTP/2 window or towards the buffer budget's eviction against
+a socket that has not had a turn since the sweep before, and the counts go
+on once it has had one. `responseTimeoutMs` runs as ever for what is queued
+on the socket itself - the sweep pushes that queue while the socket waits -
+so a peer that has stopped reading is closed when it would have been.
+`probe().turns` is `{ cut, waiting }`: how many turns ended on their
+slice with sockets still to serve, and how many sockets are waiting now;
+both stay zero on a loop that keeps up. `MORO_ENGINE_SERVE_DEBUG=1` logs a
+line every quarter of a second while sockets wait. The libuv and io_uring
+transports serve every turn in full, as before.
+
+A connection nothing more is read from - one that is lingering after its
+last response, or was answered with an error and is being closed - has what
+its peer still sends discarded in the kernel (`MSG_TRUNC`), up to 1 MiB a
+turn, instead of copied out and dropped: the rest of an upload that was
+answered 413 costs the server no copy and does not sit in a receive buffer
+while the connection lingers.
 
 ## Adding a native export (maintainers)
 

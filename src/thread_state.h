@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -29,6 +30,21 @@ namespace engine {
 struct Connection;
 struct JsServer;
 
+// What the servers of one thread may hold in buffers for their peers: the
+// requests they are still receiving and the responses their peers have not
+// taken yet (Server, "Buffer budget"). `limit` is the thread's share of the
+// process's budget, set when a server of the thread starts listening and
+// looked at again at every sweep; until then nothing is bounded.
+struct BufferBudget {
+  size_t held = 0;           // bytes the thread's connections hold now (Connection::held, summed)
+  size_t limit = SIZE_MAX;   // the thread's share
+  size_t asked = 0;          // the largest memoryBudget a server of this thread was given (0: none was)
+  size_t floor = 0;          // the least the share may be: room for the largest single message
+  uint32_t servers = 0;      // listening servers of this thread
+  uint64_t shed = 0;         // connections closed because the thread had no room for what they sent
+  uint64_t evicted = 0;      // connections closed, while the thread had no room, for holding what they would not move
+};
+
 struct ThreadState {
   // Server (server.h): request ids and the registry that maps a reqId back
   // to its Connection, and the same for WebSocket ids.
@@ -40,6 +56,8 @@ struct ThreadState {
   // server.h's, made there at first use and freed here.
   void* loopSlots = nullptr;
   void (*freeLoopSlots)(void*) = nullptr;
+  // Server (server.h, "Buffer budget").
+  BufferBudget budget;
 
   // binding.cpp: the servers created on this thread, and the reused scratch
   // buffers of respond() and friends (see HeaderBlockLease, ByteSource).

@@ -1071,10 +1071,12 @@ class TlsSession {
     directMore_ = false;
   }
 
-  // Best-effort close_notify for a graceful teardown; appends the alert
-  // ciphertext to cipherOut (empty when the handshake never completed).
+  // close_notify for a graceful teardown; appends the alert ciphertext to
+  // cipherOut (empty when the handshake never completed, or the session has
+  // failed). Said once: a second call adds nothing.
   void shutdown(std::string& cipherOut) {
-    if (fatal_ || !handshakeDone_) return;
+    if (fatal_ || !handshakeDone_ || closeNotifySent_) return;
+    closeNotifySent_ = true;
     std::string* const outer = out_;
     out_ = &cipherOut;
     flushStash();
@@ -1082,6 +1084,9 @@ class TlsSession {
     SSL_shutdown(ssl_);
     out_ = outer;
   }
+  // Our close_notify has been produced: nothing more is encrypted on this
+  // session, and the connection is on its way out.
+  bool closeNotifySent() const { return closeNotifySent_; }
 
  private:
   // The read view is over for this call: whatever the record layer did not
@@ -1246,6 +1251,7 @@ class TlsSession {
   bool directMore_ = false;
   bool directBlocked_ = false;
   bool handshakeDone_ = false;
+  bool closeNotifySent_ = false;
   bool fatal_ = false;
 };
 

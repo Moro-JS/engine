@@ -103,6 +103,30 @@ test('light parse keeps framing, errors, keep-alive and JS visibility', async ()
     r = await exchange(port, `GET /s HTTP/1.1${CRLF}${H}` + 'X-N: 1\r\n'.repeat(150) + CRLF); // > maxHeaders
     assert.deepStrictEqual(statuses(r.buf), [431]);
 
+    // A target that has none of the four forms (RFC 9112 §3.2) is refused at
+    // the request line, before any route is asked: alone on a connection
+    // with nothing queued (the read is parsed in place), behind engine
+    // routes in the same read, and arriving in pieces.
+    for (const target of ['abc', 's', '*x', '*?q', '?q', 'user/7']) {
+      r = await exchange(port, `GET ${target} HTTP/1.1${CRLF}${H}${CRLF}`, 1, { waitClose: true });
+      assert.deepStrictEqual(statuses(r.buf), [400], target);
+      r = await exchange(port, `GET /s HTTP/1.1${CRLF}${H}${CRLF}` + `GET /user/7 HTTP/1.1${CRLF}${H}${CRLF}` + `GET ${target} HTTP/1.1${CRLF}${H}${CRLF}` + `GET /s HTTP/1.1${CRLF}${H}${CRLF}`, 3, { waitClose: true });
+      assert.deepStrictEqual(statuses(r.buf), [200, 200, 400], target);
+      assert.deepStrictEqual(bodies(r.buf), ['static', '7', ''], target);
+    }
+    {
+      const s = await open(port);
+      let buf = '';
+      s.on('data', (d) => (buf += d));
+      for (const piece of ['GE', 'T ab', `c HTTP/1.1${CRLF}`, `${H}${CRLF}`]) {
+        s.write(piece);
+        await new Promise((res) => setTimeout(res, 30));
+      }
+      await new Promise((res) => setTimeout(res, 100));
+      assert.deepStrictEqual(statuses(buf), [400]);
+      s.destroy();
+    }
+
     // Connection semantics.
     r = await exchange(port, `GET /s HTTP/1.1${CRLF}${H}Connection: close${CRLF}${CRLF}`, 1, { waitClose: true });
     assert.ok(r.closed && r.buf.includes('Connection: close'), 'http/1.1 close: ' + JSON.stringify(r));

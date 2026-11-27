@@ -329,6 +329,182 @@ describe('resting connections over TLS', { skip }, () => {
   });
 });
 
+// A pooled state keeps the capacity of its buffers for the next request, and
+// the peer decides how far the ones holding its path, query and header
+// fields grow: each up to maxHeadSize, in the parser, in the snapshot and in
+// every slot of the staging ring. probe().requestStates reports what the
+// pools of the calling thread hold; a state holding more than 128 KiB is
+// freed instead of kept.
+describe('what a pooled request state holds', { skip }, () => {
+  const KEEP = 128 * 1024;
+  const states = () => engine.probe().requestStates;
+  const conns = () => engine.probe().connections;
+
+  // A server that answers every request with one byte, through onRequest or
+  // through the batch loop.
+  function serve({ batch = false, options } = {}) {
+    let buffers = null;
+    const callbacks = {
+      onRequest(reqId) {
+        engine.respond(reqId, 200, null, 'k');
+      },
+      onAborted() {},
+    };
+    if (batch) {
+      callbacks.onRequestBatch = (count) => {
+        const { descriptors: d, control: ctl } = buffers;
+        let i = 0;
+        for (;;) {
+          engine.respond(d[3 * i], 200, null, 'k');
+          const next = ctl[0];
+          if (next === i) return i + 1;
+          if (next >= count) return count;
+          i = next;
+        }
+      };
+    }
+    const sid = engine.serve(callbacks, options);
+    if (batch) buffers = engine.getBatchBuffers(sid);
+    return { sid, port: engine.listen(sid, '127.0.0.1', 0), close: () => engine.close(sid) };
+  }
+  const settled = () => waitFor(() => states().pooled === 0 && conns().open === 0, 'the pools of earlier servers are gone', 5000);
+  const get = (target, extra = '') => `GET ${target} HTTP/1.1${CRLF}Host: t${CRLF}${extra}${CRLF}`;
+  // Eighteen requests of each kind, so that the parser, the snapshot and all
+  // sixteen staging slots have held a large path, a large query and a large
+  // header block; then the start of one more, which keeps the state in use.
+  const growing = (size, i) =>
+    get(`/${'a'.repeat(size)}${i}`).repeat(18) + get(`/q?${'b'.repeat(size)}`).repeat(18) + get('/h', `X-A: ${'c'.repeat(size)}${CRLF}`).repeat(18);
+  const PARTIAL = 'GET /par';
+  const REST = `tial HTTP/1.1${CRLF}Host: t${CRLF}${CRLF}`;
+  async function answers(c, n) {
+    for (let i = 0; i < n; i++) assert.equal((await c.response()).status, 200);
+  }
+
+  it('probe().requestStates counts the states waiting for a request and the storage they hold', async () => {
+    await settled();
+    const srv = serve();
+    try {
+      assert.deepEqual(states(), { pooled: 0, bytes: 0 });
+      const c = await client(srv.port);
+      c.write(get('/one'));
+      await answers(c, 1);
+      await waitFor(() => conns().resting === 1, 'at rest');
+      assert.equal(states().pooled, 1);
+      assert.ok(states().bytes < 4096, `an ordinary request leaves little behind: ${states().bytes}`);
+      await c.close();
+    } finally {
+      srv.close();
+    }
+  });
+
+  for (const batch of [false, true]) {
+    it(`a state that large requests have grown is freed when its connection comes to rest (${batch ? 'batch' : 'one-by-one'} dispatch)`, { timeout: 60000 }, async () => {
+      await settled();
+      const srv = serve({ batch });
+      try {
+        const N = 6;
+        const cs = await Promise.all(Array.from({ length: N }, () => client(srv.port)));
+        for (const [i, c] of cs.entries()) c.write(growing(50000, i) + PARTIAL);
+        await Promise.all(cs.map((c) => answers(c, 54)));
+        assert.equal(conns().resting, 0, 'every connection still holds its state: a request is half received');
+        for (const c of cs) c.write(REST);
+        await Promise.all(cs.map((c) => answers(c, 1)));
+        await waitFor(() => conns().resting === N, 'all at rest');
+        // Each of the N states held megabytes; none of that is in the pool.
+        const now = states();
+        assert.ok(now.bytes <= now.pooled * KEEP, `pooled states hold ${now.bytes} bytes in ${now.pooled} states`);
+        assert.ok(now.bytes < 256 * 1024, `${now.bytes} bytes kept after ${N} grown states came to rest`);
+        // The connections are served as before, by other states.
+        for (const [i, c] of cs.entries()) c.write(get(`/after/${i}`));
+        await Promise.all(cs.map((c) => answers(c, 1)));
+        await waitFor(() => conns().resting === N, 'at rest again');
+        assert.ok(states().bytes < 256 * 1024);
+        await Promise.all(cs.map((c) => c.close()));
+      } finally {
+        srv.close();
+      }
+    });
+  }
+
+  it('a large head that leaves the state within the bound keeps it in the pool', async () => {
+    await settled();
+    const srv = serve();
+    try {
+      const c = await client(srv.port);
+      c.write(get(`/${'a'.repeat(20000)}`));
+      await answers(c, 1);
+      await waitFor(() => conns().resting === 1, 'at rest');
+      const now = states();
+      assert.equal(now.pooled, 1, 'the state is kept');
+      assert.ok(now.bytes >= 20000 && now.bytes <= KEEP, `it holds ${now.bytes} bytes`);
+      c.write(get('/next'));
+      await answers(c, 1);
+      await c.close();
+    } finally {
+      srv.close();
+    }
+  });
+
+  // Heads within 16 KiB leave no mark on a state, and many of them can still
+  // grow every buffer of the ring by some kilobytes: the sweep measures
+  // what the pool holds and frees a state over the bound.
+  it('states grown a little at a time, by many requests under the mark, are freed at the next sweep', { timeout: 60000 }, async () => {
+    await settled();
+    const srv = serve({ batch: true, options: { requestTimeoutMs: 600 } }); // the sweep runs every 300 ms
+    try {
+      const N = 4;
+      const cs = await Promise.all(Array.from({ length: N }, () => client(srv.port)));
+      for (const [i, c] of cs.entries()) c.write(growing(12000, i).repeat(3) + PARTIAL);
+      await Promise.all(cs.map((c) => answers(c, 162)));
+      for (const c of cs) c.write(REST);
+      await Promise.all(cs.map((c) => answers(c, 1)));
+      await waitFor(() => conns().resting === N, 'all at rest');
+      await delay(700);
+      const now = states();
+      assert.ok(now.bytes <= now.pooled * KEEP, `after a sweep the pool holds ${now.bytes} bytes in ${now.pooled} states`);
+      assert.ok(now.bytes < 256 * 1024, `${now.bytes} bytes kept`);
+      await Promise.all(cs.map((c) => c.close()));
+    } finally {
+      srv.close();
+    }
+  });
+
+  // After a burst the sweep brings the pool back to 32 states. The ones it
+  // keeps are the ones holding least, whatever order they came back in.
+  it('the pool is trimmed to its leanest states', { timeout: 60000 }, async () => {
+    await settled();
+    const srv = serve({ options: { requestTimeoutMs: 600 } });
+    try {
+      const FAT = 8;
+      const LEAN = 34;
+      const fat = await Promise.all(Array.from({ length: FAT }, () => client(srv.port)));
+      const lean = await Promise.all(Array.from({ length: LEAN }, () => client(srv.port)));
+      // 42 states in use at once. Eight of them have parsed a request with
+      // a 30,000-byte path and a 30,000-byte query: well within the bound.
+      for (const c of fat) c.write(get(`/${'a'.repeat(30000)}?${'b'.repeat(30000)}`) + PARTIAL);
+      for (const c of lean) c.write(PARTIAL);
+      await Promise.all(fat.map((c) => answers(c, 1)));
+      await waitFor(() => conns().open === FAT + LEAN && conns().resting === 0, 'every connection holds a state');
+      // The large ones come back first ...
+      for (const c of fat) c.write(REST);
+      await Promise.all(fat.map((c) => answers(c, 1)));
+      await waitFor(() => conns().resting === FAT, 'the first eight are at rest');
+      // ... and the rest after them, within one sweep interval or across two.
+      for (const c of lean) c.write(REST);
+      await Promise.all(lean.map((c) => answers(c, 1)));
+      await waitFor(() => conns().resting === FAT + LEAN, 'all at rest');
+      await delay(700);
+      const now = states();
+      assert.ok(now.pooled <= 32, `${now.pooled} states pooled after a sweep`);
+      assert.ok(now.pooled >= 30, `${now.pooled} states pooled after a sweep`);
+      assert.ok(now.bytes < 60000, `the states kept hold ${now.bytes} bytes: one that parsed the large request is among them`);
+      await Promise.all([...fat, ...lean].map((c) => c.close()));
+    } finally {
+      srv.close();
+    }
+  });
+});
+
 describe('connections that keep their request state', { skip }, () => {
   it('a WebSocket is open and never at rest', async () => {
     let opened = 0;

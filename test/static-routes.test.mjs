@@ -71,6 +71,43 @@ test('static route answers without entering JS', async () => {
   engine.close(sid);
 });
 
+// A route is looked up for a request-target that is one (RFC 9112 §3.2): a
+// target with none of the four forms is 400 before the table is asked,
+// whatever was registered under that text, and "*" is a target for OPTIONS
+// alone.
+test('a route registered under a text that is no request-target is never reached; OPTIONS * can be a static route', async () => {
+  let jsHits = 0;
+  const sid = engine.serve({
+    onRequest(reqId) {
+      jsHits++;
+      engine.respond(reqId, 200, null, 'from-js');
+    },
+    onAborted() {},
+  });
+  const port = engine.listen(sid, '127.0.0.1', 0);
+  try {
+    const OPTIONS = 6;
+    engine.setStaticRoute(sid, GET, 'abc', 200, null, 'never');
+    engine.setStaticRoute(sid, GET, '*', 200, null, 'never');
+    engine.setStaticRoute(sid, OPTIONS, '*', 204, ['allow', 'GET, POST, OPTIONS'], '');
+    engine.setStaticRoute(sid, GET, '/abc', 200, null, 'slash');
+
+    for (const target of ['abc', '*', '*x']) {
+      const r = await raw(port, req('GET', target));
+      assert.match(r, /^HTTP\/1\.1 400 /, `GET ${target}: ${JSON.stringify(r.slice(0, 40))}`);
+      assert.ok(!r.includes('never'));
+    }
+    const o = await raw(port, req('OPTIONS', '*'));
+    assert.match(o, /^HTTP\/1\.1 204 /);
+    assert.match(o, /allow: GET, POST, OPTIONS\r\n/i);
+    assert.match(await raw(port, req('OPTIONS', '*?x')), /^HTTP\/1\.1 400 /);
+    assert.ok((await raw(port, req('GET', '/abc'))).endsWith('slash'));
+    assert.strictEqual(jsHits, 0);
+  } finally {
+    engine.close(sid);
+  }
+});
+
 test('static response is byte-identical to the respond() path', async () => {
   // Same status, headers and body served both ways; the wire bytes must match.
   const headers = ['content-type', 'text/plain', 'x-marker', 'abc'];

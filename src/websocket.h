@@ -692,6 +692,22 @@ class WsParser {
     return true;
   }
 
+ public:
+  // Heap storage of the message being reassembled: what a peer that sends a
+  // message in fragments, or a frame over several reads, has made this
+  // connection hold (the server's buffer budget counts it).
+  size_t memory() const { return message_.capacity() >= sizeof(std::string) ? message_.capacity() : 0; }
+  // The same by content: the bytes of the message being reassembled (the
+  // buffer keeps its capacity after a message has been delivered).
+  size_t arriving() const { return message_.size(); }
+  // The connection is being closed for what it holds: give the storage back
+  // now, and take nothing more (the parser is latched as after a failure).
+  void abandon() {
+    std::string().swap(message_);
+    failed_ = true;
+  }
+
+ private:
   Limits limits_{};
   State state_ = State::Header;
   bool failed_ = false;

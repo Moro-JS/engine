@@ -855,8 +855,42 @@ static void sessionErrors() {
   CHECK(streamCode({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/a b"}}) == kProtocolError);
   CHECK(streamCode({{":method", "G ET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}}) == kProtocolError);
   CHECK(streamCode({{":method", "CONNECT"}, {":authority", "x:443"}}) == kProtocolError);
+  // A method token longer than the 64 bytes HTTP/1 takes for a method (501 there).
+  CHECK(streamCode({{":method", std::string(65, 'M')}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}}) == kProtocolError);
+  CHECK(streamCode({{":method", std::string(100, 'M')}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}}) == kProtocolError);
+  // :path begins with "/", or is the "*" of OPTIONS and of no other method
+  // (RFC 9113 8.3.1; the asterisk-form of RFC 9112 3.2.4).
+  for (const char* path : {"abc", "*x", "**", "*?q", "?q", "http://example.test/", "example.test:443", "."}) {
+    for (const char* method : {"GET", "OPTIONS", "POST"}) {
+      CHECK(streamCode({{":method", method}, {":scheme", "http"}, {":authority", "example.test"}, {":path", path}}) == kProtocolError);
+    }
+  }
+  for (const char* method : {"GET", "HEAD", "POST", "DELETE", "FOO"}) {
+    CHECK(streamCode({{":method", method}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "*"}}) == kProtocolError);
+    CHECK(streamCode({{":path", "*"}, {":method", method}, {":scheme", "http"}, {":authority", "example.test"}}) == kProtocolError);  // whichever comes first
+  }
   CHECK(streamCode({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {"content-length", "x"}}) == kProtocolError);
   CHECK(streamCode({{":method", "POST"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}, {"content-length", "1"}, {"content-length", "2"}}) == kProtocolError);
+  // What is not malformed: a method of exactly 64 bytes, OPTIONS *, and
+  // every path that begins with "/".
+  {
+    Harness h;
+    h.open();
+    uint32_t id = 1;
+    const auto ok = [&](const Fields& f) {
+      const size_t before = h.requests.size();
+      h.feed(frame(kHeaders, kFlagEndHeaders | kFlagEndStream, id, head(f)));
+      id += 2;
+      return h.requests.size() == before + 1;
+    };
+    CHECK(ok({{":method", std::string(64, 'M')}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "/"}}));
+    CHECK(ok({{":method", "OPTIONS"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", "*"}}));
+    CHECK(ok({{":path", "*"}, {":method", "OPTIONS"}, {":scheme", "https"}, {":authority", "example.test"}}));
+    for (const char* path : {"/", "/a", "//x", "/*", "/?q", "/a?*", "/http://x"}) {
+      CHECK(ok({{":method", "GET"}, {":scheme", "http"}, {":authority", "example.test"}, {":path", path}}));
+    }
+    CHECK(!h.session->dead());
+  }
   // te: trailers is the one allowed value.
   {
     Harness h;

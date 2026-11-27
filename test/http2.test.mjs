@@ -1980,6 +1980,140 @@ describe('HTTP/2', () => {
     }
   });
 
+  // A connection error ends the connection: GOAWAY, then - over TLS -
+  // close_notify, the FIN, and the wait for the peer's own close that a
+  // plaintext connection gets. A client still writing frames when that
+  // happens must still be able to read why: closed outright, its frames
+  // draw a RST, and the RST takes the GOAWAY it had not read yet.
+  it('over TLS, the GOAWAY of a connection error reaches a client that is still sending', T, async () => {
+    const server = await startFixtureServer(engine, (ctx) => ctx.respond(200, null, 'ok'), { http2: true, ssl: sslFileOptions() });
+    try {
+      const client = await rawH2(server.port, { secure: true, read: false });
+      // DATA on stream 0 is a connection error (RFC 9113 6.1) ...
+      await client.send(h2frame(FT.DATA, 0, 0, Buffer.from('x')));
+      // ... and the client goes on for a while, reading nothing.
+      const until = Date.now() + 300;
+      while (Date.now() < until && !client.closed) {
+        client.socket.write(h2frame(FT.PING, 0, 0, Buffer.alloc(8)), () => {});
+        await delay(5);
+      }
+      client.resume();
+      await waitFor(() => client.goaway >= 0 || client.closed, { timeout: 4000, message: 'neither GOAWAY nor a close' });
+      assert.equal(client.goaway, 1, 'GOAWAY(PROTOCOL_ERROR) was read');
+      client.destroy();
+    } finally {
+      server.close();
+    }
+  });
+
+  // A request on a stream is carried by a request object the server keeps
+  // for the next stream, and that object keeps the capacity of the buffers
+  // holding the path, the query and the fields. A peer can make them as large
+  // as maxHeaderListSize allows; one holding more than 128 KiB is not kept
+  // past the next sweep (probe().requestStates counts what is).
+  it('the request objects kept for the next streams do not keep what a very large :path grew', { timeout: 60000 }, async () => {
+    const before = engine.probe().requestStates;
+    const server = await startFixtureServer(engine, (ctx) => ctx.respond(200, null, String(ctx.path.length + ctx.query().length)), {
+      http2: true,
+      maxHeadSize: 1024 * 1024,
+      requestTimeoutMs: 600, // the sweep runs every 300 ms
+    });
+    try {
+      const session = http2.connect(`http://127.0.0.1:${server.port}`, { maxSendHeaderBlockLength: 1 << 20 });
+      const path = `/${'a'.repeat(200000)}`;
+      const query = 'b'.repeat(200000);
+      const answers = await Promise.all(Array.from({ length: 8 }, () => request(session, { ':path': `${path}?${query}` })));
+      for (const a of answers) {
+        assert.equal(a.status, 200);
+        assert.equal(a.body.toString(), String(path.length + query.length));
+      }
+      await waitFor(() => engine.probe().requestStates.pooled >= 1, { message: 'a request object is kept when its stream is done' });
+      await delay(700);
+      const swept = engine.probe().requestStates;
+      assert.ok(swept.bytes - before.bytes < 128 * 1024, `the request objects kept hold ${swept.bytes - before.bytes} bytes after eight requests of 400,000`);
+      // Ordinary requests afterwards are served, and their objects are kept.
+      const small = await Promise.all(Array.from({ length: 8 }, (_, i) => request(session, { ':path': `/small/${i}?q` })));
+      for (const a of small) assert.equal(a.status, 200);
+      await waitFor(() => engine.probe().requestStates.pooled >= 1, { message: 'a request object is kept for the next stream' });
+      await delay(700);
+      const now = engine.probe().requestStates;
+      assert.ok(now.pooled >= 1, 'an object that holds little stays');
+      assert.ok(now.bytes - before.bytes < 128 * 1024);
+      await new Promise((resolve) => session.close(resolve));
+    } finally {
+      server.close();
+    }
+  });
+
+  // The request line rules of HTTP/1 hold for the pseudo-header fields that
+  // carry the same things. :path is origin-form - it begins with "/" - or
+  // the "*" of a server-wide OPTIONS, exactly and for that method alone
+  // (RFC 9113 8.3.1); there is no absolute-form (the scheme and authority
+  // have fields of their own). And a :method longer than the 64 bytes
+  // HTTP/1 takes for a method is not one. Each is malformed: a stream error,
+  // and the connection goes on.
+  it('a :path that is neither origin-form nor the "*" of OPTIONS, and a :method of more than 64 bytes, are malformed', T, async () => {
+    const seen = [];
+    const server = await startFixtureServer(
+      engine,
+      (ctx) => {
+        seen.push(`${engine.getMethod(ctx.reqId)} ${ctx.path}`);
+        ctx.respond(200, null, 'ok');
+      },
+      { http2: true }
+    );
+    try {
+      const client = await rawH2(server.port);
+      const bad = [
+        ['GET', 'abc'],
+        ['GET', '*x'],
+        ['GET', '**'],
+        ['GET', 'http://h2.test/abs'],
+        ['GET', 'h2.test:443'],
+        ['GET', '*'],
+        ['POST', '*'],
+        ['HEAD', '*'],
+        ['OPTIONS', '*?q'],
+        ['OPTIONS', 'abc'],
+        ['M'.repeat(65), '/long-method'],
+        ['M'.repeat(100), '/longer-method'],
+      ];
+      const good = [
+        ['GET', '/'],
+        ['GET', '//double'],
+        ['GET', '/*'],
+        ['OPTIONS', '*'],
+        ['M'.repeat(64), '/method-at-the-bound'],
+      ];
+      let id = 1;
+      const frames = [];
+      const badIds = [];
+      const goodIds = [];
+      for (const [method, path] of bad) {
+        badIds.push(id);
+        frames.push(h2get(id, path, [], method));
+        id += 2;
+      }
+      for (const [method, path] of good) {
+        goodIds.push(id);
+        frames.push(h2get(id, path, [], method));
+        id += 2;
+      }
+      await client.send(...frames);
+      await client.done(id - 2);
+      for (const [k, sid] of badIds.entries()) {
+        assert.equal(client.stream(sid).rst, 1, `${bad[k][0].slice(0, 8)} ${bad[k][1]}: RST_STREAM(PROTOCOL_ERROR)`);
+        assert.equal(client.stream(sid).status, undefined);
+      }
+      for (const [k, sid] of goodIds.entries()) assert.equal(client.stream(sid).status, 200, `${good[k][0].slice(0, 8)} ${good[k][1]}`);
+      assert.deepEqual(seen, good.map(([m, p]) => `${m} ${p}`));
+      assert.equal(client.goaway, -1);
+      client.destroy();
+    } finally {
+      server.close();
+    }
+  });
+
   // An http or https request names its authority, as :authority or as Host
   // (RFC 9110 7.2: a user agent must send one or the other), and the name is
   // never empty: with neither field, or an empty one, the request is

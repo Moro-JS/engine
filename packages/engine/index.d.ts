@@ -72,6 +72,9 @@ export interface EngineCapabilities {
   /** A connection between requests holds no parser and no request buffers:
    *  an idle keep-alive connection costs its socket and its bookkeeping. */
   restingConnections: boolean;
+  /** 1.2.4: what all connections hold in buffers together is bounded (the
+   *  memoryBudget option, probe().bufferBudget). */
+  bufferBudget: boolean;
   /** Engine-side upgrades (setWsAutoUpgrade) are safe together with batched
    *  dispatch (onRequestBatch). Engines 1.1.15 to 1.1.21 report
    *  wsAutoUpgrade and batchDispatch without this flag and must not be given
@@ -181,6 +184,27 @@ export interface EngineProbeResult {
    *  buffers (capabilities.restingConnections). WebSockets, HTTP/2 connections
    *  and connections with a request in progress are open and not at rest. */
   connections?: { open: number; resting: number };
+  /** 1.2.4: the request states the servers of the calling thread keep for
+   *  the requests to come, and the heap storage their buffers hold. A state
+   *  holding more than 128 KiB is freed instead of kept (the path, query and
+   *  header storage of a request can each grow to maxHeadSize), so `bytes`
+   *  stays within 128 KiB times `pooled`. Absent on engines before 1.2.4. */
+  requestStates?: { pooled: number; bytes: number };
+  /** 1.2.4: the buffer budget of the calling thread (the memoryBudget
+   *  option). `held`: bytes its connections hold in buffers for their peers -
+   *  requests still arriving, responses not yet taken. `limit`: the thread's
+   *  share of the process's budget, Infinity when there is none (no server
+   *  listening on the thread, or memoryBudget: Infinity). `shed`: connections
+   *  closed because the thread had no room for the requests they were
+   *  sending. `evicted`: connections closed at the sweep, while it had none,
+   *  for requests or unread responses of which nothing had moved for a sweep
+   *  interval. Absent on engines before 1.2.4. */
+  bufferBudget?: { held: number; limit: number; shed: number; evicted: number };
+  /** 1.2.4: the calling thread's event loop under load (epoll transport;
+   *  zeros elsewhere). `cut`: loop turns that used up their time slice with
+   *  sockets still to serve. `waiting`: sockets waiting for a later turn
+   *  now. Both are zero on a loop that is keeping up. */
+  turns?: { cut: number; waiting: number };
   /** Per-thread fast/slow hit counters per hot entry point - present only when
    *  MORO_ENGINE_FASTCALL_STATS=1 was set when the addon loaded (test/CI proof
    *  that the fast path is taken). */
@@ -248,7 +272,10 @@ export interface ServeOptions {
    *  running a handler (slowloris defense + keep-alive cap). 0 disables.
    *  Default 120000. A connection whose response is still being written to
    *  the peer is not idle: responseTimeoutMs governs it, unless that is 0
-   *  (capabilities.idleSparesDrainingResponse). */
+   *  (capabilities.idleSparesDrainingResponse). A full budget: the
+   *  connection is never closed before it has been idle this long, and is
+   *  closed within two sweep intervals after (an interval is half the
+   *  shortest timeout set, between 250 ms and 1 s). */
   idleTimeoutMs?: number;
   /** Max simultaneous connections; accepts beyond this are dropped
    *  immediately (connection-flood defense). 0 = unlimited (default). */
@@ -258,10 +285,33 @@ export interface ServeOptions {
    *  waiting on the peer (pipelined-flood defense). Over it the connection is
    *  closed. 0 = maxHeadSize + maxBodySize (default). */
   maxPendingBytes?: number;
+  /** 1.2.4 (capabilities.bufferBudget): bytes the PROCESS may hold in
+   *  buffers for its peers, all connections of all its servers together -
+   *  requests still being received (bodies, pipelined input, WebSocket
+   *  messages being reassembled) and response bytes peers have not taken.
+   *  Every other limit bounds one connection. The budget is divided among
+   *  the threads that have a server listening; a thread's share is never
+   *  below the largest single message its servers accept (maxHeadSize +
+   *  maxBodySize, or wsMaxMessageSize). When a thread is over its share, a
+   *  connection with more than 16 KiB of requests still arriving is closed
+   *  where its read ends - 503 for an HTTP/1 request, close code 1013 for a
+   *  WebSocket message, GOAWAY on HTTP/2; a request of up to 16 KiB is never
+   *  refused. Response bytes are counted and never close a connection where
+   *  they are queued: a response to a peer that reads it is delivered
+   *  whatever its size. At the sweep, while the thread is short, connections
+   *  whose requests or unread responses have not moved for a sweep interval
+   *  are closed (for a response, the kernel's count of unacknowledged output
+   *  is asked too on Linux and macOS, so a slow reader is not taken for one
+   *  that has stopped). Unset or 0: an eighth of the memory the process may use
+   *  (its cgroup limit, or the machine's). Infinity: no budget. */
+  memoryBudget?: number;
   /** Budget in ms for receiving one complete request (head + body), measured
    *  from its first byte. Unlike idleTimeoutMs it does NOT reset on activity,
    *  so slow-drip (slowloris) clients are bounded. Expiry answers 408 and
-   *  closes. 0 disables. Default 300000 (Node's server.requestTimeout). */
+   *  closes. 0 disables. Default 300000 (Node's server.requestTimeout). A
+   *  full budget: a request that completes within it is served, and the 408
+   *  comes within two sweep intervals after it has passed (an interval is
+   *  half the shortest timeout set, between 250 ms and 1 s), never before. */
   requestTimeoutMs?: number;
   /** Budget in ms for DELIVERING queued outbound bytes (the response-side twin
    *  of requestTimeoutMs; feature-detect via probe().capabilities.responseLimits).
@@ -617,7 +667,8 @@ export function wsSend(wsId: number, data: string | ArrayBuffer | Uint8Array | B
 /** Send a Close frame (code 1000 unless given) and end the connection: the
  *  server half-closes and reads until the peer has closed too (at most two
  *  seconds), so the peer receives the Close even while it is still sending;
- *  a TLS connection is closed after its close_notify. The frame is legal
+ *  over TLS the close_notify goes out behind the frame and ahead of the FIN
+ *  (1.2.4; earlier a TLS connection was closed at once). The frame is legal
  *  whatever is passed: a `code` that may not appear on the wire (RFC 6455
  *  §7.4) is replaced - 1005 by a Close without a status, any other
  *  (1004, 1006, 1015, below 1000, 1016-2999, 5000 and up) by 1011 - and

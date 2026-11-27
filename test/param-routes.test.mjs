@@ -81,6 +81,33 @@ test('a parameter route echoes the segment without entering JS', async () => {
   }
 });
 
+// A parameter route's prefix is matched against a request-target that is
+// one: a target that does not begin with "/" (and is neither absolute-form
+// nor the "*" of OPTIONS) is 400 before any route is asked.
+test('a prefix registered without its leading slash matches nothing: such a target is 400', async () => {
+  let jsHits = 0;
+  const sid = engine.serve({
+    onRequest(reqId) {
+      jsHits++;
+      engine.respond(reqId, 200, null, 'from-js');
+    },
+    onAborted() {},
+  });
+  const port = engine.listen(sid, '127.0.0.1', 0);
+  try {
+    engine.setParamRoute(sid, GET, 'user/', '', 200, null);
+    engine.setParamRoute(sid, GET, '/user/', '', 200, null);
+    for (const target of ['user/42', 'user/', '*user/42']) {
+      const r = await raw(port, req('GET', target));
+      assert.match(r, /^HTTP\/1\.1 400 /, `GET ${target}: ${JSON.stringify(r.slice(0, 40))}`);
+    }
+    assert.ok((await raw(port, req('GET', '/user/42'))).endsWith('\r\n\r\n42'));
+    assert.strictEqual(jsHits, 0);
+  } finally {
+    engine.close(sid);
+  }
+});
+
 test('the reply is byte-identical to respond() with the same segment', async () => {
   const sid = engine.serve({
     onRequest(reqId, _method, path) {

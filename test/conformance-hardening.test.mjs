@@ -1090,6 +1090,88 @@ describe('slow and silent clients', { skip }, () => {
     });
   });
 
+  // The sweep counts passes, and the first pass after a request's first
+  // byte (or a connection's last) can come a millisecond after it. The
+  // timeout acts on the pass after the one that completes the count: the
+  // budget has gone by in full, and the answer comes within one sweep
+  // interval after it. Wherever in the interval the first byte falls.
+  it('requestTimeoutMs is a full budget: the 408 never comes before it has passed, and comes within a sweep interval after', T, async () => {
+    const budget = 1000; // the sweep then runs every 500 ms
+    await withServer(echo, { requestTimeoutMs: budget, idleTimeoutMs: 0 }, async (server) => {
+      const took = [];
+      // Four requests started at different points of the sweep interval, at once.
+      await Promise.all(
+        [0, 130, 260, 390].map(async (startAfter) => {
+          await delay(startAfter);
+          const c = await openRaw(server.port);
+          try {
+            const t0 = Date.now();
+            await c.send(`GET /slow HTTP/1.1${CRLF}Host: t${CRLF}X-Unfinished:`);
+            const res = parseResponse(await c.read({ until: (buf) => buf.includes(CRLF + CRLF), timeout: 6000 }));
+            took.push(Date.now() - t0);
+            assert.equal(res.status, 408);
+          } finally {
+            c.destroy();
+          }
+        })
+      );
+      for (const ms of took) {
+        assert.ok(ms >= budget, `408 after ${ms} ms of a ${budget} ms budget (all: ${took})`);
+        assert.ok(ms < budget + 500 + 400, `408 after ${ms} ms: more than a sweep interval late (all: ${took})`);
+      }
+      assert.equal(server.requests.length, 0);
+    });
+  });
+
+  it('a request that takes most of requestTimeoutMs to arrive is served, not timed out', T, async () => {
+    const budget = 1000;
+    await withServer(echo, { requestTimeoutMs: budget, idleTimeoutMs: 0 }, async (server) => {
+      await Promise.all(
+        [0, 170, 340].map(async (startAfter) => {
+          await delay(startAfter);
+          const c = await openRaw(server.port);
+          try {
+            await c.send(`GET /patient/${startAfter} HTTP/1.1${CRLF}Host: t${CRLF}`);
+            await delay(budget - 200); // inside the budget, past all but its last fifth
+            await c.send(CRLF);
+            const res = parseResponse(await c.read({ until: responsesComplete(1), timeout: 3000 }));
+            assert.equal(res.status, 200, `started ${startAfter} ms into the run`);
+            assert.equal(res.body, `/patient/${startAfter}`);
+          } finally {
+            c.destroy();
+          }
+        })
+      );
+    });
+  });
+
+  it('idleTimeoutMs is a full budget too: a keep-alive connection is not closed before it has been idle that long', T, async () => {
+    const budget = 1000;
+    await withServer(echo, { idleTimeoutMs: budget, requestTimeoutMs: 0 }, async (server) => {
+      const idled = [];
+      await Promise.all(
+        [0, 130, 260, 390].map(async (startAfter) => {
+          await delay(startAfter);
+          const c = await openRaw(server.port);
+          try {
+            await c.send(get('/last'));
+            assert.equal(parseResponse(await c.read({ until: responsesComplete(1) })).status, 200);
+            const t0 = Date.now();
+            await c.waitClose(6000);
+            idled.push(Date.now() - t0);
+          } finally {
+            c.destroy();
+          }
+        })
+      );
+      for (const ms of idled) {
+        // (a few milliseconds of grace: the clock starts when the response has been read)
+        assert.ok(ms >= budget - 20, `closed after ${ms} ms idle with idleTimeoutMs ${budget} (all: ${idled})`);
+        assert.ok(ms < budget + 500 + 400, `closed after ${ms} ms idle (all: ${idled})`);
+      }
+    });
+  });
+
   it('with both receive timeouts off a silent connection is kept', T, async () => {
     await withServer(echo, { idleTimeoutMs: 0, requestTimeoutMs: 0 }, async (server) => {
       const c = await openRaw(server.port);

@@ -9,6 +9,7 @@
 #include <uv.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -32,6 +33,8 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/ioctl.h>
+#include <linux/sockios.h>
 #ifndef SO_INCOMING_CPU
 #define SO_INCOMING_CPU 49  // kernel 3.19+; older libc headers lack the name
 #endif
@@ -237,6 +240,9 @@ struct EpollConn {
   bool readyQueued;     // already on EpollLoop::ready for this turn (see deferReady)
   int readyEvents;      // the events reported for it this turn, OR-ed
   uint32_t servedTurn;  // EpollLoop::iteration when it was last served (one service per loop turn)
+  uint64_t waitSeq;     // its place on the queue it waits on, plus one (0: on neither); see EpollLoop, "time slice"
+  bool waitNew;         // ...and which: EpollLoop::arrivals (true) or EpollLoop::backlog
+  int recvFlags;        // what recv() is told: 0, and MSG_TRUNC once nothing more is read from the connection (Server::epollDiscard)
   size_t pendingBytes;  // queued write bytes the kernel has not accepted
   void* wqHead;         // WriteReq* queue (intrusive, FIFO; WriteReq::next / sent)
   void* wqTail;
@@ -331,6 +337,34 @@ struct ReqState {
   // released after use so one huge response can't stay pinned per connection.
   std::string scratch;
 
+  // The heap storage this state holds on to, used or not: what it costs to
+  // keep for another request. The buffers a request is parsed into, staged
+  // in and answered from keep their capacity for the next request, and the
+  // peer decides how far the ones holding its path, query and header fields
+  // grow (each up to maxHeadSize, in the parser, the snapshot and every slot
+  // of the staging ring). Server::kRqKeepBytes is the bound on what a pooled
+  // state may hold.
+  size_t retained() const {
+    const auto heap = &HttpParser::heapOf;
+    size_t n = parser.retained() + heap(pending) + heap(methodStr) + heap(path) + heap(query) +
+               headers.retained() + heap(body) + heap(corkBuf) + heap(scratch) +
+               staged.capacity() * sizeof(StagedRequest);
+    for (const StagedRequest& sr : staged) {
+      n += heap(sr.methodStr) + heap(sr.path) + heap(sr.query) + sr.headers.retained() + heap(sr.body);
+    }
+    return n;
+  }
+  // An upper estimate of that (see HttpParser::retainedAtMost).
+  size_t retainedAtMost() const {
+    size_t n = parser.retainedAtMost() + pending.capacity() + methodStr.capacity() + path.capacity() +
+               query.capacity() + headers.retained() + body.capacity() + corkBuf.capacity() + scratch.capacity() +
+               staged.capacity() * sizeof(StagedRequest);
+    for (const StagedRequest& sr : staged) {
+      n += sr.methodStr.capacity() + sr.path.capacity() + sr.query.capacity() + sr.headers.retained() +
+           sr.body.capacity();
+    }
+    return n;
+  }
 };
 
 struct Connection {
@@ -365,6 +399,15 @@ struct Connection {
   // On Server::restQueue_: came to rest where its state could not be given
   // back yet (a response completed outside a read).
   bool restQueued = false;
+  // The kernel's count of this connection's output not yet acknowledged by
+  // the peer, as the sweep numbered unsentSweep found it (Server::onSweep,
+  // tKernelUnsent): looked at for a connection the stall rule is about to
+  // close, and for no other.
+  uint32_t unsentSeen = 0;
+  uint32_t unsentSweep = 0;
+  // What the connection holds in buffers for its peer, as its thread's
+  // buffer budget has it counted (Server::account).
+  size_t held = 0;
   // The request currently surfaced to JS (its snapshot is rq's).
   uint32_t reqId = 0;
   bool isHead = false;
@@ -425,7 +468,12 @@ struct Connection {
   // complete request that found no free slot (HttpParser::parse cannot be
   // re-asked once Done, so the status is remembered here).
   uint32_t stagedHead = 0;
-  uint32_t stagedCount = 0;
+  alignas(8) uint32_t stagedCount = 0;
+  // Whether `held` is not zero (Server::charge keeps the two in step).
+  // Directly behind stagedCount, the pair on an 8-byte boundary: rest()
+  // asks "nothing staged, nothing counted" of every request that leaves its
+  // connection at rest, and reads the two as one word (stagedOrCounted).
+  uint32_t counted = 0;
   uint32_t batchPos = 0;  // index of the active slot within the current batch call
   // The active request was activated after JS left its batch loop (see
   // completeCorkedResponse): no handler has seen it yet, dispatchBatch must
@@ -476,6 +524,11 @@ struct Connection {
   size_t uvQueued = 0;
   // Idle-sweep bookkeeping: reset to 0 on every read, incremented each sweep while not actively running a handler; closed when it exceeds the limit.
   uint32_t idleTicks = 0;
+  // Sweeps since a byte last arrived on the connection or left it (it stops
+  // counting at 255): a connection that holds buffer memory and moves
+  // nothing is the first to go when its thread has none left. Next to
+  // idleTicks, and as wide: a read clears both, with one store.
+  uint32_t stallTicks = 0;
   // Request-timeout bookkeeping: incremented each sweep while a request is partially received; NOT reset by activity (slow-drip defense), only when the request completes or the connection goes back to idle keep-alive.
   uint32_t requestTicks = 0;
   // Write-progress bookkeeping (slow-read defense): writeTicks counts sweeps with uv writes pending and NO drain progress; it resets on any progress and the connection is closed once it spans the whole responseTimeoutMs budget. Progress = the outbound queue SHRANK since the previous sweep (lastWriteQueue), or a write completed (onWrite). Queue shrinkage - not completion alone - is the load-bearing signal: a single large respond() is ONE uv_write that only completes when the whole body has drained, so a steadily-reading slow client would never produce a completion and would be shed mid-transfer despite continuous progress. SIZE_MAX = no baseline yet (next sweep records one).
@@ -649,6 +702,28 @@ class Server {
   // many of them are at rest.
   size_t openConnections() const { return conns_.size(); }
   size_t restingConnections() const { return resting_; }
+  // Request states kept for the next request (the pool, and the request
+  // objects HTTP/2 keeps), and the heap storage they hold (probe()).
+  size_t pooledStates() const { return rqPool_.size() + h2Free_.size(); }
+  size_t pooledBytes() const {
+    size_t n = 0;
+    for (const ReqState* rq : rqPool_) n += rq->retained();
+    for (const Connection* sc : h2Free_) n += sc->rq != nullptr ? sc->rq->retained() : 0;
+    return n;
+  }
+  // probe().turns, for the calling thread's loop: loop turns that ended with
+  // sockets still to serve (EpollLoop, "time slice"), and how many sockets
+  // are waiting for a later turn now. Zero where the transport is not epoll.
+  static void sliceStats(uint64_t& cut, size_t& waiting) {
+    cut = 0;
+    waiting = 0;
+#if defined(__linux__)
+    if (const EpollLoop* ep = EpollLoop::slot()) {
+      cut = ep->sliceCuts;
+      waiting = ep->waiting();
+    }
+#endif
+  }
   void setWsAutoUpgrade(bool on) { wsAutoUpgrade_ = on; }
   bool wsAutoUpgrade() const { return wsAutoUpgrade_; }
   // The handshake request's headers and query string, kept on the connection
@@ -782,6 +857,7 @@ class Server {
 #endif
 
     listenUp_ = true;
+    joinBudget();
 
     // Start the connection sweep. Granularity adapts to the shortest enabled
     // timeout (capped at 4s, floored at 250ms) so short timeouts still fire
@@ -847,6 +923,7 @@ class Server {
     onClosed_ = onClosed;
     onClosedUser_ = user;
     listening_ = false;
+    leaveBudget();
 
     if (!listenerClosed_) {
       listenerClosed_ = true;
@@ -2319,6 +2396,7 @@ class Server {
           tPendingBytes(c) > limits_.responseBackpressureLimit) {
         doClose(c);
       }
+      if (!c->closing) noteHeld(c);  // the buffer budget: bytes the socket did not take
       return;
     }
 #endif
@@ -2359,6 +2437,7 @@ class Server {
         tPendingBytes(c) > limits_.responseBackpressureLimit) {
       doClose(c);
     }
+    if (!c->closing) noteHeld(c);  // the buffer budget: bytes handed to libuv and not yet written
   }
 
   static void onWrite(uv_write_t* req, int status) {
@@ -2376,6 +2455,8 @@ class Server {
   void completeWrite(Connection* c, bool terminal, int status) {
     c->writeTicks = 0;           // a write completed: the drain made progress
     c->lastWriteQueue = SIZE_MAX;  // re-baseline at the next sweep
+    c->stallTicks = 0;
+    if (c->held != 0) noteHeld(c);
 
     if (status != 0) {
       abortConnection(c);
@@ -2962,6 +3043,10 @@ class Server {
     const size_t cmp = std::min(len, magic.size() - have);
     if (memcmp(data, magic.data() + have, cmp) != 0) {
       c->proto = 1;
+      // Not HTTP/2. Whether it is HTTP/1 is for its first request line to
+      // say (handleParse): the parser is told that this line is the
+      // connection's first, and holds that until the request is complete.
+      c->rq->parser.expectFirstLine();
       if (have == 0) return true;
       // What looked like the start of a preface was not: it is HTTP/1 input.
       std::string all;
@@ -3104,6 +3189,9 @@ class Server {
   // After a response call made outside a read (a handler answering later).
   void h2Written(Connection* p) {
     if (!p->h2Feeding && !p->closing) h2Flush(p);
+    // A response the peer's windows are holding back, or one of them gone
+    // out: counted here, where no read will end to count it.
+    if (!p->closing && p->h2->moved()) noteHeld(p);
   }
 
   Connection* h2Acquire() {
@@ -3724,6 +3812,16 @@ class Server {
   // sweep brings the pool back to kRqPoolKeep.
   static constexpr size_t kRqPoolMax = 256;
   static constexpr size_t kRqPoolKeep = 32;
+  // What a state may hold and still be kept for another request
+  // (ReqState::retained): the buffers of ordinary requests several times
+  // over - a cork buffer and a response buffer at their 16 KiB marks, the
+  // parser's input buffer at its 64 KiB one - and not the megabytes a peer
+  // can grow the path, query and header storage to (each up to maxHeadSize,
+  // eighteen times over once the staging ring is in use). A state over it is
+  // freed instead of pooled: at once when it comes to rest behind a head
+  // past HttpParser::kLeanHead (restLarge), at the sweep otherwise
+  // (trimRqPool), which measures every pooled state.
+  static constexpr size_t kRqKeepBytes = 128 * 1024;
   MORO_ALWAYS_INLINE void wake(Connection* c) {
     if (c->rq != nullptr) return;
     takeRq(c);
@@ -3754,14 +3852,36 @@ class Server {
   // HTTP/2 never are (their handshake request and their frames live in the
   // state).
   MORO_ALWAYS_INLINE bool atRest(const Connection* c) const {
-    if (c->active || c->pendingWrites != 0 || c->proto == 2 || c->stagedCount != 0) return false;
-    if (c->closing || c->isWebSocket || c->corked || c->aheadComplete || c->undelivered ||
-        c->responseStarted || c->inputClosed || c->lingering || c->outHeld || c->closeAfterFlush ||
+    return quiet(c) && c->rq->parser.idle() && emptied(c->rq);
+  }
+  // atRest() in its three parts: the connection's own state ...
+  // `uncounted`: ... and nothing counted for it in the buffer budget, asked
+  // with the same load as "nothing staged".
+  static MORO_ALWAYS_INLINE uint64_t stagedOrCounted(const Connection* c) {
+    static_assert(offsetof(Connection, counted) == offsetof(Connection, stagedCount) + sizeof(uint32_t) &&
+                      offsetof(Connection, stagedCount) % 8 == 0,
+                  "counted lies directly behind stagedCount, the pair on an 8-byte boundary");
+    uint64_t both;
+    std::memcpy(&both, reinterpret_cast<const unsigned char*>(c) + offsetof(Connection, stagedCount), sizeof both);
+    return both;
+  }
+  MORO_ALWAYS_INLINE bool quiet(const Connection* c, bool uncounted = false) const {
+    if (c->active || c->pendingWrites != 0 || c->proto == 2) return false;
+    if (uncounted ? stagedOrCounted(c) != 0 : c->stagedCount != 0) return false;
+    // (inputClosed first: the connection that has given its last response
+    // and waits for its peer's FIN comes by here on every request of a
+    // client that does not keep its connections.)
+    if (c->inputClosed || c->closing || c->isWebSocket || c->corked || c->aheadComplete || c->undelivered ||
+        c->responseStarted || c->lingering || c->outHeld || c->closeAfterFlush ||
         c->batchClose || c->h2 != nullptr || c->h2Parent != nullptr) {
       return false;
     }
-    const ReqState* rq = c->rq;
-    return rq->parser.idle() && rq->pending.empty() && rq->corkBuf.empty() && !rq->jsBody && !rq->jsLent;
+    return true;
+  }
+  // ... the parser (idle(), which rest() asks as idleLean()), and the rest
+  // of the request state.
+  static MORO_ALWAYS_INLINE bool emptied(const ReqState* rq) {
+    return rq->pending.empty() && rq->corkBuf.empty() && !rq->jsBody && !rq->jsLent;
   }
   // A response completed outside a read of its connection (a handler that
   // answered later, a write the socket finished later) and left it at rest.
@@ -3785,9 +3905,24 @@ class Server {
   }
   // Called where a connection may have come to rest and nothing further up
   // the stack reads its request state: the end of a read, and the sweep.
-  MORO_ALWAYS_INLINE void rest(Connection* c) {
+  // True when this call left it at rest (it then holds nothing, and has
+  // nothing counted).
+  MORO_ALWAYS_INLINE bool rest(Connection* c) {
     ReqState* rq = c->rq;
-    if (rq == nullptr || !atRest(c)) return;
+    if (rq == nullptr) return false;
+    // Quiet, and nothing counted for it in the buffer budget: one test more
+    // would be two instructions on every request, so "counted" rides on the
+    // word that says nothing is staged, and a connection that has a count
+    // takes the way round (restCounted).
+    if (!quiet(c, /*uncounted=*/true)) return c->counted != 0 && restCounted(c);
+    // The parser idle, and no head past HttpParser::kLeanHead parsed into
+    // this state since it was last measured: one comparison (idleLean). When
+    // it fails for the second reason the state is measured before it is
+    // kept (restLarge).
+    if (!rq->parser.idleLean()) {
+      return rq->parser.largeHead() && restLarge(c);
+    }
+    if (!emptied(rq)) return false;
     c->rq = nullptr;
     c->resting = true;
     resting_++;
@@ -3798,6 +3933,402 @@ class Server {
     rq->routeMissGen = 0;
     if (rqPool_.size() < kRqPoolMax) rqPool_.push_back(rq);
     else delete rq;
+    return true;
+  }
+  // rest() for a state a large head went through. The connection comes to
+  // rest as any other; the state goes back to the pool only if what it
+  // holds is within kRqKeepBytes, and is freed otherwise - the buffers that
+  // head grew go with it, where a pooled state would keep them for as long
+  // as the server runs. (The next request takes another state from the
+  // pool, or a new one.)
+  // rest() for a connection the buffer budget has a count for: when it is
+  // at rest but for that, the count is given back first (a connection at
+  // rest holds nothing), and it comes to rest as any other.
+  MORO_NOINLINE bool restCounted(Connection* c) {
+    if (!atRest(c)) return false;
+    release(c);
+    return rest(c);
+  }
+  MORO_NOINLINE bool restLarge(Connection* c) {
+    ReqState* rq = c->rq;
+    if (!rq->parser.idle() || !emptied(rq)) return false;  // not at rest yet; looked at again when it is
+    c->rq = nullptr;
+    c->resting = true;
+    resting_++;
+    if (rq->retainedAtMost() > kRqKeepBytes || rqPool_.size() >= kRqPoolMax) {
+      delete rq;
+      return true;
+    }
+    rq->parser.clearLargeHead();
+    rq->fastStatic = nullptr;
+    rq->fastParam = nullptr;
+    rq->fastSeg = nullptr;
+    rq->fastSegLen = 0;
+    rq->routeMissGen = 0;
+    rqPool_.push_back(rq);
+    return true;
+  }
+  // The sweep's look at the pool. Every pooled state is measured, and one
+  // holding more than kRqKeepBytes is freed: heads within kLeanHead leave no
+  // mark, but eighteen sets of buffers can each grow to a few kilobytes
+  // under them. Then the pool is brought back to kRqPoolKeep, and the states
+  // that go are the ones holding the most, so that what a burst leaves
+  // behind is the leanest of what it used. The order of the ones kept does
+  // not change (the next state out is still the one used last).
+  void trimRqPool() {
+    if (rqPool_.empty()) return;
+    std::vector<size_t> held;  // what each state that stays holds
+    held.reserve(rqPool_.size());
+    size_t kept = 0;
+    for (ReqState* rq : rqPool_) {
+      const size_t n = rq->retained();
+      if (n > kRqKeepBytes) {
+        delete rq;
+        continue;
+      }
+      rqPool_[kept++] = rq;
+      held.push_back(n);
+    }
+    rqPool_.resize(kept);
+    if (kept <= kRqPoolKeep) return;
+    // The kRqPoolKeep smallest stay: `cut` is the largest size among them.
+    std::vector<size_t> sorted(held);
+    std::nth_element(sorted.begin(), sorted.begin() + (kRqPoolKeep - 1), sorted.end());
+    const size_t cut = sorted[kRqPoolKeep - 1];
+    size_t atCut = 0;  // how many states of exactly that size stay
+    for (size_t i = 0; i < kRqPoolKeep; i++) atCut += sorted[i] == cut;
+    size_t out = 0;
+    for (size_t i = 0; i < kept; i++) {
+      ReqState* rq = rqPool_[i];
+      bool stays = held[i] < cut;
+      if (held[i] == cut && atCut > 0) {
+        atCut--;
+        stays = true;
+      }
+      if (stays) rqPool_[out++] = rq;
+      else delete rq;
+    }
+    rqPool_.resize(out);
+  }
+  // The same bound for the request objects HTTP/2 keeps for reuse (h2Free_):
+  // each holds a state whose path, query and field storage the last stream
+  // it carried may have grown.
+  void h2TrimFree() {
+    size_t kept = 0;
+    for (Connection* sc : h2Free_) {
+      if (sc->rq != nullptr && sc->rq->retained() > kRqKeepBytes) delete sc;
+      else h2Free_[kept++] = sc;
+    }
+    h2Free_.resize(kept);
+  }
+
+  // ---- Buffer budget ----
+  //
+  // Every limit a connection is held to - maxHeadSize, maxBodySize,
+  // maxPendingBytes, wsMaxMessageSize, the write high-water mark, an HTTP/2
+  // session's maxBuffered - is a limit on that one connection, and a server
+  // accepts as many connections as it has descriptors for. Ten thousand
+  // peers that each send most of a 10 MiB body, or each ask for a large
+  // response and read none of it, stay within every one of those limits and
+  // have the process hold a hundred gigabytes. So what all the connections
+  // of a thread hold together is counted too (BufferBudget, one per thread),
+  // against the thread's share of a budget for the process: an eighth of the
+  // memory the process may use unless memoryBudget says otherwise, divided
+  // by the threads that have a server listening, and never less than the
+  // largest single message a server of the thread accepts (a request that
+  // was accepted before the budget existed is still accepted on an idle
+  // thread, whatever the limits it was configured with).
+  //
+  // Counted for a connection (heldBy): the request it is still receiving -
+  // the parser's input buffer and the body, input kept behind a response in
+  // flight, a WebSocket message being reassembled, an HTTP/2 session's
+  // bodies in flight, unfinished header block and kept input - and the
+  // response bytes its peer has not taken: the transport's write queue, and
+  // what HTTP/2 flow control holds back. By capacity, which is what is
+  // allocated. The count is brought up to date where a connection's read
+  // ends (account), where a write is queued or completes (noteHeld), where
+  // the connection comes to rest or closes (release), and for every
+  // connection at each sweep, which also makes the thread's total exact
+  // again.
+  //
+  // What becomes of a connection is decided by what it has sent and what it
+  // is owed, each by content (arriving, owed) - not by the capacity a buffer
+  // keeps from an earlier request. When the thread is over its share:
+  //  - A connection whose read has just ended, with more than kHeldFree of
+  //    requests still arriving, is closed (shed) when the thread is over its
+  //    share even without the response bytes that connection is owed: with
+  //    503 when it is an HTTP/1 request with nothing in front of the answer,
+  //    with 1013 when it is a WebSocket message being reassembled, with
+  //    GOAWAY on HTTP/2. A request that fits in kHeldFree is never refused
+  //    for the budget, so the small requests of a busy server - and the
+  //    health check that asks whether it is alive - are served while it is
+  //    full.
+  //  - Response bytes close nothing where they are queued. Nothing says, at
+  //    that moment, whether the peer is reading: a response of any size to a
+  //    peer that takes it is delivered, as it was before there was a budget.
+  //  - At the sweep, with less than an eighth of the share left, the
+  //    connections that hold more than kHeldStale (requests arriving, or
+  //    responses not taken) and have moved nothing in either direction for a
+  //    whole sweep interval are closed (evicted), unless a handler holds
+  //    their request and nothing is queued for them: a peer that fills the
+  //    budget and then stops - sends most of a body and no more, asks for
+  //    responses and reads none, opens no window - would otherwise keep it
+  //    full until one of the timeouts, five minutes by default, and every
+  //    connection that needs room in that time would be the one closed.
+  //    Moving is a read, a write that completed, a write queue that shrank
+  //    or an HTTP/2 window that opened, with or without responseTimeoutMs.
+  //
+  // The budget closes a connection in two places only, both on a clean
+  // stack: where its own read has ended (account), and after the sweep's
+  // pass. Never from a write, a write completion or a handler's call, and
+  // never before or during the dispatch of the bytes a read brought.
+  //
+  // Nothing is paused and nothing waits for room. A connection asked to wait
+  // holds its descriptor and whatever the kernel has buffered for it, and
+  // when every holder is waiting none of them completes; the budget is a
+  // bound on memory, and what does not fit is told so at once.
+  static constexpr size_t kHeldFree = 16 * 1024;
+  static constexpr size_t kHeldStale = 4 * 1024;
+  // The automatic budget: this fraction of the memory the process may use.
+  // It bounds the engine's own buffers, and those are not all a buffered
+  // byte costs: a body handed to a handler is copied for JS, the allocator
+  // keeps what it was given, and every socket the loop has not got to holds
+  // a receive buffer in the kernel that nothing here can bound (some 50 KiB
+  // at Linux defaults - 1.8 GiB measured for 32,768 flooding connections). A
+  // quarter left a 4 GiB container at up to 3.1 GiB under those floods, with
+  // a worst case past its limit; an eighth leaves room for what is not
+  // counted (2.5 GiB at the most, measured the same way).
+  static constexpr size_t kBudgetShare = 8;
+
+  // The memory the process may use: its cgroup's limit when there is one
+  // below the machine's memory, the machine's otherwise. 0 when neither is
+  // known (no budget is derived from that).
+  static size_t processMemory() {
+    static const size_t bytes = [] {
+      const uint64_t total = uv_get_total_memory();
+      const uint64_t bound = uv_get_constrained_memory();
+      uint64_t m = bound != 0 && (total == 0 || bound < total) ? bound : total;
+      if (m > SIZE_MAX) m = SIZE_MAX;
+      return static_cast<size_t>(m);
+    }();
+    return bytes;
+  }
+  // Threads of the process with a server listening.
+  static std::atomic<uint32_t>& budgetThreads() {
+    static std::atomic<uint32_t> n{0};
+    return n;
+  }
+  void joinBudget() {
+    if (budgetJoined_) return;
+    budgetJoined_ = true;
+    BufferBudget& m = *mem_;
+    if (m.servers++ == 0) budgetThreads().fetch_add(1, std::memory_order_relaxed);
+    if (limits_.memoryBudget > m.asked) m.asked = limits_.memoryBudget;
+    size_t one = limits_.maxHeadSize + limits_.maxBodySize;
+    if (one < limits_.maxBodySize) one = SIZE_MAX;
+    if (limits_.wsMaxMessageSize > one) one = limits_.wsMaxMessageSize;
+    if (one > m.floor) m.floor = one;
+    rebudget();
+  }
+  void leaveBudget() {
+    if (!budgetJoined_) return;
+    budgetJoined_ = false;
+    BufferBudget& m = *mem_;
+    if (--m.servers != 0) return;
+    budgetThreads().fetch_sub(1, std::memory_order_relaxed);
+    // The thread's last server: the next one sets the figures afresh.
+    m.asked = 0;
+    m.floor = 0;
+    m.limit = SIZE_MAX;
+  }
+  // The thread's share, from the figures as they are now: the other threads
+  // of a cluster start one after another, and each sweep looks again.
+  void rebudget() {
+    BufferBudget& m = *mem_;
+    const size_t all = m.asked != 0 ? m.asked : processMemory() / kBudgetShare;
+    if (all == SIZE_MAX || all == 0) {
+      m.limit = SIZE_MAX;
+      return;
+    }
+    uint32_t threads = budgetThreads().load(std::memory_order_relaxed);
+    if (threads == 0) threads = 1;
+    const size_t share = all / threads;
+    m.limit = share > m.floor ? share : m.floor;
+  }
+
+  // What `c` holds in buffers for its peer (see above). A handful of loads:
+  // capacities, which is what is allocated, not sizes.
+  size_t heldBy(Connection* c) {
+    size_t n = c->pendingWrites > 0 ? tOutputHeld(c) : 0;
+    if (c->h2 != nullptr) return n + c->h2->memory();
+    if (c->isWebSocket) return n + (c->wsParser != nullptr ? c->wsParser->memory() : 0);
+    const ReqState* rq = c->rq;
+    if (rq == nullptr) return n;
+    const auto heap = &HttpParser::heapOf;
+    n += rq->parser.memory() + heap(rq->pending) + heap(rq->body) + heap(rq->corkBuf);
+    if (c->stagedCount != 0) {
+      for (const StagedRequest& sr : rq->staged) n += heap(sr.body);
+    }
+    return n;
+  }
+  // The two parts of that which decide what becomes of the connection, each
+  // by what is in it, not by the storage around it. A buffer keeps the
+  // capacity an earlier request grew it to - a pooled request state the
+  // parser's input buffer and a body buffer, a WebSocket its reassembly
+  // buffer - and counted by capacity a request of two kilobytes was refused
+  // for the sixty its state had held before, and an idle WebSocket closed for
+  // a message it had long delivered.
+  //
+  // arriving(): what the peer has sent of requests that no handler has been
+  // given yet - the request being received, input kept behind a response in
+  // flight, requests staged behind the active one, a WebSocket message being
+  // reassembled, an HTTP/2 session's bodies in flight, header block and kept
+  // input.
+  size_t arriving(const Connection* c) const {
+    if (c->h2 != nullptr) return c->h2->arriving();
+    if (c->isWebSocket) return c->wsParser != nullptr ? c->wsParser->arriving() : 0;
+    const ReqState* rq = c->rq;
+    if (rq == nullptr) return 0;
+    size_t n = rq->parser.arriving() + rq->pending.size();
+    if (c->stagedCount != 0) {
+      for (const StagedRequest& sr : rq->staged) n += sr.body.size();
+    }
+    return n;
+  }
+  // owed(): the response bytes the peer has not taken - the transport's
+  // write queue, and what HTTP/2 flow control holds back.
+  size_t owed(Connection* c) {
+    size_t n = c->pendingWrites > 0 ? tOutputHeld(c) : 0;
+    if (c->h2 != nullptr) n += c->h2->heldBytes();
+    return n;
+  }
+  // Brings the count for `c` up to date.
+  void charge(Connection* c) {
+    if (c->h2 != nullptr) c->h2->counted();
+    const size_t now = c->closing ? 0 : heldBy(c);
+    const size_t was = c->held;
+    mem_->held += now - was;
+    heldSum_ += now - was;
+    c->held = now;
+    c->counted = now != 0;
+  }
+  // Where a connection's read ends, on a clean stack: a connection whose
+  // requests still arriving do not fit is the one that goes. That is decided
+  // by its request side alone:
+  //  - What it has sent and no handler has yet (arriving) is within
+  //    kHeldFree: never refused, however full the thread is.
+  //  - The thread is over its share without counting the response bytes this
+  //    connection is owed: refused. Counting them, a response larger than
+  //    the share would have its own connection closed for the next request
+  //    pipelined behind it.
+  // Response bytes are never a reason to close here, whatever their size:
+  // when they are queued nothing says whether the peer is reading them, and
+  // a response to a peer that is reading must arrive as it did before there
+  // was a budget. They are counted, they are what makes a thread short, and
+  // the connection that is owed them and takes none goes at the sweep (the
+  // stall rule, onSweep).
+  // Not a request a handler has just been given, with nothing queued for its
+  // peer: what it holds is the application's now, about to be answered and
+  // released, and closing it would throw that work away to free memory the
+  // answer frees anyway.
+  MORO_NOINLINE void account(Connection* c) {
+    charge(c);
+    if (mem_->held <= mem_->limit || c->closing) return;
+    if (c->active && c->pendingWrites == 0 && c->h2 == nullptr && !c->isWebSocket) return;
+    if (arriving(c) <= kHeldFree) return;
+    const size_t mine = owed(c);
+    if (mem_->held - (mine < c->held ? mine : c->held) <= mem_->limit) return;
+    shed(c);
+  }
+  // The same count from anywhere - inside a write the application is making,
+  // a write that completed. Nothing is decided here: what grows in a write
+  // is response bytes.
+  MORO_NOINLINE void noteHeld(Connection* c) { charge(c); }
+  // The connection holds nothing any more (it came to rest, or is closing).
+  MORO_NOINLINE void release(Connection* c) {
+    mem_->held -= c->held;
+    heldSum_ -= c->held;
+    c->held = 0;
+    c->counted = 0;
+  }
+  // The end of a read, for the budget, of a connection the read did not
+  // leave at rest. (One it did has nothing counted - rest() released it -
+  // and costs nothing here: that is every request answered within its
+  // read.) Counting a connection is a walk over its buffers, and most reads
+  // that end with a connection awake have changed nothing in them: a request
+  // without a body that a handler will answer later, a last response gone
+  // out and the peer's FIN awaited, an HTTP/2 frame acted on where it was
+  // read. So the walk is taken only when there is something for it to find:
+  //  - HTTP/1 (holdsHttp1): bytes the peer has sent that are still with the
+  //    engine - a request partly received or pipelined behind another, a
+  //    body, staged requests - or bytes queued for it, or a count from
+  //    before that may no longer be true. A connection whose input is over
+  //    has only the last two.
+  //  - HTTP/2: the session says when one of the figures its count is made of
+  //    has moved since it was last counted (h2::Session::moved).
+  //  - A WebSocket, and a connection with no request state: as before, when
+  //    it has a state or a count.
+  // What this leaves uncounted until the sweep counts everything is the
+  // capacity a request state brought with it from the pool: storage the
+  // engine keeps, bounded there (kRqKeepBytes), and nothing a peer has put
+  // in it.
+  MORO_ALWAYS_INLINE bool holdsHttp1(const Connection* c, const ReqState* rq) const {
+    if (c->inputClosed) return c->held != 0;
+    return c->held != 0 || c->pendingWrites != 0 || c->stagedCount != 0 || !rq->body.empty() ||
+           !rq->pending.empty() || !rq->parser.idle();
+  }
+  MORO_ALWAYS_INLINE void settleHttp1(Connection* c) {
+    const ReqState* rq = c->rq;
+    if (rq == nullptr) {
+      if (c->held != 0) [[unlikely]] account(c);
+      return;
+    }
+    if (holdsHttp1(c, rq)) [[unlikely]] account(c);
+  }
+  MORO_ALWAYS_INLINE void settleHeld(Connection* c) {
+    if (c->h2 != nullptr) {
+      if (c->h2->moved()) [[unlikely]] account(c);
+      return;
+    }
+    if (c->isWebSocket) {
+      if (c->rq != nullptr || c->held != 0) account(c);
+      return;
+    }
+    settleHttp1(c);
+  }
+
+  // Close `c` for what it holds (clean stack only). An HTTP/1 request still
+  // arriving, with no response of this connection in front of the answer, is
+  // told 503 and its buffers go at once: the connection then lingers as
+  // after any error response, holding nothing. Everything else has either a
+  // protocol's own way of saying it (1013, GOAWAY) or nobody reading.
+  void shed(Connection* c) {
+    if (c->closing) return;
+    mem_->shed++;
+    if (c->isWebSocket) {
+      if (c->wsClosing || (c->pendingWrites > 0 && tOutputHeld(c) > kHeldFree)) {
+        wsGone(c);
+        abortConnection(c);
+        return;
+      }
+      if (c->wsParser != nullptr) c->wsParser->abandon();
+      wsClose(c, 1013, "", 0);
+      charge(c);
+      return;
+    }
+    const bool answerable =
+        c->h2 == nullptr && c->h2Parent == nullptr && c->proto == 1 && c->rq != nullptr && !c->active &&
+        !c->responseStarted && c->pendingWrites == 0 && c->stagedCount == 0 && !c->aheadComplete &&
+        !c->undelivered && !c->corked && !c->inputClosed && (c->tls == nullptr || c->tls->handshakeDone());
+    if (!answerable) {
+      doClose(c);
+      return;
+    }
+    sendErrorAndClose(c, 503);
+    if (c->closing || c->rq == nullptr) return;
+    c->rq->parser.abandon();
+    std::string().swap(c->rq->pending);
+    charge(c);
   }
 
   // Transport-neutral tail of accepting a connection: protocol state, TLS
@@ -3900,6 +4431,7 @@ class Server {
   MORO_NOINLINE void onPlainRead(Connection* c, char* base, size_t nread) {
     if (c->inputClosed) return;
     c->idleTicks = 0;
+    c->stallTicks = 0;
     if (!restQueue_.empty()) drainRest();
     wake(c);
     reading_ = c;
@@ -3909,14 +4441,14 @@ class Server {
       if (c->proto != 0 || limits_.http2.enabled) {
         onOtherProtocol(c, base, nread);
         reading_ = nullptr;
-        rest(c);
+        if (!rest(c)) settleHeld(c);
         return;
       }
       c->proto = 1;
     }
     dispatchHttp1(c, base, nread);
     reading_ = nullptr;
-    rest(c);
+    if (!rest(c)) settleHttp1(c);
   }
   MORO_NOINLINE void onOtherProtocol(Connection* c, char* base, size_t nread) {
     dispatchPlaintext(c, base, nread);
@@ -3925,7 +4457,9 @@ class Server {
   MORO_NOINLINE void onWebSocketRead(Connection* c, char* base, size_t nread) {
     if (c->inputClosed) return;
     c->idleTicks = 0;
+    c->stallTicks = 0;
     feedWebSocket(c, base, nread);
+    if (c->rq != nullptr || c->held != 0) account(c);
   }
 
   // The libuv transport's share of a loop turn for one stream: one read of
@@ -4056,13 +4590,18 @@ class Server {
   // provided buffer). The buffer is consumed before this returns - the
   // parser/pending/TLS/WS layers copy what they keep (see onAlloc).
   void onTransportData(Connection* c, char* base, size_t nread) {
-    if (c->inputClosed) return;
+    if (c->inputClosed) {
+#if defined(__linux__)
+      if (kind_ == TransportKind::Epoll) epollDiscard(c, nread);
+#endif
+      return;
+    }
     if (!restQueue_.empty()) drainRest();
     wake(c);
     reading_ = c;
     transportData(c, base, nread);
     reading_ = nullptr;
-    rest(c);
+    if (!rest(c)) settleHeld(c);
   }
   MORO_ALWAYS_INLINE void transportData(Connection* c, char* base, size_t nread) {
     Server* s = this;
@@ -4076,6 +4615,7 @@ class Server {
     // rejected request is read.
     if (c->inputClosed) return;
     c->idleTicks = 0;  // activity: reset the idle sweep counter
+    c->stallTicks = 0;
 
     if (c->tls) {
       // Ciphertext: pump through the TLS transform; decrypted bytes re-enter the exact plaintext path below via dispatchPlaintext. Outbound ciphertext (handshake flights, key updates, alerts) must go to the wire even when the pump reports failure.
@@ -4380,7 +4920,15 @@ class Server {
         // HTTP/1 error would reach an HTTP/2 client as a malformed frame.
         // The connection is ended with no reply (RFC 9113 §3.4 for the one
         // peer, RFC 9112 §2.2 for the other).
-        if (limits_.http2.enabled && !c->tls && c->reqId == 0 && !c->responseStarted && c->rq->parser.notHttp()) {
+        //
+        // Only the first line: a connection that has had a request parsed
+        // has spoken HTTP/1 and is answered in it, whoever answered that
+        // request. (Asked of the parser, which h2Decide told that the line
+        // is the first and which forgets it with the first complete request.
+        // What the connection has been answered with does not say: a request
+        // answered by an engine route takes no request id, and its response
+        // may still be in the cork buffer, which doClose would drop.)
+        if (limits_.http2.enabled && !c->tls && c->rq->parser.firstLineNotHttp()) {
           doClose(c);
           return;
         }
@@ -4689,8 +5237,9 @@ class Server {
   // in the peer's buffer. Measured with autocannon (which writes the next
   // request the moment a response completes, before it has seen the FIN):
   // the immediate close reconnected twice per cycle and ran at a quarter of
-  // the rate of servers that linger. TLS keeps its close_notify sequence
-  // (doClose).
+  // the rate of servers that linger. A TLS connection ends the same way,
+  // with its close_notify written ahead of the FIN (tlsGoodbye): what the
+  // peer sends while it lingers is dropped as ciphertext, never decrypted.
   //
   // A WebSocket ends the same way once its Close frame is out (RFC 6455
   // §7.1.1: half-close, read until the peer has closed too, then close). The
@@ -4703,10 +5252,12 @@ class Server {
   // closes its side.
   void closeAfterResponse(Connection* c) {
     if (c->closing || c->lingering) return;
-    if (c->tls) {
-      doClose(c);
-      return;
-    }
+    // TLS: close_notify first, then the same FIN and the same wait. (It used
+    // to be close_notify and an immediate close(): a peer still sending -
+    // the rest of an upload that was answered 413, requests pipelined behind
+    // a response that ends the connection - then had those bytes answered
+    // with a RST, and lost the response it had not read yet.)
+    if (c->tls && !tlsGoodbye(c)) return;
     if (!c->finSent) {
 #if defined(__linux__)
       if (kind_ != TransportKind::Uv) {
@@ -4733,6 +5284,34 @@ class Server {
     c->lingering = true;
     c->inputClosed = true;
     c->lingerTicks = 0;
+  }
+
+  // Our close_notify, ahead of the FIN of a lingering close. True when it is
+  // out (or there is no session to end: the handshake never finished) and
+  // the FIN may follow now. False when the connection was closed instead
+  // (the socket refused it), or when the socket took only part of it: the
+  // rest is queued, nothing more is read (as for any last write that is
+  // still draining, closeOnceFlushed), and completeWrite comes back here
+  // once it has gone - under responseTimeoutMs, like every queued byte.
+  // What the peer sends from now on is dropped undecrypted (inputClosed is
+  // tested before the TLS layer sees a byte), so a closing TLS connection
+  // costs what a plaintext one does and is cut at the same kLingerMs.
+  bool tlsGoodbye(Connection* c) {
+    if (c->tls->closeNotifySent()) return true;
+    std::string bye;
+    c->tls->shutdown(bye);
+    if (bye.empty()) return true;
+    const int n = tTryWrite(c, bye.data(), bye.size());
+    if (n == static_cast<int>(bye.size())) return true;
+    if (n < 0 && n != UV_EAGAIN) {
+      doClose(c);  // the peer is gone: nothing to linger for
+      return false;
+    }
+    if (n > 0) bye.erase(0, static_cast<size_t>(n));
+    c->closeAfterFlush = true;
+    c->inputClosed = true;
+    queueWrite(c, std::move(bye), /*terminal=*/false);
+    return false;
   }
 
   static void onShutdownDone(uv_shutdown_t* req, int status) {
@@ -4765,13 +5344,36 @@ class Server {
       if (tIsClosing(c)) return;  // the write failed and closed it from underneath
     }
     // Best-effort close_notify on an established TLS session (truncation detection for the peer). uv_try_write: synchronous, non-blocking, no bookkeeping - if the kernel buffer is full the alert is simply lost, which is exactly the semantics "best effort" means here.
-    if (c->tls && !c->closing) {
+    // Not a second time: a connection that lingered said it before its FIN
+    // (closeAfterResponse), and nothing can be written behind that.
+    if (c->tls && !c->closing && !c->tls->closeNotifySent()) {
       std::string bye;
       c->tls->shutdown(bye);
       if (!bye.empty()) tTryWrite(c, bye.data(), bye.size());
     }
     c->closing = true;
-    if (c->rq) c->rq->jsLent.reset();  // a lent body ends with the connection, whatever state the request was in
+    if (c->held != 0) release(c);
+    if (c->rq) {
+      c->rq->jsLent.reset();  // a lent body ends with the connection, whatever state the request was in
+      c->rq->parser.stop();
+    }
+    // Nothing more of this connection reaches a handler, whoever is still
+    // holding it further up the stack (the read that brought the bytes, a
+    // TLS record loop, a dispatch loop, a write completion). Three things
+    // see to that, each enough for the paths it covers: no read of it is
+    // taken from here on (every read path, the resume behind a drained
+    // queue and the error response stop at inputClosed); its parser accepts
+    // nothing more (stop(), above: whatever is parsed for it now is an
+    // error, and the answer to an error stops at inputClosed); and the
+    // requests staged behind the active one - parsed, given an id,
+    // registered nowhere yet - are dropped, with the one the parser had
+    // complete. A request activated after this point would be registered
+    // under an id that outlives the Connection. (Nothing is freed here: the
+    // caller up the stack may be reading the request the parser holds.)
+    c->inputClosed = true;
+    c->stagedCount = 0;
+    c->aheadComplete = false;
+    c->undelivered = false;
     // Closed from inside JS's loop over its own batch (a handler closed the
     // server, or the connection went over a limit): the slots still staged
     // die with it, so the loop is told its batch is over and takes no
@@ -4885,6 +5487,30 @@ class Server {
   //    idleTicks alone is defeated by one byte per idle window).
   //  - responseTimeoutMs: queued outbound bytes have made no progress for the
   //    whole budget -> hard close (slow-read defense, see below).
+  // The sweep counts passes, and a pass says only that some part of an
+  // interval has gone by: the first one after a connection's last byte, or
+  // after a request's first, may come a millisecond later. So neither
+  // receive timeout acts on the pass that completes its count but on the
+  // one after it - the budget has then passed in full, and the timeout comes
+  // less than two sweep intervals after it (one, when the budget is a whole
+  // number of intervals), never before it. (Acting on the count itself
+  // answered 408 as early as half of a short requestTimeoutMs, to a request
+  // that was arriving within its budget. The delivery deadline already
+  // starts from a pass of its own, the one that records the queue.)
+  //
+  // And a pass counts against a connection what its peer has done, or not
+  // done, since the pass before - which is nothing the sweep can know about a
+  // socket that has been waiting for its turn all that time (epoll, a loop
+  // that is behind: EpollLoop, "time slice"). What that peer sent is in the
+  // socket, unread: it is the server that is late. So such a pass counts no
+  // idle time, no request time and no stall against the connection, and no
+  // time towards the deadline of an HTTP/2 window (the frame that opens it
+  // may be among what is unread). The counts go on from where they were with
+  // the first pass after the socket has had its turn, so a peer that always
+  // has a byte in the socket is still measured: once per turn it is given.
+  // The delivery deadline of the socket itself needs no reading and is not
+  // suspended; the queue of a waiting socket is pushed here instead, since
+  // nothing else pushes it while it waits.
   static void onSweep(uv_timer_t* timer) {
     Server* s = static_cast<Server*>(timer->data);
     const uint32_t idleLimit = static_cast<uint32_t>(
@@ -4898,20 +5524,51 @@ class Server {
     std::vector<Connection*> stale;
     std::vector<Connection*> overdue;
     std::vector<Connection*> stalled;
-    s->drainRest();
-    while (s->rqPool_.size() > kRqPoolKeep) {
-      delete s->rqPool_.back();
-      s->rqPool_.pop_back();
+    std::vector<Connection*> hoarding;
+#if defined(__linux__)
+    // The loop is behind, and which turn this server's last pass was in.
+    bool behind = false;
+    uint32_t lastPass = 0;
+    if (s->kind_ == TransportKind::Epoll) {
+      behind = s->epoll_->behind;
+      lastPass = s->sweepTurn_;
+      s->sweepTurn_ = s->epoll_->iteration;
     }
+#endif
+    s->drainRest();
+    s->trimRqPool();
     s->h2Reap();
+    s->h2TrimFree();
 #if defined(__linux__)
     if (s->acceptPaused_) s->resumeAccept();
 #endif
+    // The buffer budget: the thread's share as the process stands now, and
+    // then - in the pass over the connections below - what each of them
+    // holds, counted afresh, so that the total is exact once a sweep.
+    // `pressed`: less than an eighth of the share is left, and connections
+    // that hold memory without moving any of it are closed (see "Buffer
+    // budget").
+    BufferBudget& mem = *s->mem_;
+    s->rebudget();
+    s->sweepSeq_++;
+    const bool pressed = mem.held > mem.limit - mem.limit / 8;
+    size_t heldSum = 0;
     for (Connection* c : s->conns_) {
       if (c->closing) continue;
+#if defined(__linux__)
+      const bool waits = behind && s->epoll_->keptWaiting(c, lastPass);
+#else
+      constexpr bool waits = false;
+#endif
       // A connection that came to rest outside a read and has not been seen
       // to since (a response the socket took a while to accept).
       s->rest(c);
+      if (c->stallTicks != 255 && !waits) c->stallTicks++;
+      if (c->rq != nullptr || c->held != 0 || c->pendingWrites != 0) {
+        c->held = s->heldBy(c);
+        c->counted = c->held != 0;
+        heldSum += c->held;
+      }
 #if defined(__linux__)
       if (s->kind_ == TransportKind::Uring) s->uringCheckPeer(c);
 #endif
@@ -4921,6 +5578,24 @@ class Server {
       if (c->lingering) {
         if (++c->lingerTicks >= lingerLimit) stale.push_back(c);
         continue;
+      }
+      // Without a response deadline the two blocks below do not run, and
+      // they are where the buffer budget's stall count learns that a
+      // response is moving: the write queue shrank, an HTTP/2 window opened.
+      // The same two questions are asked here in that case, for that count
+      // alone - a download that keeps moving is nobody's stall, whatever the
+      // deadline option says.
+      if (!s->limits_.responseTimeoutMs) {
+        if (c->pendingWrites > 0) {
+          const size_t q = s->tPendingBytes(c);
+          if (q < c->lastWriteQueue) c->stallTicks = 0;
+          c->lastWriteQueue = q;
+        }
+        if (c->h2 != nullptr) {
+          const uint64_t sent = c->h2->heldSent();
+          if (sent != c->h2LastSent) c->stallTicks = 0;
+          c->h2LastSent = sent;
+        }
       }
       // Response-delivery deadline (slow-read DoS defense). The `active`
       // exemption below is right for a handler that hasn't answered yet, but
@@ -4943,9 +5618,15 @@ class Server {
       // hold its memory - maxConnections / responseBackpressureLimit bound
       // that; see THREAT_MODEL.)
       if (s->limits_.responseTimeoutMs && c->pendingWrites > 0) {
+#if defined(__linux__)
+        // (A socket waiting for its turn is not watched, so nothing has
+        // pushed its queue since: what the peer took shows once it is.)
+        if (behind && c->ep.waitSeq != 0) s->epollFlush(c);
+#endif
         const size_t q = s->tPendingBytes(c);
         if (q < c->lastWriteQueue) {
           c->writeTicks = 0;  // bytes drained since the last sweep
+          c->stallTicks = 0;
         } else if (++c->writeTicks >= respLimit) {
           c->lastWriteQueue = q;
           stalled.push_back(c);
@@ -4960,13 +5641,55 @@ class Server {
       // answer to its PING - are not.
       if (s->limits_.responseTimeoutMs && c->h2 != nullptr) {
         const uint64_t sent = c->h2->heldSent();
+        if (sent != c->h2LastSent) c->stallTicks = 0;  // the peer opened a window for some of them
         if (c->h2->heldBytes() == 0 || sent != c->h2LastSent) {
           c->h2HeldTicks = 0;
-        } else if (++c->h2HeldTicks >= respLimit) {
+        } else if (!waits && ++c->h2HeldTicks >= respLimit) {
           stalled.push_back(c);
           continue;
         }
         c->h2LastSent = sent;
+      }
+      // The last word on whether a response is moving is the kernel's. The
+      // engine's write queue shrinks when the socket takes more, and a
+      // socket takes in steps - on Linux it is writable again once a third
+      // of its send buffer is free, over a megabyte for a buffer that has
+      // grown - so a peer that reads a few hundred kilobytes a second can
+      // leave the queue as it was for sweep after sweep. What the kernel
+      // holds of the connection's output goes down with every acknowledgment
+      // of a peer that is reading, and stays where it is for one that is
+      // not (its window is shut: a full send buffer is not progress). Asked
+      // only here: the thread is short, bytes are queued for this
+      // connection and nothing has been seen to move for a sweep - the
+      // sweep before the one that would close it, and that one. A system
+      // call each, for the few connections in that state.
+      if (pressed && c->stallTicks != 0 && c->pendingWrites > 0) {
+        const int64_t unsent = s->tKernelUnsent(c);
+        if (unsent >= 0) {
+          const uint32_t now = unsent > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(unsent);
+          if (c->unsentSweep + 1 == s->sweepSeq_ && now < c->unsentSeen) c->stallTicks = 0;
+          c->unsentSeen = now;
+          c->unsentSweep = s->sweepSeq_;
+        }
+      }
+      // The buffer budget is nearly spent, and this connection holds some of
+      // it without having moved a byte in either direction since before the
+      // last sweep: its peer is not sending the rest of what it began, or not
+      // taking what it asked for. Not while a handler holds its request and
+      // nothing is queued for it (how long a handler takes is the
+      // application's business) - on HTTP/2, while a handler holds one of
+      // its requests and no response is waiting on a window.
+      // What it holds is what it has sent and no handler has yet, and what
+      // it is owed and has not taken - not the storage a buffer keeps from
+      // an earlier request (an idle WebSocket's reassembly buffer, a pooled
+      // request state's), which is counted and is nobody's stall.
+      if (pressed && c->stallTicks >= 2 && s->arriving(c) + s->owed(c) > kHeldStale) {
+        const bool owed = c->pendingWrites > 0 || (c->h2 != nullptr && c->h2->anyBlocked());
+        const bool handled = c->h2 != nullptr ? c->h2->held() > 0 : c->active;
+        if (owed || !handled) {
+          hoarding.push_back(c);
+          continue;
+        }
       }
       // An HTTP/2 connection is busy while a handler holds one of its
       // requests; streams still waiting for the rest of a request are not
@@ -4979,7 +5702,7 @@ class Server {
       // business, above - which also closes a peer that stops reading. With
       // that budget disabled the idle timeout stays the only bound.
       const bool draining = s->limits_.responseTimeoutMs && c->pendingWrites > 0;
-      if (!draining && s->limits_.idleTimeoutMs && ++c->idleTicks >= idleLimit) {
+      if (!draining && s->limits_.idleTimeoutMs && !waits && ++c->idleTicks > idleLimit) {
         stale.push_back(c);
         continue;
       }
@@ -4996,10 +5719,14 @@ class Server {
                    (c->proto == 0 && rq && !rq->pending.empty());
         if (!mid)
           c->requestTicks = 0;
-        else if (++c->requestTicks >= reqLimit)
+        else if (!waits && ++c->requestTicks > reqLimit)
           overdue.push_back(c);
       }
     }
+    // What this server's connections hold is now exactly what was just
+    // counted; the connections closed below take their own counts out.
+    mem.held += heldSum - s->heldSum_;
+    s->heldSum_ = heldSum;
     // Mutations deferred: sendErrorAndClose/doClose can erase from conns_ (synchronously on a uv_write failure), which would invalidate the loop.
     for (Connection* c : stale) s->doClose(c);
     for (Connection* c : overdue) {
@@ -5009,6 +5736,14 @@ class Server {
     }
     // The peer isn't reading, so no error response can reach it: hard close.
     for (Connection* c : stalled) s->doClose(c);
+    // The same for a connection closed for what it holds; a WebSocket's
+    // application is told first, as when its peer goes (1006).
+    for (Connection* c : hoarding) {
+      if (c->closing) continue;
+      mem.evicted++;
+      if (c->isWebSocket) s->wsGone(c);
+      s->doClose(c);
+    }
   }
 
   // ---- transport seam ----
@@ -5114,7 +5849,8 @@ class Server {
   // short send applies no EOF, so the queued path stays correct). Linux:
   // send(MSG_MORE) holds the segment and shutdown(SHUT_WR) piggybacks the FIN
   // on it. Same return contract as tTryWrite; TLS connections are excluded
-  // (close_notify must precede the FIN and goes through doClose).
+  // (close_notify must precede the FIN: closeAfterResponse writes it, then
+  // half-closes).
   int tTryWriteLast(Connection* c, const char* p, size_t n) {
 #if defined(__APPLE__) || defined(__linux__)
     int fd = -1;
@@ -5202,6 +5938,39 @@ class Server {
     return c->uvQueued;
 #else
     return uv_stream_get_write_queue_size(reinterpret_cast<uv_stream_t*>(&c->handle));
+#endif
+  }
+
+  // What the kernel holds of this connection's output: bytes written to the
+  // socket that the peer has not acknowledged (Linux SIOCOUTQ, macOS
+  // SO_NWRITE; the descriptor is the same under TLS and on every transport).
+  // -1 where there is no such count (Windows) or the call fails. A system
+  // call: for the sweep's look at a connection it is about to close for
+  // moving nothing (onSweep), never on the path of a request.
+  int64_t tKernelUnsent(Connection* c) {
+#if defined(__linux__) || defined(__APPLE__)
+    int fd = -1;
+#if defined(__linux__)
+    if (kind_ == TransportKind::Uring) fd = c->ring.fd;
+    else if (kind_ == TransportKind::Epoll) fd = c->ep.fd;
+    else
+#endif
+    {
+      uv_os_fd_t ofd;
+      if (uv_fileno(reinterpret_cast<uv_handle_t*>(&c->handle), &ofd) == 0) fd = static_cast<int>(ofd);
+    }
+    if (fd < 0) return -1;
+    int n = 0;
+#if defined(__linux__)
+    if (::ioctl(fd, SIOCOUTQ, &n) != 0) return -1;
+#else
+    socklen_t len = sizeof(n);
+    if (::getsockopt(fd, SOL_SOCKET, SO_NWRITE, &n, &len) != 0) return -1;
+#endif
+    return n < 0 ? -1 : n;
+#else
+    (void)c;
+    return -1;
 #endif
   }
 
@@ -6354,15 +7123,22 @@ class Server {
     uv_check_t check;
     bool checkActive = false;
     bool checkClosed = false;
+    // Active while sockets wait for a later turn ("time slice"): they are
+    // off the poll set meanwhile, so nothing would wake the loop for them. A
+    // loop with an idle handle does not wait in its poll, and the handle's
+    // callback sees to it that the turn ends in settle() (onSpin).
+    uv_idle_t spin;
+    bool spinActive = false;
+    bool spinClosed = false;
     int emfileFd = -1;
     std::vector<Connection*> completions;  // fully-sent queued writes to complete
-    std::vector<Connection*> ready;  // sockets the poll phase reported this turn, each once; served by serve()
-    std::vector<Connection*> readySpare;  // empty; the storage serve() hands to `ready` for the next turn
+    std::vector<Connection*> ready;  // sockets the poll phase reported this turn, each once; served by settle()
+    std::vector<Connection*> readySpare;  // empty; the storage a turn's service hands to `ready` for the next turn
     unsigned groups = 1;       // peer-CPU groups seen so far (max peerCpu + 2, -1 being a group)
-    unsigned turn = 0;         // serve() calls; the group that goes first rotates with it
+    unsigned turn = 0;         // turns put in order; the group that goes first rotates with it
 
     // Which order serves a turn. 'grouped', the default, sorts the turn's
-    // sockets by peer CPU (serve() below); 'arrival' serves them as the kernel
+    // sockets by peer CPU (orderTurnList below); 'arrival' serves them as the kernel
     // reported them; 'auto' measures both and keeps whichever the current
     // peers answer faster. A probe is four windows of 200 ms, grouped and
     // arrival alternating, the first 50 ms of each not counted while the
@@ -6401,7 +7177,10 @@ class Server {
     size_t subServed = 0;
     size_t subAccepts = 0;     // connections accepted in the sub-window
     size_t subPeak = 0;        // largest turn in the sub-window (a proxy for the live connection count)
-    void noteAccept() { subAccepts++; }
+    void noteAccept() {
+      subAccepts++;
+      dbgAccepts++;
+    }
     static constexpr uint64_t kSettleNs = 50ull * 1000 * 1000;
     static constexpr uint64_t kProbeNs = 200ull * 1000 * 1000;
     static constexpr uint64_t kExploitNs = 4000ull * 1000 * 1000;
@@ -6413,14 +7192,17 @@ class Server {
       else if (e && strcmp(e, "auto") == 0) autoOrder = true;
       const char* d = getenv("MORO_ENGINE_SERVE_DEBUG");
       debug = d && *d && *d != '0';
+      if (debug) fastTurn = 0;
     }
     static Order probeOrder(uint8_t ph) { return (ph & 1u) ? Order::Arrival : Order::Grouped; }
     void startProbe(uint64_t now) {
       before = order;
       phase = 0; order = Order::Grouped; winStart = now; winServed = 0; sumGrouped = sumArrival = 0;
     }
-    void tune(size_t served) {
-      if (!autoOrder) return;
+    MORO_ALWAYS_INLINE void tune(size_t served) {
+      if (autoOrder) tuneAuto(served);
+    }
+    MORO_NOINLINE void tuneAuto(size_t served) {
       const uint64_t now = uv_hrtime();
       if (winStart == 0) { startProbe(now); return; }
       const uint64_t elapsed = now - winStart;
@@ -6503,6 +7285,9 @@ class Server {
       u->check.data = u;
       uv_check_init(loop, &u->check);
       uv_unref(reinterpret_cast<uv_handle_t*>(&u->check));
+      u->spin.data = u;
+      uv_idle_init(loop, &u->spin);
+      uv_unref(reinterpret_cast<uv_handle_t*>(&u->spin));
       u->emfileFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
       s = u;
       return u;
@@ -6551,7 +7336,7 @@ class Server {
       if (c->ep.readyQueued) return;
       c->ep.readyQueued = true;
       ready.push_back(c);
-      if (ready.size() >= kPollBatch) serve();
+      if (ready.size() >= kPollBatch) serveSliced();
     }
     // The turn's events for a queued socket, taken as it is served: the entry
     // is spent and the socket is done for this turn.
@@ -6576,45 +7361,389 @@ class Server {
     // send(), so the grouping is cheaper for both ends. Every socket reported
     // in a turn is served in that turn; which group goes first rotates from
     // turn to turn, so no peer is always the last to be answered.
-    void serve() {
-      if (ready.empty()) return;
+    //
+    // serveAll() is the whole of it for a turn of fewer than kSliceCheck
+    // sockets on a loop that has none waiting (settle): no clock, no queue,
+    // nothing of the time slice below. Every other turn goes through
+    // serveSliced().
+    MORO_ALWAYS_INLINE void takeTurnList(std::vector<Connection*>& list) {
       // The turn's list is taken, and `ready` is left with the storage the
       // previous turn's list gave back: swapped against a fresh vector, it
       // was grown again from nothing on every turn, a handful of allocations
-      // each. The list stays this call's own, so nothing a handler does can
+      // each. The list stays the caller's own, so nothing a handler does can
       // touch it while it is being walked.
-      std::vector<Connection*> list;
       list.swap(readySpare);
       list.swap(ready);
+    }
+    // (A turn of one socket has no order to be put in, and does not go
+    // through the sort to be told so.)
+    MORO_ALWAYS_INLINE void orderTurnList(std::vector<Connection*>& list) {
       tune(list.size());
-      if (order == Order::Grouped) {
-        const unsigned n = groups, rot = turn++ % n;
-        const auto key = [n, rot](const Connection* c) { return (static_cast<unsigned>(c->ep.peerCpu + 1) + rot) % n; };
-        std::sort(list.begin(), list.end(), [&key](const Connection* a, const Connection* b) {
-          const unsigned ka = key(a), kb = key(b);
-          if (ka != kb) return ka < kb;
-          return a->ep.fd < b->ep.fd;
-        });
-      }
+      if (order == Order::Grouped && list.size() > 1) groupTurnList(list);
+    }
+    MORO_NOINLINE void groupTurnList(std::vector<Connection*>& list) {
+      const unsigned n = groups, rot = turn++ % n;
+      const auto key = [n, rot](const Connection* c) { return (static_cast<unsigned>(c->ep.peerCpu + 1) + rot) % n; };
+      std::sort(list.begin(), list.end(), [&key](const Connection* a, const Connection* b) {
+        const unsigned ka = key(a), kb = key(b);
+        if (ka != kb) return ka < kb;
+        return a->ep.fd < b->ep.fd;
+      });
+    }
+    MORO_ALWAYS_INLINE void returnTurnList(std::vector<Connection*>& list) {
+      // A burst's worth of capacity is not kept on an idle loop.
+      list.clear();
+      if (list.capacity() <= 4 * kPollBatch && list.capacity() > readySpare.capacity()) readySpare.swap(list);
+    }
+    MORO_ALWAYS_INLINE void serveAll() {
+      std::vector<Connection*> list;
+      takeTurnList(list);
+      orderTurnList(list);
       for (Connection* c : list) {
         const int events = takeReady(c);
         if (c->ep.state < 2) c->server->epollOnConn(c, events);
       }
-      // A burst's worth of capacity is not kept on an idle loop.
-      list.clear();
-      if (list.capacity() <= 4 * kPollBatch && list.capacity() > readySpare.capacity()) readySpare.swap(list);
+      returnTurnList(list);
+    }
+    // The same with the turn's slice (see "time slice"): the clock is read
+    // once every kSliceCheck sockets, and what the slice does not reach waits
+    // for the turns to come. On a loop that is behind already, nothing is
+    // served from here: what the poll phase reported goes behind the sockets
+    // that wait - behind the ones that have just arrived if it was not
+    // served in the last turn, behind all the others if it was.
+    MORO_NOINLINE void serveSliced() {
+      if (ready.empty()) return;
+      std::vector<Connection*> list;
+      takeTurnList(list);
+      const size_t n = list.size();
+      size_t i = 0;
+      if (behind) {
+        const uint32_t last = iteration == 1 ? UINT32_MAX : iteration - 1;  // the turn before this one (0 is no turn)
+        for (; i < n; i++) {
+          Connection* c = list[i];
+          if (c->ep.state < 2) {
+            const bool again = c->ep.servedTurn == last;
+            park(again ? backlog : arrivals, c, !again);
+          } else {
+            c->ep.readyEvents = 0;
+            c->ep.readyQueued = false;
+          }
+        }
+      } else {
+        orderTurnList(list);
+        if (sliceTurn != iteration) beginSlice();
+        for (; i < n; i++) {
+          if ((i & (kSliceCheck - 1)) == kSliceCheck - 1 && sliceOver(sliceEnd)) break;
+          Connection* c = list[i];
+          const int events = takeReady(c);
+          if (c->ep.state < 2) c->server->epollServe(c, events);
+        }
+        if (i < n) {
+          sliceCut = true;
+          behind = true;
+          fastTurn = 0;
+          for (; i < n; i++) {
+            Connection* c = list[i];
+            if (c->ep.state < 2) {
+              park(backlog, c, false);
+            } else {
+              c->ep.readyEvents = 0;
+              c->ep.readyQueued = false;
+            }
+          }
+        }
+      }
+      returnTurnList(list);
+    }
+
+    // ---- time slice ----
+    //
+    // A loop turn serves every socket the poll phase reported, and a socket's
+    // service is whatever its bytes ask for: one request, or a read buffer
+    // full of pipelined ones, or a body whose handler takes milliseconds.
+    // With thousands of sockets ready at once that is a turn of seconds, and
+    // everything else the loop has to do waits for it to end - the timers,
+    // the connections waiting to be accepted, and the request of a client
+    // that connected a moment ago to ask whether the server is alive. A
+    // flood of requests that each look reasonable then makes the server
+    // unreachable without exhausting anything.
+    //
+    // So a turn has kSliceMs. When it has used them, the sockets not yet
+    // served are put on `backlog`, in order, and the turn ends: the loop goes
+    // round to its timers and its poll. From then on, and until nothing is
+    // waiting any more, the sockets a turn is told about are not served as
+    // they come but queued, on one of two queues:
+    //  - `arrivals`: a socket that was NOT served in the turn before - a
+    //    connection just accepted, or one that has been quiet. They are
+    //    served first, within half the slice (all of it when the backlog is
+    //    empty), taken from both ends of the queue: the oldest for the first
+    //    half of that time, then the newest for the rest of it. From the old
+    //    end alone, a client that connects while ten thousand others are
+    //    being let in waits for all of them, which is longer than a client
+    //    waits; from the new end alone - or from the new end first, when one
+    //    service is as long as the time there is - the oldest wait for as
+    //    long as newer ones keep coming, which with a new connection every
+    //    few milliseconds is for ever.
+    //  - `backlog`: a socket that was served in the turn before and is ready
+    //    again. Oldest first, for the rest of the slice.
+    // Each queue is given one socket a turn whatever the clock says - its
+    // oldest - so the head of both always moves, and a socket that waits is
+    // served after at most as many turns as there were sockets ahead of it
+    // when it was queued. The new end is the one that goes without when
+    // services are long: sockets that each bring a slice's worth of work are
+    // then served in the order they came, as a loop without a slice serves
+    // them. The busy sockets take turns among themselves (a socket that has
+    // been served goes to the end of the backlog), and what a newcomer waits
+    // for is the newcomers around it - whose first service is one read - not
+    // the work the busy ones have brought.
+    //
+    // While sockets are waiting, a service reads less than the whole buffer
+    // (quantum) and the listener is given more connections per report
+    // (Server::kAcceptBatchBehind): both for the same reason, that a round
+    // over everything that waits should stay short however much there is.
+    //
+    // Nothing is dropped and nothing is served less often than the load
+    // allows; the order is what changes, and only while a turn does not fit
+    // in its slice. A loop whose turns do fit - which is every loop that is
+    // keeping up - never reads the clock for it unless a turn serves
+    // kSliceCheck sockets or more, and then once per that many; a turn of
+    // fewer is served by the code that served it before there was a slice
+    // (serveAll), for one compare in settle().
+    //
+    // A socket on a queue is not watched (park), so the poll phase reports
+    // nothing about it until it has had its turn. A connection closed while
+    // it waits is taken off (forget): unlike `ready`, the queues outlive the
+    // turn, and so would outlive the close callback that frees the
+    // Connection.
+    static constexpr uint64_t kSliceMs = 50;
+    static constexpr size_t kSliceCheck = 32;  // a power of two
+
+    // Sockets waiting for a later turn, oldest first. A slot is emptied when
+    // its connection closes; EpollConn::waitSeq finds it.
+    struct WaitQueue {
+      std::vector<Connection*> slots;
+      size_t head = 0;    // the next slot to serve
+      uint64_t base = 0;  // waitSeq - 1 of slots[0]
+      size_t live = 0;    // connections from `head` on
+
+      // `c` is already marked queued (EpollConn::readyQueued).
+      void push(Connection* c, bool isNew) {
+        c->ep.waitSeq = base + slots.size() + 1;
+        c->ep.waitNew = isNew;
+        slots.push_back(c);
+        live++;
+      }
+      void drop(Connection* c) {
+        const uint64_t at = c->ep.waitSeq - 1 - base;
+        if (at < slots.size() && slots[static_cast<size_t>(at)] == c) {
+          slots[static_cast<size_t>(at)] = nullptr;
+          live--;
+        }
+        c->ep.waitSeq = 0;
+      }
+      Connection* pop() {
+        while (head < slots.size()) {
+          Connection* c = slots[head++];
+          if (c == nullptr) continue;
+          live--;
+          c->ep.waitSeq = 0;
+          return c;
+        }
+        return nullptr;
+      }
+      // The newest instead of the oldest.
+      Connection* popNewest() {
+        while (slots.size() > head) {
+          Connection* c = slots.back();
+          slots.pop_back();
+          if (c == nullptr) continue;
+          live--;
+          c->ep.waitSeq = 0;
+          return c;
+        }
+        return nullptr;
+      }
+      // After a turn's pops: an empty queue gives its storage back when a
+      // flood grew it, and the served part of a long one is dropped once it
+      // is the larger half.
+      void tidy() {
+        if (head == slots.size()) {
+          base += slots.size();
+          slots.clear();
+          head = 0;
+          if (slots.capacity() > 4 * kPollBatch) std::vector<Connection*>().swap(slots);
+        } else if (head >= 4 * kPollBatch && head >= slots.size() / 2) {
+          slots.erase(slots.begin(), slots.begin() + static_cast<std::ptrdiff_t>(head));
+          base += head;
+          head = 0;
+        }
+      }
+    };
+    WaitQueue arrivals;
+    WaitQueue backlog;
+    size_t waiting() const { return arrivals.live + backlog.live; }
+    // Sockets are waiting, or were when this turn began: what the turn is
+    // told about is queued behind them (serveSliced). settleSliced() brings
+    // it up to date.
+    bool behind = false;
+    // The most sockets a turn may have and be served by serveAll(), without
+    // a look at the clock or at anything else here: kSliceCheck - 1, and 0 -
+    // no turn - while sockets wait (`behind`) or the debug line is on. It is
+    // the one thing of the time slice that a turn which fits pays for, in
+    // settle(): a load and a compare.
+    size_t fastTurn = kSliceCheck - 1;
+    uint32_t sliceTurn = 0;            // the turn sliceEnd, sliceHalf and sliceQuarter are for
+    uint64_t sliceEnd = 0;             // on the clock of uv_now(), in ms
+    uint64_t sliceHalf = 0;
+    uint64_t sliceQuarter = 0;
+    bool sliceCut = false;             // this turn's slice is used up
+    uint64_t sliceCuts = 0;            // turns that were cut (probe)
+
+    // MORO_ENGINE_SERVE_DEBUG=1: a line every quarter of a second while
+    // sockets are waiting - how long the longest turn took from one settle()
+    // to the next, and what waits.
+    uint64_t dbgLast = 0, dbgPrev = 0, dbgWorst = 0, dbgTurns = 0, dbgAccepts = 0;
+    uint64_t dbgServe = 0, dbgDone = 0, dbgPoll = 0, dbgEnd = 0;
+    void debugTurn() {
+      const uint64_t now = uv_hrtime();
+      if (dbgPrev != 0 && now - dbgPrev > dbgWorst) dbgWorst = now - dbgPrev;
+      dbgPrev = now;
+      dbgTurns++;
+      if ((!behind && !sliceCut) || now - dbgLast < 250ull * 1000 * 1000) return;
+      fprintf(stderr, "[serve] %llu turns, longest %.1f ms (poll %.1f, serve %.1f, completions %.1f); waiting: %zu arrivals, %zu backlog; cut %llu; accepted %llu\n",
+              static_cast<unsigned long long>(dbgTurns), static_cast<double>(dbgWorst) / 1e6,
+              static_cast<double>(dbgPoll) / 1e6, static_cast<double>(dbgServe) / 1e6, static_cast<double>(dbgDone) / 1e6,
+              arrivals.live, backlog.live, static_cast<unsigned long long>(sliceCuts),
+              static_cast<unsigned long long>(dbgAccepts));
+      dbgLast = now;
+      dbgWorst = 0;
+      dbgServe = dbgDone = dbgPoll = 0;
+      dbgTurns = 0;
+      dbgAccepts = 0;
+    }
+    // libuv reads the clock after every poll, so at the first service of a
+    // turn uv_now() is the present to the millisecond, for nothing.
+    void beginSlice() {
+      sliceTurn = iteration;
+      sliceCut = false;
+      const uint64_t now = uv_now(loop);
+      sliceEnd = now + kSliceMs;
+      sliceHalf = now + kSliceMs / 2;
+      sliceQuarter = now + kSliceMs / 4;
+    }
+    static bool sliceOver(uint64_t until) { return uv_hrtime() / 1000000 >= until; }
+    // `c` waits for a later turn. Its watcher is stopped until then: left
+    // armed, a level-triggered socket with bytes in it is reported again by
+    // every poll of every turn, and with ten thousand of them waiting the
+    // loop spent as long being told about them as it spent serving. Nothing
+    // is missed by not being told: whatever happens to the socket meanwhile -
+    // more bytes, the peer closing - is found when its turn comes and it is
+    // read. The loop is kept from waiting in its poll for as long as any
+    // socket waits (`spin`).
+    void park(WaitQueue& q, Connection* c, bool isNew) {
+      q.push(c, isNew);
+      uv_poll_stop(&c->ep.poll);
+      if (!spinActive) {
+        spinActive = true;
+        uv_idle_start(&spin, onSpin);
+      }
+    }
+    // Every turn while sockets wait ends in settle(), whether or not the
+    // poll phase has anything to report: the sockets that wait are not
+    // watched, so it may have nothing, and settle() is what serves them (and
+    // stops this handle once none is left).
+    static void onSpin(uv_idle_t* h) { static_cast<EpollLoop*>(h->data)->armCheck(); }
+    void forget(Connection* c) {
+      if (c->ep.waitSeq != 0) (c->ep.waitNew ? arrivals : backlog).drop(c);
+    }
+    // Has `c` been waiting for its turn since the turn `since` (the one a
+    // sweep ran in: Server::onSweep), without having been given one? Asked
+    // only while the loop is behind.
+    bool keptWaiting(const Connection* c, uint32_t since) const {
+      if (c->ep.waitSeq == 0) return false;
+      return c->ep.servedTurn == 0 || iteration - c->ep.servedTurn > iteration - since;
+    }
+    // A part of a turn for one end of a queue: its oldest sockets, or its
+    // newest, until `until`. `one`: the first of them whatever the clock
+    // says.
+    void serveWaiting(WaitQueue& q, uint64_t until, bool newest, bool one) {
+      for (;;) {
+        if (!one && sliceOver(until)) break;
+        Connection* c = newest ? q.popNewest() : q.pop();
+        if (c == nullptr) break;
+        const int events = takeReady(c);
+        if (c->ep.state >= 2) continue;
+        one = false;
+        // Watched again from here on (park stopped it), then served with what
+        // had been reported when it was queued.
+        uv_poll_start(&c->ep.poll, UV_READABLE | UV_DISCONNECT | (c->ep.wantOut ? UV_WRITABLE : 0), Server::onConnPoll);
+        // ... by a read that is shorter the more sockets wait (quantum).
+        Server* s = c->server;
+        s->epollRead_ = quantum(s->readBufSize_);
+        s->epollServe(c, events);
+        s->epollRead_ = s->readBufSize_;
+      }
+    }
+    // The arrivals have half the slice when the backlog waits too, and all
+    // of it otherwise; their oldest go first, for half of that, and the
+    // newest have what is then left of it. The backlog has the rest.
+    void serveQueues() {
+      if (sliceTurn != iteration) beginSlice();
+      if (arrivals.live != 0) {
+        const bool shared = backlog.live != 0;
+        serveWaiting(arrivals, shared ? sliceQuarter : sliceHalf, /*newest=*/false, /*one=*/true);
+        if (arrivals.live != 0) serveWaiting(arrivals, shared ? sliceHalf : sliceEnd, /*newest=*/true, /*one=*/false);
+        arrivals.tidy();
+      }
+      if (backlog.live != 0) {
+        serveWaiting(backlog, sliceEnd, /*newest=*/false, /*one=*/true);
+        backlog.tidy();
+      }
+      if (waiting() != 0) sliceCut = true;
+    }
+
+    // How much one socket's service reads while sockets are waiting: the
+    // whole buffer for up to kQuantumFull of them, and proportionally less
+    // as they become more, down to kQuantumMin. A service is one read, and
+    // what a read holds is what the service costs - 64 KiB of pipelined
+    // requests is a thousand of them - so with ten thousand sockets waiting
+    // a round over all of them at full buffers is seconds long, and the
+    // socket at the end of it waits that long for its first byte to be
+    // looked at. Shrinking the read keeps a round at roughly what
+    // kQuantumFull full services cost, whatever the number waiting; the
+    // bytes not read stay in the socket and are reported at the next turn.
+    static constexpr size_t kQuantumFull = 256;
+    static constexpr size_t kQuantumMin = 1024;
+    size_t quantum(size_t full) const {
+      const size_t n = waiting();
+      if (n <= kQuantumFull) return full;
+      const size_t q = full / n * kQuantumFull;
+      return q < kQuantumMin ? (full < kQuantumMin ? full : kQuantumMin) : q;
     }
 
     // Clean-stack work: serve this turn's readable sockets, then complete
     // fully-sent writes, which may surface further requests and queue more
     // writes - those complete in the next pass. A connection closed along the
     // way is skipped by its state.
+    //
+    // A turn of 1 to fastTurn sockets is served here as it was before there
+    // was a time slice. A turn of more, and every turn while sockets wait,
+    // is settleSliced()'s.
     void settle() {
       if (checkActive) {
         checkActive = false;
         uv_check_stop(&check);
       }
-      serve();
+      const size_t n = ready.size();
+      if (n - 1 < fastTurn) {
+        serveAll();
+      } else if (n != 0 || fastTurn == 0) {
+        settleSliced();
+        return;
+      }
+      finishTurn();
+    }
+    MORO_ALWAYS_INLINE void finishTurn() {
       if (++iteration == 0) iteration = 1;  // what is reported from here on belongs to the next turn (0 marks a socket never served)
       for (int pass = 0; pass < 64 && !completions.empty(); pass++) {
         std::vector<Connection*> list;
@@ -6625,6 +7754,30 @@ class Server {
       }
       if (!completions.empty() || !ready.empty()) armCheck();
     }
+    MORO_NOINLINE void settleSliced() {
+      const uint64_t dbg0 = debug ? uv_hrtime() : 0;
+      serveSliced();
+      if (behind) {
+        serveQueues();
+        behind = waiting() != 0;
+        if (!behind && spinActive) {
+          spinActive = false;
+          uv_idle_stop(&spin);
+        }
+      }
+      if (sliceCut && sliceTurn == iteration) sliceCuts++;
+      fastTurn = behind || debug ? 0 : kSliceCheck - 1;
+      const uint64_t dbg1 = debug ? uv_hrtime() : 0;
+      finishTurn();
+      if (debug) {
+        const uint64_t dbg2 = uv_hrtime();
+        if (dbg1 - dbg0 > dbgServe) dbgServe = dbg1 - dbg0;
+        if (dbg2 - dbg1 > dbgDone) dbgDone = dbg2 - dbg1;
+        if (dbgEnd != 0 && dbg0 - dbgEnd > dbgPoll) dbgPoll = dbg0 - dbgEnd;
+        dbgEnd = dbg2;
+        debugTurn();
+      }
+    }
 
     static void shutdownForThread() {
       EpollLoop*& s = slot();
@@ -6633,12 +7786,16 @@ class Server {
       s = nullptr;
       u->settle();
       uv_close(reinterpret_cast<uv_handle_t*>(&u->check), onCheckClosed);
-      while (!u->checkClosed) uv_run(u->loop, UV_RUN_ONCE);
+      uv_close(reinterpret_cast<uv_handle_t*>(&u->spin), onSpinClosed);
+      while (!u->checkClosed || !u->spinClosed) uv_run(u->loop, UV_RUN_ONCE);
       if (u->emfileFd >= 0) ::close(u->emfileFd);
       delete u;
     }
     static void onCheckClosed(uv_handle_t* h) {
       static_cast<EpollLoop*>(h->data)->checkClosed = true;
+    }
+    static void onSpinClosed(uv_handle_t* h) {
+      static_cast<EpollLoop*>(h->data)->spinClosed = true;
     }
   };
 
@@ -6684,9 +7841,19 @@ class Server {
     static_cast<Server*>(h->data)->epollOnListener();
   }
 
+  // Connections accepted per report of the listener: 64, so that a burst of
+  // connects takes a fifth of a millisecond out of a turn - and sixteen times
+  // that while sockets are waiting for their turn (EpollLoop, "time slice").
+  // A loop in that state reports the listener once per turn, and at 64 a
+  // turn the connections of a flood are accepted over many seconds: the
+  // listen queue stays full meanwhile, and a client that connects then is
+  // behind all of it, or is not let in at all.
+  static constexpr int kAcceptBatch = 64;
+  static constexpr int kAcceptBatchBehind = 1024;
   void epollOnListener() {
     if (listenFd_ < 0) return;
-    for (int i = 0; i < 64; i++) {
+    const int batch = epoll_->behind ? kAcceptBatchBehind : kAcceptBatch;
+    for (int i = 0; i < batch; i++) {
       int fd = ::accept4(listenFd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
       if (fd < 0) {
         if (errno == EINTR || errno == ECONNABORTED) continue;
@@ -6741,6 +7908,7 @@ class Server {
       readBuf_.reset(new char[65536]);
       readBufSize_ = 65536;
     }
+    epollRead_ = readBufSize_;
     uv_poll_start(&c->ep.poll, UV_READABLE | UV_DISCONNECT, onConnPoll);
   }
 
@@ -6756,6 +7924,7 @@ class Server {
   // (epollOnConn). The watcher libuv stopped is started again for the turns
   // that takes; the error is reported again on each of them.
   static constexpr int kEpollError = 1 << 8;  // beside the uv_poll_event bits: this service follows an error report
+  static constexpr int kDiscardReads = 16;    // buffers taken per turn from a connection nothing is read from (epollDiscard)
   static void onConnPoll(uv_poll_t* h, int status, int events) {
     Connection* c = static_cast<Connection*>(h->data);
     if (c->ep.state >= 2) return;
@@ -6775,7 +7944,10 @@ class Server {
     if (static_cast<unsigned>(cpu + 2) > epoll_->groups) epoll_->groups = static_cast<unsigned>(cpu + 2);
   }
 
-  void epollOnConn(Connection* c, int events) {
+  // One service of a socket. Inlined into the loop that serves a turn
+  // (EpollLoop::serveAll), as it was when that loop was its only caller; the
+  // turns that go by the clock and the sockets that waited call epollServe.
+  MORO_ALWAYS_INLINE void epollOnConn(Connection* c, int events) {
     if (events & UV_WRITABLE) {
       epollFlush(c);
       // A write that failed ends the connection in this turn's completion
@@ -6783,7 +7955,10 @@ class Server {
       if (c->ep.state >= 2 || c->ep.writeError) return;
     }
     if (!(events & (UV_READABLE | UV_DISCONNECT))) return;
-    ssize_t n = ::recv(c->ep.fd, readBuf_.get(), readBufSize_, 0);
+    // One buffer per socket per turn (epollRead_: the whole of it, or less
+    // while sockets are waiting for their turn - EpollLoop::serveWaiting),
+    // copied out or not (recvFlags: epollDiscard).
+    const ssize_t n = ::recv(c->ep.fd, readBuf_.get(), epollRead_, c->ep.recvFlags);
     if (n > 0) {
       if ((++c->ep.reads & 1023u) == 0) epollReadPeerCpu(c);  // the peer may have moved CPU
       // Level-triggered: anything left in the socket raises the next event.
@@ -6799,6 +7974,28 @@ class Server {
       onTransportEof(c);
     }
   }
+  MORO_NOINLINE void epollServe(Connection* c, int events) { epollOnConn(c, events); }
+
+  // A connection nothing more is read from - it is lingering, or an error
+  // response is on its way out - has had a buffer taken out of its socket
+  // and dropped (onTransportData). Nothing is done with what its peer still
+  // sends, so from here on it is not copied out either: MSG_TRUNC has the
+  // kernel discard it, in this connection's every read (recvFlags - which
+  // is how a connection that is read from pays nothing for this). And when
+  // the buffer came back full there is more, and it is taken now, up to
+  // kDiscardReads buffers' worth a turn in all: a peer that keeps sending
+  // behind a refusal - the rest of an upload answered 413 or 503 - otherwise
+  // keeps a receive buffer full in the kernel for as long as the connection
+  // lingers. (An EOF or error behind what was dropped is reported at the
+  // next turn.)
+  MORO_NOINLINE void epollDiscard(Connection* c, size_t taken) {
+    c->ep.recvFlags = MSG_TRUNC;
+    if (taken < epollRead_) return;
+    for (int i = 1; i < kDiscardReads; i++) {
+      const ssize_t n = ::recv(c->ep.fd, readBuf_.get(), readBufSize_, MSG_TRUNC);
+      if (n <= 0 || static_cast<size_t>(n) < readBufSize_) break;
+    }
+  }
 
   void epollQueueWrite(Connection* c, WriteReq* wr) {
     wr->next = nullptr;
@@ -6811,8 +8008,11 @@ class Server {
 
   void epollWantOut(Connection* c, bool on) {
     if (c->ep.wantOut == on || c->ep.state >= 2 || c->ep.fd < 0) return;
-    uv_poll_start(&c->ep.poll, UV_READABLE | UV_DISCONNECT | (on ? UV_WRITABLE : 0), onConnPoll);
     c->ep.wantOut = on;
+    // A socket waiting for a later turn is not watched (EpollLoop::park); the
+    // interest is taken up when its turn comes and it is watched again.
+    if (c->ep.waitSeq != 0) return;
+    uv_poll_start(&c->ep.poll, UV_READABLE | UV_DISCONNECT | (on ? UV_WRITABLE : 0), onConnPoll);
   }
 
   // Push the write queue as far as the socket takes it, in order. Nothing is
@@ -6915,6 +8115,9 @@ class Server {
       c->ep.completionPending = false;
       epoll_->dropCompletion(c);
     }
+    // And a place among the sockets waiting for a later turn, which would
+    // outlive the Connection.
+    epoll_->forget(c);
     uv_poll_stop(&c->ep.poll);
     uv_close(reinterpret_cast<uv_handle_t*>(&c->ep.poll), onConnPollClosed);
   }
@@ -6951,6 +8154,8 @@ class Server {
   }
 
   EpollLoop* epoll_ = nullptr;
+  size_t epollRead_ = 0;    // what one service reads: readBufSize_, less while sockets wait (EpollLoop::quantum)
+  uint32_t sweepTurn_ = 0;  // EpollLoop::iteration at this server's last sweep (EpollLoop::keptWaiting)
   uv_poll_t listenPoll_{};
 #endif
 
@@ -7043,6 +8248,7 @@ class Server {
   bool tlsEnabled_ = false;  // set via adoptTls() before listen()
   uv_timer_t sweepTimer_;
   uint64_t sweepMs_ = 4000;  // idle-sweep granularity (set in listen())
+  uint32_t sweepSeq_ = 1;    // counts the sweeps (Connection::unsentSweep)
   // Lingering-close deadline: how long a half-closed connection waits for the
   // peer's FIN before it is closed anyway (Apache's lingering_close budget;
   // nginx defaults to 5 s). Loopback peers close within a millisecond; the
@@ -7087,6 +8293,9 @@ class Server {
   std::vector<ReqState*> rqPool_;      // request states of connections at rest; see wake/rest
   size_t resting_ = 0;                 // connections in conns_ that are at rest
   std::vector<Connection*> restQueue_; // at rest, their state to be given back; see queueRest
+  BufferBudget* const mem_ = &threadState().budget;  // the calling thread's buffer budget
+  size_t heldSum_ = 0;                 // Connection::held over this server's connections
+  bool budgetJoined_ = false;          // counted in mem_->servers
   Connection* reading_ = nullptr;      // the connection whose read is on the stack
 
   // HTTP/2 (see the "HTTP/2" section).

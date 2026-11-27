@@ -675,6 +675,94 @@ describe('request line and Host', { skip }, () => {
     });
   });
 
+  // "A connection that has spoken HTTP/1" is one that has had a request
+  // parsed - whoever answered it. A static or parameter route answers inside
+  // the engine: no handler runs, no request id is taken, and the reply may
+  // still be waiting to be written when the next line is read.
+  it('with http2 on, a connection answered by an engine route has spoken HTTP/1: a later line that is not HTTP/1 is 400, and the replies before it are sent', T, async () => {
+    await withServer(echo, { http2: true }, async (server) => {
+      engine.setStaticRoute(server.serverId, 0, '/s', 200, null, 'static');
+      engine.setParamRoute(server.serverId, 0, '/p/', '', 200, null);
+      const S = `GET /s HTTP/1.1\r\n${H}\r\n`;
+      const P = `GET /p/seg HTTP/1.1\r\n${H}\r\n`;
+      for (const [label, bytes, statuses, bodies] of [
+        ['static route, one write', S + 'GARBAGE\r\n\r\n', [200, 400], ['static', '']],
+        ['parameter route, one write', P + 'GARBAGE\r\n\r\n', [200, 400], ['seg', '']],
+        ['a request with no version behind a static route', S + 'GET /x\r\n\r\n', [200, 400], ['static', '']],
+        ['three static routes, then one byte and a line end', S + S + S + 'X\r\n', [200, 200, 200, 400], ['static', 'static', 'static', '']],
+        ['static, handler, static, then the line', S + `GET /js HTTP/1.1\r\n${H}\r\n` + S + 'GARBAGE\r\n', [200, 200, 200, 400], ['static', 'GET|/js|', 'static', '']],
+      ]) {
+        const r = await exchange(server, bytes);
+        assert.deepEqual(r.statuses, statuses, label);
+        assert.deepEqual(r.responses.map((x) => x.body), bodies, label);
+        assert.equal(r.responses.at(-1).headers.connection, 'close', label);
+        assert.equal(r.closed, true, label);
+      }
+      // The same when the line comes in a write of its own, after the reply
+      // has been read and the connection has come to rest.
+      for (const first of [S, P]) {
+        const r = await exchange(server, null, { parts: [first, 'GARBAGE\r\n\r\n'], gap: 80 });
+        assert.deepEqual(r.statuses, [200, 400], JSON.stringify(first));
+        assert.equal(r.closed, true);
+      }
+      // The first line of a connection is still answered in neither protocol.
+      const r = await exchange(server, 'GARBAGE\r\n\r\n', { wait: 200 });
+      assert.deepEqual(r.statuses, []);
+      assert.equal(r.closed, true);
+    });
+  });
+
+  // RFC 9112 §3.2: a request-target has one of four forms. Origin-form
+  // begins with "/"; absolute-form is a URI with a scheme, which a server
+  // must accept (§3.2.2) and which is handed over as it came; authority-form
+  // is CONNECT's; asterisk-form is "*" and nothing more, for OPTIONS.
+  it('a request-target that has none of the four forms is 400 and reaches no handler', T, async () => {
+    const seen = [];
+    await withServer((ctx) => { seen.push(`${engine.getMethod(ctx.reqId)} ${ctx.path}${ctx.query() ? '?' + ctx.query() : ''}`); ctx.respond(200, null, 'ok'); }, async (server) => {
+      for (const target of ['abc', 'abc/def', '*x', '**', '?q', '.', '..', 'host:80', 'http:/x', 'mailto:a', '%2F', '@']) {
+        for (const m of ['GET', 'POST', 'OPTIONS']) {
+          await expectRejected(server, `${m} ${target} HTTP/1.1\r\n${H}\r\n`, 400, `${m} ${target}`);
+        }
+      }
+      assert.deepEqual(seen, []);
+      // ... behind a request that was served, too: that one is answered first.
+      const r = await exchange(server, `GET /a HTTP/1.1\r\n${H}\r\nGET abc HTTP/1.1\r\n${H}\r\nGET /never HTTP/1.1\r\n${H}\r\n`);
+      assert.deepEqual(r.statuses, [200, 400]);
+      assert.equal(r.closed, true);
+      assert.deepEqual(seen.splice(0), ['GET /a']);
+      // The forms that are taken, as they always were.
+      for (const [line, want] of [
+        ['GET / HTTP/1.1', 'GET /'],
+        ['GET //double/slash HTTP/1.1', 'GET //double/slash'],
+        ['GET /a?b=c HTTP/1.1', 'GET /a?b=c'],
+        ['GET http://example.test/a?b=c HTTP/1.1', 'GET http://example.test/a?b=c'],
+        ['GET https://example.test HTTP/1.1', 'GET https://example.test'],
+        ['POST HTTP://EXAMPLE.TEST/ HTTP/1.1', 'POST HTTP://EXAMPLE.TEST/'],
+        ['CONNECT example.test:443 HTTP/1.1', 'CONNECT example.test:443'],
+        ['OPTIONS * HTTP/1.1', 'OPTIONS *'],
+      ]) {
+        const ok = await exchange(server, `${line}\r\n${H}\r\n`);
+        assert.deepEqual(ok.statuses, [200], line);
+        assert.deepEqual(seen.splice(0), [want], line);
+      }
+    });
+  });
+
+  // asterisk-form is exactly "*" (RFC 9112 §3.2.4): with a query behind it
+  // the target is no longer that form, nor any other, whatever the method.
+  it('"*" followed by a query is not asterisk-form: 400 for OPTIONS as for every other method', T, async () => {
+    let calls = 0;
+    await withServer((ctx) => { calls++; ctx.respond(204, null, ''); }, async (server) => {
+      for (const m of ['GET', 'HEAD', 'POST', 'OPTIONS', 'TRACE']) {
+        await expectRejected(server, `${m} *?x HTTP/1.1\r\n${H}\r\n`, 400, `${m} *?x`);
+        await expectRejected(server, `${m} *? HTTP/1.1\r\n${H}\r\n`, 400, `${m} *?`);
+      }
+      assert.equal(calls, 0);
+      const r = await exchange(server, `OPTIONS * HTTP/1.1\r\n${H}\r\n`);
+      assert.deepEqual(r.statuses, [204]);
+    });
+  });
+
   it('HTTP-version: any 1.x digit is served as HTTP/1.1; other majors are 505; malformed is 400', T, async () => {
     await withServer(echo, async (server) => {
       for (const v of ['HTTP/1.2', 'HTTP/1.9']) {

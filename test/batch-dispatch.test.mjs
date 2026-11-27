@@ -327,6 +327,34 @@ describe('batched pipelined dispatch', { skip }, () => {
     }
   });
 
+  // The request-target rule belongs to the request line, so a batch sees it
+  // where one-by-one dispatch does: the requests ahead are answered, the one
+  // with no valid target is 400, and nothing behind it is read.
+  it('a request whose target has no valid form ends a batch with 400, in both dispatch modes and behind an engine route', T, async () => {
+    for (const batch of [true, false]) {
+      const srv = serveWith(handler, { batch });
+      try {
+        engine.setStaticRoute(srv.sid, 0, '/static', 200, null, 'static!');
+        for (const target of ['abc', '*x', '*?q', '?q']) {
+          const raw = stripDate(await exchange(srv.port, [req('/sync/0') + req('/static') + req('/sync/2') + req(target) + req('/sync/never')]));
+          assert.deepEqual(raw.match(/HTTP\/1\.1 \d{3}/g), ['HTTP/1.1 200', 'HTTP/1.1 200', 'HTTP/1.1 200', 'HTTP/1.1 400'], `${target} batch=${batch}`);
+          assert.match(raw, /Connection: close\r\n\r\n$/);
+        }
+        assert.ok(!srv.log.dispatched.some((p) => !p.startsWith('/')), JSON.stringify(srv.log.dispatched));
+        assert.ok(!srv.log.dispatched.includes('/sync/never'));
+        // More of them than the staging ring has slots, and the valid forms among them.
+        const many = [];
+        for (let i = 0; i < 20; i++) many.push(req(`/sync/${i}`));
+        const raw = stripDate(await exchange(srv.port, [many.join('') + req('http://t/abs') + req('*', { method: 'OPTIONS' }) + req('nope')]));
+        assert.equal((raw.match(/HTTP\/1\.1 200/g) || []).length, 22);
+        assert.equal((raw.match(/HTTP\/1\.1 400/g) || []).length, 1);
+        assert.ok(raw.includes('sync:http://t/abs:GET') && raw.includes('sync:*:OPTIONS'));
+      } finally {
+        srv.close();
+      }
+    }
+  });
+
   it('a throwing handler does not stall the rest of the batch', T, async () => {
     const bat = serveWith(handler, { batch: true });
     try {

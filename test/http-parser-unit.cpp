@@ -1246,7 +1246,58 @@ int main() {
       CHECK(code == 400);
     }
     CHECK(status("GET /* HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Complete);
-    CHECK(status("GET ** HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Complete);  // opaque, as before
+
+    // The four forms of a request-target (RFC 9112 §3.2), and nothing else.
+    // asterisk-form is exactly "*": with a query, or anything else behind
+    // it, it is no form at all, for OPTIONS as for every other method.
+    for (const char* t : {"*?x", "*?", "**", "*x", "*/", "abc", "abc/def", "?q", "#f", "\\x", ".", "..", "host:80",
+                          "http:/x", "http:x", "://x", "1http://h/", "%2F", "@", "a?b=/"}) {
+      for (const char* m : {"GET", "POST", "OPTIONS", "HEAD", "FOO"}) {
+        CHECK(status(std::string(m) + " " + t + " HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Error);
+        CHECK(code == 400);
+      }
+    }
+    // origin-form: one byte settles it, whatever follows the "/".
+    for (const char* t : {"/", "/a", "//", "//host/path", "/*", "/?q", "/a?*", "/http://x"}) {
+      CHECK(status(std::string("GET ") + t + " HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Complete);
+    }
+    // absolute-form: a scheme (RFC 3986 §3.1) and "://", passed through as it came.
+    for (const char* t : {"http://h/x?q=1", "https://h", "HTTP://H/", "ws://h/chat", "a+b-c.d1://h/", "http://", "h://x"}) {
+      HttpParser p;
+      CHECK(feed(p, std::string("GET ") + t + " HTTP/1.1\r\nHost: h\r\n\r\n") == ParseStatus::Complete);
+      CHECK(p.path + (p.query.empty() ? "" : "?" + p.query) == t);
+    }
+    // authority-form is CONNECT's, and a target of CONNECT is taken as before.
+    for (const char* t : {"example.test:443", "[::1]:443", "host", "/m"}) {
+      HttpParser p;
+      CHECK(feed(p, std::string("CONNECT ") + t + " HTTP/1.1\r\nHost: h\r\n\r\n") == ParseStatus::Complete);
+      CHECK(p.methodStr == "CONNECT" && p.path == t);
+    }
+    CHECK(status("CONNECT * HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Error);
+    CHECK(status("connect example.test:443 HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Error);  // methods are case-sensitive
+    // The answer is the same however the line arrives, and behind another request.
+    for (const char* t : {"abc", "*?x", "*x"}) {
+      const std::string all = std::string("GET ") + t + " HTTP/1.1\r\nHost: h\r\n\r\n";
+      for (const size_t step : {size_t(1), size_t(3)}) {
+        HttpParser split;
+        ParseStatus st = ParseStatus::NeedMore;
+        for (size_t fed = 0; fed < all.size() && st == ParseStatus::NeedMore; fed += step)
+          st = split.parse(all.data() + fed, step < all.size() - fed ? step : all.size() - fed);
+        CHECK(st == ParseStatus::Error);
+        CHECK(split.errorStatus == 400);
+      }
+      HttpParser p;
+      CHECK(feed(p, "GET / HTTP/1.1\r\nHost: h\r\n\r\n" + all) == ParseStatus::Complete);
+      p.reset();
+      CHECK(p.parse(nullptr, 0) == ParseStatus::Error);
+      CHECK(p.errorStatus == 400);
+      CHECK(!p.notHttp());  // an HTTP/1 line, and wrong: answered, never dropped
+    }
+    // A line that is not HTTP/1.x is still answered for that (the HTTP/2 preface).
+    CHECK(status("PRI * HTTP/2.0\r\n\r\n", code) == ParseStatus::Error);
+    CHECK(code == 505);
+    CHECK(status("GET abc HTTP/2.0\r\n\r\n", code) == ParseStatus::Error);
+    CHECK(code == 505);
 
     // A method token past kMaxMethodLen is 501 - whole, split, or never
     // finished, and however far past maxHeadSize the line runs.
@@ -1291,6 +1342,116 @@ int main() {
       CHECK(feed(p, std::string("GET ") + t + " HTTP/1.1\r\nHost: h\r\n\r\n") == ParseStatus::Complete);
     }
     CHECK(status("GET /caf%C3%A9 HTTP/1.1\r\nHost: h\r\n\r\n", code) == ParseStatus::Complete);
+  }
+
+  // --- a line with no HTTP-version in it: the first of its connection, or a later one ---
+  {
+    // Not asked for: notHttp() alone.
+    HttpParser p;
+    CHECK(feed(p, "GARBAGE\r\n\r\n") == ParseStatus::Error);
+    CHECK(p.notHttp() && !p.firstLineNotHttp());
+    // Asked for, and the first line is not HTTP/1.
+    for (const char* first : {"GARBAGE\r\n\r\n", "GET /\r\n\r\n", "GET\r\n", "\r\nGARBAGE\r\n"}) {
+      HttpParser q;
+      q.expectFirstLine();
+      CHECK(feed(q, first) == ParseStatus::Error);
+      CHECK(q.firstLineNotHttp());
+    }
+    // An HTTP/1 line that is wrong is not that.
+    for (const char* first : {"GET / HTTP/1.9x\r\n\r\n", "GET / HTTP/3.0\r\n\r\n", "GET abc HTTP/1.1\r\n\r\n", "G@T / HTTP/1.1\r\n\r\n"}) {
+      HttpParser q;
+      q.expectFirstLine();
+      CHECK(feed(q, first) == ParseStatus::Error);
+      CHECK(!q.firstLineNotHttp());
+    }
+    // Once a request has been parsed the connection has spoken HTTP/1: what
+    // follows is no longer a first line, whole in one read or in a later one.
+    {
+      HttpParser q;
+      q.expectFirstLine();
+      CHECK(feed(q, "GET /a HTTP/1.1\r\nHost: h\r\n\r\nGARBAGE\r\n\r\n") == ParseStatus::Complete);
+      q.reset();
+      CHECK(q.parse(nullptr, 0) == ParseStatus::Error);
+      CHECK(q.notHttp() && !q.firstLineNotHttp());
+    }
+    {
+      HttpParser q;
+      q.expectFirstLine();
+      CHECK(feed(q, "GET /a HTTP/1.1\r\nHost: h\r\n\r\n") == ParseStatus::Complete);
+      q.reset();
+      CHECK(feed(q, "GARBAGE\r\n\r\n") == ParseStatus::Error);
+      CHECK(q.notHttp() && !q.firstLineNotHttp());
+    }
+    // A first request that arrives in pieces is still the first until it is complete.
+    {
+      HttpParser q;
+      q.expectFirstLine();
+      CHECK(feed(q, "GET /a HT") == ParseStatus::NeedMore);
+      CHECK(feed(q, "TP/1.1\r\nHost: h\r\n") == ParseStatus::NeedMore);
+      CHECK(feed(q, "\r\n") == ParseStatus::Complete);
+      CHECK(!q.firstLineNotHttp());
+    }
+  }
+
+  // --- a head past kLeanHead is noted, whichever way it was parsed; a head within it is not ---
+  {
+    const size_t lean = HttpParser::kLeanHead;
+    const auto request = [](size_t pathLen, size_t valueLen) {
+      return "GET /" + std::string(pathLen, 'p') + " HTTP/1.1\r\nHost: h\r\nX-A: " + std::string(valueLen, 'v') + "\r\n\r\n";
+    };
+    // the head's size, to the byte: at kLeanHead it is within, one more is past
+    const size_t fixed = request(0, 0).size();
+    for (const bool stored : {true, false}) {       // a request JS sees, and one an engine route answers
+      for (const size_t step : {size_t(0), size_t(1000)}) {  // whole (parsed in place), and in pieces (buffered)
+        for (const size_t over : {size_t(0), size_t(1)}) {
+          HttpParser p;
+          bool engineRoute = !stored;
+          p.routeHook = [](void* user, Method, const std::string&) { return *static_cast<bool*>(user); };
+          p.routeHookUser = &engineRoute;
+          const std::string all = request(lean - fixed + over, 0);
+          ParseStatus st = ParseStatus::NeedMore;
+          if (step == 0) st = p.parse(all.data(), all.size());
+          else
+            for (size_t fed = 0; fed < all.size() && st == ParseStatus::NeedMore; fed += step)
+              st = p.parse(all.data() + fed, step < all.size() - fed ? step : all.size() - fed);
+          CHECK(st == ParseStatus::Complete);
+          CHECK(p.largeHead() == (over == 1));
+          p.reset();
+          CHECK(p.idle());
+          CHECK(p.idleLean() == (over == 0));       // the mark outlives the request ...
+          p.clearLargeHead();
+          CHECK(p.idleLean());                      // ... until it is cleared
+        }
+      }
+    }
+    // A header block does it as a request line does, and what the parser holds says by how much.
+    {
+      HttpParser p;
+      const size_t before = p.retained();
+      CHECK(feed(p, request(10, 3 * lean)) == ParseStatus::Complete);
+      CHECK(p.largeHead());
+      CHECK(p.retained() >= before + 3 * lean);
+      p.reset();
+      CHECK(!p.idleLean() && p.idle());
+    }
+    // idleLean() is idle() while nothing is noted: not with a request half received.
+    {
+      HttpParser p;
+      CHECK(p.idleLean());
+      CHECK(feed(p, "GET / HT") == ParseStatus::NeedMore);
+      CHECK(!p.idle() && !p.idleLean());
+    }
+    // maxHeadSize below kLeanHead still refuses at maxHeadSize, and above it at its own value.
+    for (const size_t max : {size_t(256), 3 * lean}) {
+      HttpLimits lim;
+      lim.maxHeadSize = max;
+      HttpParser ok(lim);
+      CHECK(feed(ok, request(max - fixed, 0)) == ParseStatus::Complete);
+      CHECK(ok.largeHead() == (max > lean));
+      HttpParser refused(lim);
+      CHECK(feed(refused, request(max - fixed + 1, 0)) == ParseStatus::Error);
+      CHECK(refused.errorStatus == 431);
+    }
   }
 
   return 0;

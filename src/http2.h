@@ -702,6 +702,35 @@ class Session {
   // How many held-back bytes have gone out since the session began: it moves
   // only when the peer opens a window for them.
   uint64_t heldSent() const { return heldSent_; }
+  // True while a response is waiting on a window.
+  bool anyBlocked() const { return !blocked_.empty(); }
+  // What the session holds in buffers for its peer, as the server's buffer
+  // budget counts it: the storage of the responses waiting on a window (all
+  // of it - the part already sent stays allocated until the buffer is
+  // compacted), the room set aside for request bodies still arriving, input
+  // kept unread, and a header block still arriving in CONTINUATION frames.
+  // Four loads when no stream is waiting.
+  size_t memory() const {
+    const auto heap = [](const std::string& b) { return b.capacity() >= sizeof(std::string) ? b.capacity() : 0; };
+    size_t n = reserved_ + heap(in_) + heap(hbuf_);
+    for (const uint32_t id : blocked_) {
+      if (const Stream* st = find(id)) n += st->pending.capacity();
+    }
+    return n;
+  }
+
+  // True when one of the figures memory() is made of has changed since the
+  // host last counted it (counted()): the host counts a session where its
+  // read ends, and most reads - a request without a body, answered within
+  // its window - change none of them. Set wherever kept input, a header
+  // block across frames, room for a body, or a response waiting on a window
+  // grows or goes.
+  bool moved() const { return moved_; }
+  void counted() { moved_ = false; }
+
+  // The request side of that, by content: bodies in flight (the room set
+  // aside for them), input kept unread and a header block still arriving.
+  size_t arriving() const { return reserved_ + (in_.size() - inOff_) + hbuf_.size(); }
 
   // Bytes from the peer. `nowMs` is any monotonic clock; it paces the budget
   // for frames that cost the server work and the peer nothing.
@@ -725,7 +754,10 @@ class Session {
         return;
       }
       if (!kept) {
-        if (pos < n) in_.assign(reinterpret_cast<const char*>(p) + pos, n - pos);
+        if (pos < n) {
+          in_.assign(reinterpret_cast<const char*>(p) + pos, n - pos);
+          moved_ = true;
+        }
         break;
       }
       if (!keptDone(pos, off == len)) break;
@@ -763,6 +795,7 @@ class Session {
     if (!st.pending.empty() || st.pendingEnd) {  // order: behind what is already waiting
       st.pending.append(data, len);
       st.pendingEnd = st.pendingEnd || endStream;
+      moved_ = true;
       return st.pending.size() - st.pendingOff;
     }
     bool finished = false;
@@ -772,6 +805,7 @@ class Session {
       st.pending.assign(data + sent, len - sent);
       st.pendingOff = 0;
       st.pendingEnd = endStream;
+      moved_ = true;
       if (!st.blocked) {
         st.blocked = true;
         blocked_.push_back(st.id);
@@ -870,6 +904,7 @@ class Session {
     const size_t want = stop_ ? len - off : missing();
     const size_t take = std::min(want, len - off);
     in_.append(data + off, take);
+    moved_ = true;
     off += take;
     return take == want;
   }
@@ -878,6 +913,7 @@ class Session {
   // on: with the rest of the read once nothing is kept, or with what is
   // kept when more of the read can be joined to it.
   MORO_NOINLINE bool keptDone(size_t pos, bool readTaken) {
+    moved_ = true;
     inOff_ += pos;
     if (inOff_ == in_.size()) {
       in_.clear();
@@ -1159,6 +1195,7 @@ class Session {
     contStream_ = id;
     contFrames_ = 0;
     hbuf_.assign(reinterpret_cast<const char*>(frag), fragLen);
+    moved_ = true;
   }
 
   void onContinuation(uint8_t flags, uint32_t id, const uint8_t* p, uint32_t len) {
@@ -1169,6 +1206,7 @@ class Session {
     if (++contFrames_ > kMaxContinuations || hbuf_.size() + len > maxHeaderBlock())
       return connectionError(kEnhanceYourCalm);
     hbuf_.append(reinterpret_cast<const char*>(p), len);
+    moved_ = true;
     if ((flags & kFlagEndHeaders) == 0) return;
     contStream_ = 0;
     std::string block;
@@ -1239,7 +1277,11 @@ class Session {
 
     // A request is malformed without exactly one :method, :scheme and :path
     // (8.3.1); CONNECT, which has neither of the last two, is not served.
-    if ((rq.bad & kMalformed) || !rq.method || !rq.scheme || !rq.path || st->path.empty())
+    // And :path is never empty: it begins with "/", which its first byte
+    // settles (an empty string's is the terminator), or it is the "*" of a
+    // server-wide OPTIONS (pathIsAsterisk).
+    if ((rq.bad & kMalformed) || !rq.method || !rq.scheme || !rq.path ||
+        (st->path[0] != '/' && !pathIsAsterisk(*st)))
       return streamError(id, kProtocolError);
     if (rq.bad != 0) return refuse(*st, 431, endStream);  // too large (malformed was seen to above)
     if (local_.maxUriSize && st->path.size() + st->query.size() + 1 > local_.maxUriSize)
@@ -1276,6 +1318,18 @@ class Session {
     // of it to arrive (dataBody).
     if (rq.contentLength > 0 && static_cast<uint64_t>(rq.contentLength) <= kReserveAtOnce)
       st->body.reserve(static_cast<size_t>(rq.contentLength));
+  }
+
+  // A :path that does not begin with "/". RFC 9113 8.3.1 allows one such
+  // value: "*", exactly, for an OPTIONS request that names no path - the
+  // asterisk-form of HTTP/1 (RFC 9112 3.2.4), under the rule the HTTP/1
+  // parser applies to it. There is no absolute-form here (scheme and
+  // authority travel in pseudo-header fields of their own) and no
+  // authority-form (CONNECT is not served), so everything else - "abc",
+  // "*x", "*?q", "http://host/", a query with no path before it - is
+  // malformed, where HTTP/1 answers 400.
+  static MORO_NOINLINE bool pathIsAsterisk(const Stream& st) {
+    return st.path.size() == 1 && st.path[0] == '*' && st.query.empty() && st.method == Method::OPTIONS;
   }
 
   struct Request {
@@ -1384,7 +1438,10 @@ class Session {
         return;
       }
       if (name == ":method") {
-        if (rq.method || value.empty()) {
+        // Once, not empty, and no longer than the method token HTTP/1 takes
+        // for a method at all (HttpParser::kMaxMethodLen, answered 501
+        // there): one unsigned comparison for the two bounds.
+        if (rq.method || value.size() - 1 >= HttpParser::kMaxMethodLen) {
           rq.bad |= kMalformed;
           return;
         }
@@ -1663,6 +1720,7 @@ class Session {
     if (target > cap) st.body.reserve(target);
     reserved_ += st.body.capacity() - st.bodyHeld;
     st.bodyHeld = st.body.capacity();
+    moved_ = true;
   }
 
   // The frame's payload is all in.
@@ -1765,6 +1823,7 @@ class Session {
     if (st.bodyHeld != 0) {
       reserved_ -= st.bodyHeld;
       st.bodyHeld = 0;
+      moved_ = true;
     }
   }
 
@@ -1862,6 +1921,7 @@ class Session {
     const size_t sent = writeData(st, st.pending.data() + st.pendingOff,
                                   st.pending.size() - st.pendingOff, st.pendingEnd, finished);
     heldSent_ += sent;
+    moved_ = true;
     if (finished) return false;
     st.pendingOff += sent;
     if (st.pendingOff == st.pending.size()) {
@@ -1963,6 +2023,7 @@ class Session {
   }
 
   void unblock(uint32_t id) {
+    moved_ = true;
     for (size_t i = 0; i < blocked_.size(); i++) {
       if (blocked_[i] == id) {
         blocked_.erase(blocked_.begin() + static_cast<std::ptrdiff_t>(i));
@@ -2029,8 +2090,11 @@ class Session {
     }
     if (!st.dispatched) {
       buffered_ -= std::min(buffered_, st.body.size());
-      reserved_ -= st.bodyHeld;
-      st.bodyHeld = 0;
+      if (st.bodyHeld != 0) {
+        reserved_ -= st.bodyHeld;
+        st.bodyHeld = 0;
+        moved_ = true;
+      }
     }
     if (st.blocked) unblock(st.id);
     streams_.erase(st.id);
@@ -2112,6 +2176,7 @@ class Session {
   uint32_t connRecvUnacked_ = 0;
   size_t buffered_ = 0;  // request body bytes held for requests not yet dispatched
   size_t reserved_ = 0;  // ...and the capacity set aside for them (roomFor)
+  bool moved_ = false;   // a figure of memory() changed since counted()
   std::string cookie_;   // the cookie fields of the header block being decoded, joined
   uint64_t heldSent_ = 0;  // see heldSent()
 

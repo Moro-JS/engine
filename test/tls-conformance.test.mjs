@@ -36,6 +36,7 @@ import {
   openShimTls,
 } from './tls-helpers.mjs';
 import net from 'node:net';
+import tls from 'node:tls';
 
 const engine = await loadEngine();
 const tlsCapable = engine?.probe?.().capabilities?.tls === true;
@@ -614,10 +615,15 @@ describe('@morojs/engine TLS conformance', { skip }, () => {
   // is switched on by the fault point of a test build (probe() says whether
   // this binary has it). Bytes go first: they are not read that way, so a
   // callback made inside the send fails this test instead.
+  // That is the default delivery. Under MORO_ENGINE_NOTIFY=sync the engine
+  // delivers in place by design - the binding copies the payload first, so
+  // nothing is read from the heap while JS runs - and the close is then
+  // reported from inside the send, which is what is expected there.
   const noFaultPoints = engine?.probe?.().testFaults
     ? false
     : 'needs a build with fault points (tools/build.mjs --sanitize)';
   it('WSS: a send the session cannot encrypt reports the close after wsSend() has returned', { ...T, skip: noFaultPoints }, async () => {
+    const inPlace = engine.probe().notify === 'sync';
     let sending = false;
     let lastWsId = 0;
     const closes = [];
@@ -660,8 +666,8 @@ describe('@morojs/engine TLS conformance', { skip }, () => {
           await new Promise((r) => setTimeout(r, 50));
           assert.deepEqual(
             closes.filter((e) => e.wsId === wsId),
-            [{ wsId, code: 1006, insideSend: false }],
-            `${kind}: one onWsClose(1006), delivered outside wsSend()`
+            [{ wsId, code: 1006, insideSend: inPlace }],
+            `${kind}: one onWsClose(1006), delivered ${inPlace ? 'in place (sync notification)' : 'outside wsSend()'}`
           );
           assert.equal(engine.wsSend(wsId, 'x', false), false, `${kind}: the socket is gone`);
         } finally {
@@ -781,5 +787,174 @@ describe('@morojs/engine TLS conformance', { skip }, () => {
       const res = parseResponse(await rawTlsRequest(server.port, GET()));
       assert.equal(res.status, 200);
     });
+  });
+});
+
+// The end of a TLS connection (RFC 9112 §9.6 over TLS): after the last
+// response the server writes its close_notify, half-closes, and waits for
+// the peer's FIN with the input discarded - what a plaintext connection has
+// always done, with the alert ahead of the FIN. Closed outright instead,
+// the bytes a peer is still sending are answered with a RST, and a RST costs
+// the peer whatever of the response it had not read yet.
+describe('closing a TLS connection', { skip }, () => {
+  const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // A client that goes on writing for a while without reading, and only
+  // then reads what the server sent. Resolves to what it read and how the
+  // connection ended.
+  async function stillSending(port, first, more, { quietMs = 300, halfOpen = false } = {}) {
+    const socket = tls.connect({ host: '127.0.0.1', port, servername: 'localhost', ca: fixturePem('ca.pem'), allowHalfOpen: halfOpen });
+    const seen = { data: Buffer.alloc(0), ended: false, error: null, closed: false, writeErrors: 0 };
+    socket.on('error', (e) => (seen.error = e.code || String(e)));
+    socket.on('end', () => (seen.ended = true));
+    const closed = new Promise((resolve) => socket.on('close', () => ((seen.closed = true), resolve())));
+    await new Promise((resolve, reject) => {
+      socket.once('secureConnect', resolve);
+      socket.once('error', reject);
+    });
+    socket.pause();
+    socket.write(first, 'latin1');
+    const until = Date.now() + quietMs;
+    while (Date.now() < until && !socket.destroyed) {
+      socket.write(more, 'latin1', (err) => err && seen.writeErrors++);
+      await delay(5);
+    }
+    socket.on('data', (d) => (seen.data = Buffer.concat([seen.data, d])));
+    socket.resume();
+    return { socket, seen, closed };
+  }
+
+  it('a response that ends the connection reaches a peer that is still sending: an HTTP/1.0 stream with requests pipelined behind it', T, async () => {
+    const body = 'B'.repeat(20000);
+    let handled = 0;
+    await withTlsServer(
+      (ctx) => {
+        handled++;
+        // Streamed without a length to an HTTP/1.0 client: the end of the
+        // connection is the end of the body.
+        ctx.writeHead(200, ['content-type', 'text/plain']);
+        ctx.write(body.slice(0, 7000));
+        ctx.end(body.slice(7000));
+      },
+      sslFileOptions(),
+      async (server) => {
+        const { seen, closed } = await stillSending(
+          server.port,
+          `GET /stream HTTP/1.0${CRLF}Host: t${CRLF}Connection: keep-alive${CRLF}${CRLF}`,
+          GET('/behind').repeat(20)
+        );
+        await closed;
+        const text = seen.data.toString('latin1');
+        assert.match(text, /^HTTP\/1\.1 200 /);
+        assert.equal(text.slice(text.indexOf(CRLF + CRLF) + 4), body, 'the whole body, though the client kept writing before it read');
+        assert.equal(seen.error, null, 'no reset');
+        assert.equal(seen.writeErrors, 0, 'what the client wrote meanwhile was taken, not refused');
+        assert.equal(seen.ended, true, 'ended by close_notify and FIN');
+        assert.equal(handled, 1, 'nothing sent behind the last response is served');
+      }
+    );
+  });
+
+  it('an error response reaches a client that is still uploading', T, async () => {
+    await withTlsServer(
+      echoBody,
+      sslFileOptions(),
+      async (server) => {
+        const { seen, closed } = await stillSending(
+          server.port,
+          `POST /up HTTP/1.1${CRLF}Host: t${CRLF}Content-Length: 4000000${CRLF}${CRLF}`,
+          'u'.repeat(16000)
+        );
+        await closed;
+        const res = parseResponse(seen.data.toString('latin1'));
+        assert.equal(res.status, 413);
+        assert.equal(res.headers.connection, 'close');
+        assert.equal(seen.error, null, 'no reset');
+        assert.equal(seen.ended, true);
+        assert.equal(server.requests.length, 0);
+      },
+      { maxBodySize: 1024 }
+    );
+  });
+
+  it('the peer\'s own close ends the wait at once', T, async () => {
+    await withTlsServer(ok, sslFileOptions(), async (server) => {
+      const t0 = Date.now();
+      const { seen, closed } = await stillSending(server.port, GET('/', `Connection: close${CRLF}`), '', { quietMs: 0 });
+      await closed;
+      assert.equal(parseResponse(seen.data.toString('latin1')).body, 'ok-tls');
+      assert.equal(seen.error, null);
+      assert.ok(Date.now() - t0 < 1000, `closed after ${Date.now() - t0} ms: well inside the two seconds a peer is waited for`);
+    });
+  });
+
+  it('a peer that never closes is cut after two seconds, as on a plaintext connection, and nothing it sends meanwhile is read', T, async () => {
+    let handled = 0;
+    await withTlsServer(
+      (ctx) => {
+        handled++;
+        ctx.respond(200, null, 'last');
+      },
+      sslFileOptions(),
+      async (server) => {
+        const t0 = Date.now();
+        // allowHalfOpen: the client reads the server's close and keeps its own side open.
+        const { socket, seen, closed } = await stillSending(server.port, GET('/', `Connection: close${CRLF}`), '', { quietMs: 0, halfOpen: true });
+        const poke = setInterval(() => {
+          if (!socket.destroyed) socket.write(GET('/more'), () => {});
+        }, 100);
+        const giveUp = setTimeout(() => socket.destroy(), 8000);
+        await closed;
+        clearInterval(poke);
+        clearTimeout(giveUp);
+        const ms = Date.now() - t0;
+        assert.equal(parseResponse(seen.data.toString('latin1')).body, 'last');
+        assert.equal(seen.ended, true, 'the server said it was done: close_notify and FIN came with the response');
+        assert.ok(ms >= 900 && ms < 5000, `cut after ${ms} ms`);
+        assert.equal(handled, 1, 'the requests sent into the closing connection are dropped, not served');
+      }
+    );
+  });
+
+  it('WSS: a Close the server starts reaches a peer that is still sending frames', T, async () => {
+    const closes = [];
+    const sid = engine.serve(
+      {
+        onRequest(reqId) {
+          const wsId = engine.upgradeToWebSocket(reqId);
+          // Closed by the server a moment after it opened, while the peer is mid-conversation.
+          setTimeout(() => engine.wsClose(wsId, 1001, 'going away'), 60);
+        },
+        onAborted() {},
+        onWsOpen() {},
+        onWsMessage() {},
+        onWsClose: (wsId, code) => closes.push(code),
+      },
+      { ssl: sslFileOptions() }
+    );
+    const port = engine.listen(sid, '127.0.0.1', 0);
+    try {
+      const mask = Buffer.from([1, 2, 3, 4]);
+      const payload = Buffer.alloc(100, 0x61);
+      for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+      const frame = Buffer.concat([Buffer.from([0x82, 0x80 | 100]), mask, payload]).toString('latin1');
+      const { seen, closed } = await stillSending(
+        port,
+        `GET /ws HTTP/1.1${CRLF}Host: t${CRLF}Upgrade: websocket${CRLF}Connection: Upgrade${CRLF}` +
+          `Sec-WebSocket-Key: ${crypto.randomBytes(16).toString('base64')}${CRLF}Sec-WebSocket-Version: 13${CRLF}${CRLF}`,
+        frame.repeat(8)
+      );
+      await closed;
+      const text = seen.data.toString('latin1');
+      assert.match(text, /^HTTP\/1\.1 101 /);
+      const frames = Buffer.from(text.slice(text.indexOf(CRLF + CRLF) + 4), 'latin1');
+      assert.equal(frames[0], 0x88, 'a Close frame');
+      assert.equal(frames.readUInt16BE(2), 1001, 'with the code the server gave');
+      assert.equal(seen.error, null, 'no reset');
+      assert.equal(seen.ended, true);
+      assert.deepEqual(closes, [1001]);
+    } finally {
+      engine.close(sid);
+    }
   });
 });

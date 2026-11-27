@@ -19,6 +19,7 @@
 #endif
 #include <memory>
 #include <mutex>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -1350,6 +1351,14 @@ static void Serve(const FunctionCallbackInfo<Value>& args) {
     getNum("wsMaxMessageSize", limits.wsMaxMessageSize, 1);
     getNum("wsBackpressureLimit", limits.wsBackpressureLimit, 0);
     getNum("writeHighWaterMark", limits.writeHighWaterMark, 1);
+    // memoryBudget: bytes the process may hold in buffers for its peers, or
+    // Infinity for no budget. Absent, 0 or anything else: the automatic one.
+    Local<Value> mb;
+    if (opts->Get(ctx, str(iso, "memoryBudget")).ToLocal(&mb) && mb->IsNumber()) {
+      const double d = mb->NumberValue(ctx).FromMaybe(0);
+      if (d >= kMaxLimit) limits.memoryBudget = SIZE_MAX;
+      else if (d >= 1) limits.memoryBudget = static_cast<size_t>(d);
+    }
     Local<Value> bl;
     if (opts->Get(ctx, str(iso, "backlog")).ToLocal(&bl) && bl->IsNumber()) {
       int v = bl->Int32Value(ctx).FromMaybe(0);
@@ -2389,6 +2398,9 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   setCap("bodyText", true);
   // getBodyLent(): the body as an ArrayBuffer released with the request.
   setCap("bodyLent", true);
+  // What all connections hold in buffers together is bounded (the
+  // memoryBudget option, probe().bufferBudget).
+  setCap("bufferBudget", true);
   set("capabilities", caps);
   // The TLS library this binary terminates TLS with: "boringssl" (carried in
   // the addon; `version` is the upstream tag it was pinned to) or "openssl"
@@ -2428,17 +2440,48 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   {
     // The connections this thread's servers hold, and how many of them are
     // at rest (between requests: no parser, no request buffers).
-    size_t open = 0, resting = 0;
+    // And what is kept for the requests to come: request states waiting in
+    // a pool, and the heap storage they hold.
+    size_t open = 0, resting = 0, pooled = 0, pooledBytes = 0;
     for (const auto& entry : threadState().servers) {
       const JsServer* js = entry.second;
       if (js == nullptr || js->server == nullptr) continue;
       open += js->server->openConnections();
       resting += js->server->restingConnections();
+      pooled += js->server->pooledStates();
+      pooledBytes += js->server->pooledBytes();
     }
     Local<Object> conns = Object::New(iso);
     (void)conns->Set(ctx, str(iso, "open"), Number::New(iso, static_cast<double>(open))).FromMaybe(false);
     (void)conns->Set(ctx, str(iso, "resting"), Number::New(iso, static_cast<double>(resting))).FromMaybe(false);
     set("connections", conns);
+    Local<Object> states = Object::New(iso);
+    (void)states->Set(ctx, str(iso, "pooled"), Number::New(iso, static_cast<double>(pooled))).FromMaybe(false);
+    (void)states->Set(ctx, str(iso, "bytes"), Number::New(iso, static_cast<double>(pooledBytes))).FromMaybe(false);
+    set("requestStates", states);
+    // The calling thread's buffer budget: what its connections hold in
+    // buffers for their peers, the thread's share of the process's budget
+    // (Infinity when there is none), and the connections closed for it.
+    const BufferBudget& mem = threadState().budget;
+    Local<Object> budget = Object::New(iso);
+    auto setBudget = [&](const char* k, double v) {
+      (void)budget->Set(ctx, str(iso, k), Number::New(iso, v)).FromMaybe(false);
+    };
+    setBudget("held", static_cast<double>(mem.held));
+    setBudget("limit", mem.limit == SIZE_MAX ? std::numeric_limits<double>::infinity()
+                                             : static_cast<double>(mem.limit));
+    setBudget("shed", static_cast<double>(mem.shed));
+    setBudget("evicted", static_cast<double>(mem.evicted));
+    set("bufferBudget", budget);
+    // The calling thread's loop: turns that ran out of their time slice with
+    // sockets still to serve, and the sockets waiting for a later turn now.
+    uint64_t cut = 0;
+    size_t waiting = 0;
+    Server::sliceStats(cut, waiting);
+    Local<Object> turns = Object::New(iso);
+    (void)turns->Set(ctx, str(iso, "cut"), Number::New(iso, static_cast<double>(cut))).FromMaybe(false);
+    (void)turns->Set(ctx, str(iso, "waiting"), Number::New(iso, static_cast<double>(waiting))).FromMaybe(false);
+    set("turns", turns);
   }
   if (g_countCalls) {
     // Per-thread fast/slow hit counters (MORO_ENGINE_FASTCALL_STATS=1 at load).
