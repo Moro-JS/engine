@@ -14,6 +14,12 @@ echo "text helper unit tests ..."
 $CXX -std=c++20 -O2 "$DIR/text-unit.cpp" -o /tmp/moro_texttest
 /tmp/moro_texttest
 
+# Without exceptions, as the engine is built: libstdc++'s shrink_to_fit does
+# nothing there, which is what src/shrink.h is for.
+echo "shrink unit tests ..."
+$CXX -std=c++20 -O2 -fno-exceptions "$DIR/shrink-unit.cpp" -o /tmp/moro_shrinktest
+/tmp/moro_shrinktest
+
 echo "response-template unit tests ..."
 $CXX -std=c++20 -O2 "$DIR/response-template-unit.cpp" -o /tmp/moro_tpltest
 /tmp/moro_tpltest

@@ -109,7 +109,16 @@ describe('buffer budget: what the probe reports', { skip }, () => {
     const server = serve(echoSize);
     try {
       assert.equal(budget().limit, MiB);
-      assert.deepEqual(Object.keys(budget()).sort(), ['evicted', 'held', 'limit', 'shed']);
+      assert.deepEqual(Object.keys(budget()).sort(), [
+        'connections',
+        'evicted',
+        'held',
+        'limit',
+        'receiveBuffer',
+        'resized',
+        'shed',
+        'sockets',
+      ]);
     } finally {
       server.close();
     }
@@ -394,7 +403,17 @@ describe('buffer budget: responses a peer does not read', { skip }, () => {
       }
       assert.ok(budget().held > 4 * MiB, `the responses held are counted: ${budget().held}`);
       assert.equal(budget().shed, before.shed, 'no session is closed where its responses are held');
-      await waitFor(() => budget().evicted >= before.evicted + 6 && closed >= 6, 'the sessions that open no window are closed at the sweep', 6000);
+      // 12 MiB against a share of 4. Which rule gets there first depends on
+      // the clock: the sweep closes every session that has moved nothing
+      // while the thread is nearly out of room, all six; the look a thread
+      // at twice its share takes four times a second (1.2.5) closes the ones
+      // owed most until the thread is within its share again, five of them,
+      // and the sixth then holds 2 MiB of a share with room in it.
+      await waitFor(
+        () => budget().evicted >= before.evicted + 5 && closed >= 5 && budget().held <= budget().limit,
+        'the sessions that open no window are closed until the thread is within its share',
+        6000
+      );
     } finally {
       for (const s of sessions) s.destroy();
       server.close();

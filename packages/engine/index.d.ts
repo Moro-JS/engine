@@ -75,6 +75,12 @@ export interface EngineCapabilities {
   /** 1.2.4: what all connections hold in buffers together is bounded (the
    *  memoryBudget option, probe().bufferBudget). */
   bufferBudget: boolean;
+  /** 1.2.5, Linux: the kernel receive buffers of a thread's connections are
+   *  held to a budget as well - twice the thread's buffer budget - once it
+   *  has more connections than fit in it with the system's buffer each (see
+   *  the memoryBudget option, probe().bufferBudget). False on macOS and
+   *  Windows; engines before 1.2.5 do not report it. */
+  socketBudget: boolean;
   /** Engine-side upgrades (setWsAutoUpgrade) are safe together with batched
    *  dispatch (onRequestBatch). Engines 1.1.15 to 1.1.21 report
    *  wsAutoUpgrade and batchDispatch without this flag and must not be given
@@ -198,8 +204,23 @@ export interface EngineProbeResult {
    *  closed because the thread had no room for the requests they were
    *  sending. `evicted`: connections closed at the sweep, while it had none,
    *  for requests or unread responses of which nothing had moved for a sweep
-   *  interval. Absent on engines before 1.2.4. */
-  bufferBudget?: { held: number; limit: number; shed: number; evicted: number };
+   *  interval. Absent on engines before 1.2.4.
+   *  1.2.5 (capabilities.socketBudget) adds the socket budget's figures.
+   *  `connections`: open connections of the thread's servers. `sockets`: the
+   *  thread's share for what the kernel queues for them to read, Infinity
+   *  when there is none. `receiveBuffer`: the size each connection's kernel
+   *  receive buffer is held to now, 0 while the system's own fits (always 0
+   *  off Linux). `resized`: times a connection's buffer was set. */
+  bufferBudget?: {
+    held: number;
+    limit: number;
+    shed: number;
+    evicted: number;
+    connections?: number;
+    sockets?: number;
+    receiveBuffer?: number;
+    resized?: number;
+  };
   /** 1.2.4: the calling thread's event loop under load (epoll transport;
    *  zeros elsewhere). `cut`: loop turns that used up their time slice with
    *  sockets still to serve. `waiting`: sockets waiting for a later turn
@@ -303,7 +324,24 @@ export interface ServeOptions {
    *  are closed (for a response, the kernel's count of unacknowledged output
    *  is asked too on Linux and macOS, so a slow reader is not taken for one
    *  that has stopped). Unset or 0: an eighth of the memory the process may use
-   *  (its cgroup limit, or the machine's). Infinity: no budget. */
+   *  (its cgroup limit, or the machine's). Infinity: no budget.
+   *  1.2.5: on a thread over its share, a connection's further requests wait
+   *  once it has 16 KiB of responses it has not taken (its part of half the
+   *  share on a thread with more connections than that half has 16 KiB for,
+   *  4 KiB at the least), where the write high-water mark applies otherwise.
+   *  And while a thread holds twice its share, a connection owed more than
+   *  that which has taken nothing for half a second - no acknowledgment, no
+   *  HTTP/2 window opened - is closed, the one owed most first, until the
+   *  thread is within its share again.
+   *  1.2.5, Linux (capabilities.socketBudget): twice this budget is what the
+   *  kernel may queue for the connections to read. While a thread's
+   *  connections fit in its share of that with the receive buffer the system
+   *  gives a socket (128 KiB), nothing is set. Past that, each connection's
+   *  receive buffer is set to its part, a power of two from 64 KiB down to
+   *  16 KiB, and raised again when the thread has room. A request that fits
+   *  the buffer is served as before; a larger body from a peer on the
+   *  loopback interface arrives a buffer at a time, about five a second,
+   *  while the thread is that crowded. Infinity: no socket budget either. */
   memoryBudget?: number;
   /** Budget in ms for receiving one complete request (head + body), measured
    *  from its first byte. Unlike idleTimeoutMs it does NOT reset on activity,

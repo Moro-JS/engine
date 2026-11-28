@@ -53,7 +53,9 @@ serve(callbacks: {
   memoryBudget?: number;       // 1.2.4 (capabilities.bufferBudget). Bytes the PROCESS may hold in
                                // buffers for its peers, all connections of all servers together.
                                // Default: an eighth of the memory the process may use (its cgroup
-                               // limit, or the machine's). Infinity = no budget. See "Memory"
+                               // limit, or the machine's). Infinity = no budget. See "Memory".
+                               // 1.2.5, Linux: twice this is what the kernel may queue for the
+                               // connections to read (see "The socket budget")
   reusePort?: boolean;         // default false. SO_REUSEPORT so several engine instances
                                // (cluster workers / worker threads) share one port with
                                // kernel-balanced accepts. POSIX only; ignored on Windows.
@@ -261,6 +263,8 @@ endWith(reqId, chunk: string | ArrayBuffer | Uint8Array | Buffer): void; // exac
 //     memoryTrim: boolean,      // trimMemory() exists
 //     restingConnections: boolean, // a connection between requests holds no parser or request buffers
 //     bufferBudget: boolean,    // 1.2.4: the memoryBudget option and probe().bufferBudget (see "Memory")
+//     socketBudget: boolean,    // 1.2.5: kernel receive buffers are held to a budget too (Linux; see
+//                               // "The socket budget")
 //     idleSparesDrainingResponse: boolean, // idleTimeoutMs never closes a connection whose response is
 //                               // still being written to a peer that reads it (responseTimeoutMs governs
 //                               // that). Without the flag (before 1.2.0) a response given before the
@@ -279,6 +283,10 @@ endWith(reqId, chunk: string | ArrayBuffer | Uint8Array | Buffer): void; // exac
 //                               // its connections hold in buffers for their peers, the thread's
 //                               // share of memoryBudget (Infinity when there is none), and the
 //                               // connections closed for it (see "Memory")
+//   + { connections, sockets, receiveBuffer, resized } - 1.2.5: the thread's open connections,
+//                               // its share for what the kernel queues for them, the size each
+//                               // one's receive buffer is held to now (0: the system's own) and
+//                               // how often a buffer was set (see "The socket budget")
 // turns: { cut, waiting } - 1.2.4: the calling thread's loop under load: turns that used up their
 //                               // time slice, and sockets waiting for a later turn now (see "A
 //                               // loop that falls behind"); zeros unless the transport is epoll
@@ -800,6 +808,82 @@ state has kept from earlier requests (`probe().requestStates`), which is the
 engine's and not a peer's doing. Nothing is paid for the budget on the path
 of a request that is answered within the read that brought it: such a
 connection is at rest when the read ends and has nothing counted.
+
+**Responses nobody reads** (1.2.5). Response bytes close nothing where they
+are queued, and the sweep's rule above needs two sweep intervals in which
+the connection moved nothing in either direction - seconds, and never for a
+peer that keeps sending. A request of a hundred bytes can ask for a megabyte,
+so that is not a bound on a thread whose peers ask and do not read. While a
+thread holds twice its share, the engine therefore looks four times a second
+at every connection owed more than it may always hold, and closes the ones
+whose peer has taken nothing at two looks running - no write completed, no
+byte of its queue acknowledged (the engine's queue plus the kernel's send
+queue), no held-back HTTP/2 bytes sent because a window opened - the one
+owed most first, until the thread is within its share again. What the peer
+sends does not count, and on a connection with responses behind a window a
+completed write does not either. A peer that reads, at any speed, is not
+closed; below twice the share none of this runs. They are counted in
+`probe().bufferBudget.evicted`.
+
+On a thread over its share, a connection's further requests wait once it has
+that much response it has not taken, where the write high-water mark applies
+otherwise. "That much" is 16 KiB, and each connection's part of half the
+thread's share when the thread has more connections than that half has
+16 KiB for, 4 KiB at the least: with the default budget in a 4 GiB container
+and two threads, 16 KiB up to 8,192 connections a thread and 8 KiB at
+16,384. Nothing is refused by it: a request of up to 16 KiB is never refused
+for the budget, whatever the crowd.
+
+**The socket budget** (`capabilities.socketBudget`, 1.2.5, Linux). The buffer
+budget counts what the engine has read. What it has not read yet is in the
+kernel: every connection has a receive buffer there, 128 KiB to begin with
+at Linux defaults, the peer decides how full it is, and the memory is
+charged to the process's cgroup like its own. Peers that send faster than a
+server reads keep those buffers full, so it is the number of connections,
+and nothing they are allowed to send, that decides how much that is: 32,768
+of them can hold 4 GiB. The kernel does not refuse the packet that fills the
+cgroup; the process is killed at its next page fault.
+
+So the receive buffers of a thread's connections have a budget as well:
+twice the thread's buffer budget, which is a quarter of the memory the
+process may use unless `memoryBudget` is set, divided among the threads
+that serve.
+
+- While a thread's connections fit in it with the system's buffer each,
+  nothing is done: no socket option is set, and the kernel sizes every
+  buffer itself as it does for any server. In a 4 GiB container that is up
+  to 8,192 connections; with 64 GiB, 131,072.
+- Past that, each connection's receive buffer is set (`SO_RCVBUF`) to its
+  part of the budget: the largest power of two that fits, 64 KiB at most and
+  16 KiB at least. A new connection gets it when it is accepted; the ones
+  already open get it at the accept that halves the part, or at the sweep.
+  The peer is told of a smaller window and sends less.
+- When connections have gone and there is room again, the buffers that were
+  set are raised at the sweep, and with no crowd left to 128 KiB. (A buffer
+  that has been set is no longer resized by the kernel, so such a
+  connection keeps 128 KiB for the rest of its life, where one never
+  touched may grow to the system's maximum under a fast upload.)
+
+What a crowded thread's connections pay is the speed of a body larger than
+the buffer, from a peer whose TCP segments are larger than the buffer, which
+means a peer on the loopback interface (64 KiB segments): a sender does not
+split a segment to fit a window, it waits for its probe timer, and the body
+arrives one buffer at a time, about five a second. Measured there, a 1 MiB
+body through 32 KiB buffers took 6.7 s and through 16 KiB buffers 13 s; a
+body that fits the buffer, and any body at 64 KiB or with the system's
+buffer, arrived at once. Peers on a network send segments of 1.5 KiB and are
+not paced this way. A reverse proxy on the same host is a loopback peer, but
+its connections are few, and buffers go below 64 KiB only past four
+connections per MiB of the process's memory. (Measured on Linux 6.12.)
+
+`memoryBudget` is the one setting: a number moves both budgets (the socket
+budget is twice it), `Infinity` turns both off. `probe().bufferBudget`
+reports `connections` (the thread's), `sockets` (its share, `Infinity`
+without one), `receiveBuffer` (what each connection's buffer is held to now,
+0 while the system's own fits) and `resized` (how often a buffer was set).
+The bound is conns x 16 KiB at the least, so past 16 KiB per connection of
+the budget it is `maxConnections` that bounds what the kernel holds. On
+macOS and Windows nothing is set and `receiveBuffer` is always 0.
 
 **`trimMemory()`** (`capabilities.memoryTrim`, 1.2.3) gives back what an
 isolate's start-up left behind: one memory-reducing collection of the calling

@@ -44,6 +44,7 @@
 #include "http2.h"
 #include "http_parser.h"
 #include "response_template.h"
+#include "shrink.h"
 #include "text.h"
 #include "thread_state.h"
 #include "tls.h"
@@ -399,6 +400,13 @@ struct Connection {
   // On Server::restQueue_: came to rest where its state could not be given
   // back yet (a response completed outside a read).
   bool restQueued = false;
+  // (These two sit in what was padding: the structure is no larger for them.)
+  // log2 of the size the socket's receive buffer was last set to, 0 while it
+  // is the system's own (Server, "Socket budget").
+  uint8_t rcvExp = 0;
+  // A write of this connection's has completed since its thread last looked
+  // at who is taking their responses (Server::onPress).
+  bool outMoved = false;
   // The kernel's count of this connection's output not yet acknowledged by
   // the peer, as the sweep numbered unsentSweep found it (Server::onSweep,
   // tKernelUnsent): looked at for a connection the stall rule is about to
@@ -714,6 +722,17 @@ class Server {
   // probe().turns, for the calling thread's loop: loop turns that ended with
   // sockets still to serve (EpollLoop, "time slice"), and how many sockets
   // are waiting for a later turn now. Zero where the transport is not epoll.
+  // What a connection of the calling thread may have as a receive buffer now
+  // (bytes; 0 while the system's own fits). See "Socket budget".
+  static size_t receiveBufferNow(const BufferBudget& m) {
+#if defined(__linux__)
+    const uint8_t e = rcvTarget(m);
+    return e == 0 ? 0 : size_t{1} << e;
+#else
+    (void)m;
+    return 0;
+#endif
+  }
   static void sliceStats(uint64_t& cut, size_t& waiting) {
     cut = 0;
     waiting = 0;
@@ -880,6 +899,13 @@ class Server {
       uv_timer_start(&sweepTimer_, onSweep, sweepMs_, sweepMs_);
       sweepActive_ = true;
       liveHandles_++;  // the sweep timer is now a live uv handle
+      // The press clock ("Unread responses, far over the budget"): made here,
+      // started only while the thread holds kPressAt times its share.
+      pressTimer_.data = this;
+      uv_timer_init(loop_, &pressTimer_);
+      uv_unref(reinterpret_cast<uv_handle_t*>(&pressTimer_));
+      pressInit_ = true;
+      liveHandles_++;
     }
 
     // Resolve the actual bound port (supports port 0). Read the big-endian port bytes directly instead of ntohs(), which would drag ws2_32.lib (Winsock) into the Windows link for a trivial byte swap.
@@ -934,6 +960,13 @@ class Server {
       sweepActive_ = false;
       uv_timer_stop(&sweepTimer_);
       uv_close(reinterpret_cast<uv_handle_t*>(&sweepTimer_), onServerHandleClosed);
+    }
+    if (pressInit_) {
+      pressInit_ = false;
+      pressOn_ = false;
+      pressSeen_.clear();
+      uv_timer_stop(&pressTimer_);
+      uv_close(reinterpret_cast<uv_handle_t*>(&pressTimer_), onServerHandleClosed);
     }
     // Streams stopped for this turn are closed below with every other
     // connection; nothing starts them again.
@@ -2382,6 +2415,15 @@ class Server {
 
   // Queued (owned) write: WriteReq holds the bytes until uv flushes them.
   void queueWrite(Connection* c, std::string&& data, bool terminal) {
+    // A buffer that reaches the queue stays allocated until the peer has
+    // taken what is in it, and the storage it was built in is often far
+    // larger than that - a cork buffer grown by doubling, or one whose sent
+    // part was erased. The budget counts the bytes (tOutputHeld), so the
+    // allocation is brought down to them: measured under a flood of
+    // pipelined requests nobody read the answers to, queued writes were 549
+    // MiB allocated for 284 MiB counted on each thread. A copy of what is
+    // queued, on the path of a socket that is full.
+    if (data.capacity() - data.size() > data.size() / 4 + 256) shrinkToFit(data);
     WriteReq* wr = new WriteReq{};
     wr->conn = c;
     wr->data = std::move(data);
@@ -2456,6 +2498,7 @@ class Server {
     c->writeTicks = 0;           // a write completed: the drain made progress
     c->lastWriteQueue = SIZE_MAX;  // re-baseline at the next sweep
     c->stallTicks = 0;
+    c->outMoved = true;
     if (c->held != 0) noteHeld(c);
 
     if (status != 0) {
@@ -2484,8 +2527,19 @@ class Server {
   // next request: a peer that pipelines requests and reads nothing would
   // otherwise have every one of them answered into memory. One field read
   // when nothing is queued.
+  // While the thread is over its buffer budget the mark is what every
+  // connection may always hold (heldFree), not the write high-water mark:
+  // a thread that has no room left does not answer further requests into
+  // memory for a peer that has not taken the answers it already has. A peer
+  // that reads is below either mark and is not held.
   bool outputBacklogged(Connection* c) {
-    return c->pendingWrites > 0 && tOutputHeld(c) >= limits_.writeHighWaterMark;
+    if (c->pendingWrites == 0) return false;
+    size_t mark = limits_.writeHighWaterMark;
+    if (mem_->held > mem_->limit) [[unlikely]] {
+      const size_t free = heldFree();
+      if (mark > free) mark = free;
+    }
+    return tOutputHeld(c) >= mark;
   }
 
   // ... and when it is, the connection's request intake is held (outHeld):
@@ -4089,15 +4143,33 @@ class Server {
   // bound on memory, and what does not fit is told so at once.
   static constexpr size_t kHeldFree = 16 * 1024;
   static constexpr size_t kHeldStale = 4 * 1024;
+  // What a connection may have waiting of responses it has not taken, on a
+  // thread over its share, before no more of its requests are answered
+  // (outputBacklogged) and before it is one the press clock looks at
+  // (onPress): kHeldFree, 16 KiB. That is a sum over connections like every
+  // per-connection limit - 32,768 connections with 16 KiB each are 512 MiB
+  // that no budget has agreed to - so on a thread with more connections than
+  // half its share has 16 KiB for, each one's part of that half is the
+  // figure, and 4 KiB at the least. It makes a connection wait sooner and
+  // refuses nothing: what a connection may send before it can be refused
+  // (account) stays kHeldFree whatever the crowd, since a request head of
+  // ten kilobytes is an ordinary one. (Asked only while a thread is over its
+  // share: a division on that path, nothing on any other.)
+  static constexpr size_t kHeldLeast = 4 * 1024;
+  size_t heldFree() const {
+    const BufferBudget& m = *mem_;
+    if (m.conns == 0) return kHeldFree;
+    const size_t each = m.limit / m.conns / 2;
+    return each >= kHeldFree ? kHeldFree : (each > kHeldLeast ? each : kHeldLeast);
+  }
   // The automatic budget: this fraction of the memory the process may use.
   // It bounds the engine's own buffers, and those are not all a buffered
   // byte costs: a body handed to a handler is copied for JS, the allocator
   // keeps what it was given, and every socket the loop has not got to holds
-  // a receive buffer in the kernel that nothing here can bound (some 50 KiB
-  // at Linux defaults - 1.8 GiB measured for 32,768 flooding connections). A
-  // quarter left a 4 GiB container at up to 3.1 GiB under those floods, with
-  // a worst case past its limit; an eighth leaves room for what is not
-  // counted (2.5 GiB at the most, measured the same way).
+  // a receive buffer in the kernel, which has a bound of its own ("Socket
+  // budget", below). A quarter left a 4 GiB container at up to 3.1 GiB under
+  // floods of 32,768 connections, with a worst case past its limit; an
+  // eighth leaves room for what is not counted.
   static constexpr size_t kBudgetShare = 8;
 
   // The memory the process may use: its cgroup's limit when there is one
@@ -4140,6 +4212,8 @@ class Server {
     m.asked = 0;
     m.floor = 0;
     m.limit = SIZE_MAX;
+    m.sockets = SIZE_MAX;
+    m.roomy = UINT32_MAX;
   }
   // The thread's share, from the figures as they are now: the other threads
   // of a cluster start one after another, and each sweep looks again.
@@ -4148,13 +4222,229 @@ class Server {
     const size_t all = m.asked != 0 ? m.asked : processMemory() / kBudgetShare;
     if (all == SIZE_MAX || all == 0) {
       m.limit = SIZE_MAX;
+      m.sockets = SIZE_MAX;
+      m.roomy = UINT32_MAX;
       return;
     }
     uint32_t threads = budgetThreads().load(std::memory_order_relaxed);
     if (threads == 0) threads = 1;
     const size_t share = all / threads;
     m.limit = share > m.floor ? share : m.floor;
+#if defined(__linux__)
+    // The socket budget is kSocketFactor times the buffer budget, divided the
+    // same way; `roomy` is the connections that fit in it with the receive
+    // buffer the system gives a socket.
+    m.sockets = share > SIZE_MAX / kSocketFactor ? SIZE_MAX : share * kSocketFactor;
+    const size_t fit = m.sockets / systemRcvBuf();
+    m.roomy = fit > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(fit);
+#endif
   }
+
+  // ---- Unread responses, far over the budget -------------------------------
+  //
+  // Response bytes close nothing where they are queued (account), and the
+  // sweep closes a connection that holds them without moving - two sweeps
+  // on, which is seconds at the default timeouts, and not at all while the
+  // peer keeps sending: a read counts as moving there. That is right for a
+  // thread that is a little short. It is not a bound: a request of a hundred
+  // bytes can ask for a megabyte, peers that ask and never read (or open no
+  // HTTP/2 window) are answered into memory at the rate the handlers
+  // produce, and 32,768 of them had a 4 GiB container at 3.5 GiB of held
+  // responses within ten seconds, where the share of its two threads was
+  // 0.5 GiB together.
+  //
+  // So while a thread holds kPressAt times its share, a clock of kPressMs
+  // looks at every connection that is owed more than kHeldFree and asks one
+  // thing of it: has its peer taken anything since the last look. Taken is a
+  // write that completed, an engine queue plus kernel send queue that is
+  // smaller than it was (tKernelUnsent: what the peer has acknowledged), or
+  // held-back HTTP/2 bytes that went out because a window opened. What the
+  // peer sends is not asked, and on a connection with responses behind a
+  // window, neither is a completed write: its HEADERS and its PING answers
+  // complete whether or not it ever opens one. A connection that has taken
+  // nothing for two looks running is closed, the one owed most first, until
+  // the thread is back within its share; then the clock stops.
+  //
+  // A peer that is reading - at any speed that acknowledges a segment in
+  // half a second - is never among them, and below kPressAt times the share
+  // nothing of this runs: the sweep's rule is the only one there, as before.
+  static constexpr size_t kPressAt = 2;
+  static constexpr uint64_t kPressMs = 250;
+  struct PressSeen {
+    size_t out = 0;      // engine queue + kernel send queue at the last look
+    uint64_t sent = 0;   // h2::Session::heldSent at the last look
+    uint8_t looks = 0;   // looks running at which nothing had been taken
+  };
+  void pressStart() {
+    if (pressOn_ || !pressInit_ || closeRequested_) return;
+    pressOn_ = true;
+    uv_timer_start(&pressTimer_, onPress, kPressMs, kPressMs);
+  }
+  static void onPress(uv_timer_t* timer) {
+    Server* s = static_cast<Server*>(timer->data);
+    BufferBudget& mem = *s->mem_;
+    if (mem.held <= mem.limit || s->closeRequested_) {
+      s->pressOn_ = false;
+      s->pressSeen_.clear();
+      uv_timer_stop(timer);
+      return;
+    }
+    std::unordered_map<Connection*, PressSeen> seen;
+    std::vector<std::pair<size_t, Connection*>> stuck;
+    const size_t free = s->heldFree();
+    for (Connection* c : s->conns_) {
+      const bool wrote = c->outMoved;
+      c->outMoved = false;
+      if (c->closing) continue;
+      const size_t owes = s->owed(c);
+      if (owes <= free) continue;
+      PressSeen now;
+      if (c->pendingWrites > 0) {
+        const int64_t unsent = s->tKernelUnsent(c);
+        now.out = s->tPendingBytes(c) + (unsent > 0 ? static_cast<size_t>(unsent) : 0);
+      }
+      const bool behindWindow = c->h2 != nullptr && c->h2->anyBlocked();
+      if (c->h2 != nullptr) now.sent = c->h2->heldSent();
+      const auto was = s->pressSeen_.find(c);
+      const bool taken = was == s->pressSeen_.end() || now.sent != was->second.sent ||
+                         now.out < was->second.out || (wrote && !behindWindow);
+      if (!taken) {
+        now.looks = static_cast<uint8_t>(was->second.looks + 1);
+        if (now.looks >= 2) stuck.emplace_back(owes, c);
+      }
+      seen.emplace(c, now);
+    }
+    s->pressSeen_.swap(seen);
+    if (stuck.empty()) return;
+    std::sort(stuck.begin(), stuck.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (const auto& [owes, c] : stuck) {
+      if (mem.held <= mem.limit || s->closeRequested_) break;
+      // Closing one runs application code (onAborted, a WebSocket's close),
+      // which may have closed others of the list.
+      if (s->conns_.find(c) == s->conns_.end() || c->closing) continue;
+      mem.evicted++;
+      if (c->isWebSocket) s->wsGone(c);
+      s->doClose(c);
+    }
+  }
+
+  // ---- Socket budget ------------------------------------------------------
+  //
+  // What the buffer budget counts is what the engine has read. What it has
+  // not read yet is in the kernel: every connection has a receive buffer
+  // there, 128 KiB to begin with at Linux defaults, the peer decides how full
+  // it is, and the memory is charged to the process's cgroup like its own.
+  // A server reads a socket when its turn comes, so peers that send faster
+  // than it reads keep those buffers full, and it is the number of
+  // connections, not anything they are allowed to send, that decides how
+  // much that is: 32,768 of them hold 4 GiB. Measured that way in a 4 GiB
+  // container, 2.9 GiB of a 3.5 GiB peak was socket memory while the engine
+  // and the runtime together held 0.5 GiB - and the kernel does not refuse
+  // the next packet when the cgroup is full, it kills the process at its
+  // next page fault.
+  //
+  // So the receive buffers of a thread's connections have a budget too: twice
+  // its buffer budget (a quarter of the process's memory by default,
+  // divided among the threads like the other). While the connections a
+  // thread has fit in it with the system's buffer each, nothing is done and
+  // no socket option is set: the kernel sizes each buffer itself, as it does
+  // for any server. Past that, each connection's buffer is set (SO_RCVBUF)
+  // to its part of the budget, the largest power of two that fits and never
+  // below 16 KiB: at accept for a new connection, and for the ones already
+  // open when the part has halved (at the accept that halved it) or at the
+  // sweep. A buffer made smaller keeps what is in it; the peer is told of a
+  // smaller window and sends less.
+  //
+  // What that costs is the speed of a body larger than the buffer, on a
+  // crowded thread, from a peer whose segments are larger than the buffer -
+  // which is a peer on the loopback interface (segments of 64 KiB) and no
+  // other: a sender does not split a segment to fit a window, it waits for
+  // its probe timer, and the body arrives a buffer at a time, five times a
+  // second (1 MiB through 32 KiB buffers in 6.7 s, measured; at once through
+  // 64 KiB or the system's own). Requests that fit the buffer, and peers on
+  // a network (segments of 1.5 KiB), are served as before.
+  //
+  // A socket whose buffer has been set is no longer sized by the kernel, so
+  // when the thread has room again its buffer is raised again at the sweep -
+  // one step short of what fits, so that a count moving about a boundary
+  // does not set every socket at every sweep - and with no crowd at all to
+  // 128 KiB, where it stays for the rest of the connection.
+  //
+  // Linux only: it is where the memory is charged, and what SO_RCVBUF means
+  // differs elsewhere. memoryBudget: Infinity turns this off with the rest.
+  static constexpr size_t kSocketFactor = 2;
+  static constexpr uint8_t kRcvExpMin = 14;   // 16 KiB
+  static constexpr uint8_t kRcvExpOpen = 17;  // 128 KiB: the most a buffer is set to
+#if defined(__linux__)
+  // The receive buffer the system gives a TCP socket (tcp_rmem's middle
+  // figure; the network namespace's own inside a container).
+  static size_t systemRcvBuf() {
+    static const size_t bytes = [] {
+      size_t v = 131072;
+      if (FILE* f = ::fopen("/proc/sys/net/ipv4/tcp_rmem", "re")) {
+        unsigned long lo = 0, def = 0;
+        if (::fscanf(f, "%lu %lu", &lo, &def) == 2 && def >= 4096) v = def;
+        ::fclose(f);
+      }
+      return v;
+    }();
+    return bytes;
+  }
+  // The receive buffer a connection of the thread may have as it stands, as
+  // a power of two; 0 while the system's own fits.
+  static uint8_t rcvTarget(const BufferBudget& m) {
+    if (m.conns <= m.roomy) return 0;
+    const size_t each = m.sockets / m.conns;
+    uint8_t e = kRcvExpMin;
+    while (e < kRcvExpOpen && (size_t{2} << e) <= each) e++;
+    return e;
+  }
+  int socketFd(Connection* c) {
+    if (kind_ == TransportKind::Uring) return c->ring.fd;
+    if (kind_ == TransportKind::Epoll) return c->ep.fd;
+    uv_os_fd_t ofd;
+    return uv_fileno(reinterpret_cast<uv_handle_t*>(&c->handle), &ofd) == 0 ? static_cast<int>(ofd) : -1;
+  }
+  void setRcv(Connection* c, uint8_t e) {
+    const int fd = socketFd(c);
+    if (fd < 0) return;
+    const int half = static_cast<int>((size_t{1} << e) / 2);  // the kernel doubles what it is given
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &half, sizeof(half));
+    c->rcvExp = e;
+    mem_->resized++;
+  }
+  // Every connection of this server whose buffer is larger than 2^e, or the
+  // system's own, is given 2^e.
+  MORO_NOINLINE void fitSockets(uint8_t e) {
+    rcvExp_ = e;
+    for (Connection* c : conns_) {
+      if (c->closing || (c->rcvExp != 0 && c->rcvExp <= e)) continue;
+      setRcv(c, e);
+    }
+  }
+  // The sweep's look at one socket whose buffer is not what the thread's
+  // connections may have now (2^now; 0 with no crowd): made smaller when it
+  // is larger than that or the system's own, raised when two steps of room
+  // have opened - with no crowd, back to kRcvExpOpen.
+  MORO_NOINLINE void refit(Connection* c, uint8_t now) {
+    if (c->rcvExp == 0 || (now != 0 && c->rcvExp > now)) {
+      setRcv(c, now);  // now != 0 here: rcvExp == 0 == now does not reach this
+      return;
+    }
+    const uint8_t room = now == 0 ? kRcvExpOpen + 1 : now;
+    if (c->rcvExp + 2 <= room) setRcv(c, room - 1);
+  }
+  // A connection accepted on a thread with more of them than fit.
+  MORO_NOINLINE void crowded(Connection* c) {
+    const uint8_t e = rcvTarget(*mem_);
+    if (e == 0) return;
+    if (rcvExp_ == 0 || e < rcvExp_) {
+      fitSockets(e);  // c is among them
+      return;
+    }
+    setRcv(c, e);
+  }
+#endif
 
   // What `c` holds in buffers for its peer (see above). A handful of loads:
   // capacities, which is what is allocated, not sizes.
@@ -4211,6 +4501,7 @@ class Server {
     heldSum_ += now - was;
     c->held = now;
     c->counted = now != 0;
+    if (mem_->held > mem_->limit && !pressOn_ && mem_->held / kPressAt > mem_->limit) [[unlikely]] pressStart();
   }
   // Where a connection's read ends, on a clean stack: a connection whose
   // requests still arriving do not fit is the one that goes. That is decided
@@ -4339,6 +4630,10 @@ class Server {
     conns_.insert(c);
     c->resting = true;
     resting_++;
+    mem_->conns++;
+#if defined(__linux__)
+    if (mem_->conns > mem_->roomy) [[unlikely]] crowded(c);
+#endif
   }
 
   static void onAlloc(uv_handle_t* handle, size_t suggested, uv_buf_t* buf) {
@@ -5407,6 +5702,8 @@ class Server {
     // closed a second time here (libuv aborts on a handle closed twice).
     if (tIsClosing(c)) return;
     conns_.erase(c);
+    mem_->conns--;
+    if (!pressSeen_.empty()) pressSeen_.erase(c);
     if (c->resting) {
       c->resting = false;
       resting_--;
@@ -5551,6 +5848,14 @@ class Server {
     BufferBudget& mem = *s->mem_;
     s->rebudget();
     s->sweepSeq_++;
+    if (mem.held > mem.limit && mem.held / kPressAt > mem.limit) s->pressStart();
+#if defined(__linux__)
+    // The socket budget: in the pass below, a receive buffer larger than
+    // the thread's connections may have now is made smaller, and one that
+    // may be larger again is raised ("Socket budget").
+    const uint8_t rcvNow = rcvTarget(mem);
+    s->rcvExp_ = rcvNow;
+#endif
     const bool pressed = mem.held > mem.limit - mem.limit / 8;
     size_t heldSum = 0;
     for (Connection* c : s->conns_) {
@@ -5570,6 +5875,7 @@ class Server {
         heldSum += c->held;
       }
 #if defined(__linux__)
+      if (c->rcvExp != rcvNow) [[unlikely]] s->refit(c, rcvNow);
       if (s->kind_ == TransportKind::Uring) s->uringCheckPeer(c);
 #endif
       // Lingering close (closeAfterResponse): the peer has our FIN and owes
@@ -8026,6 +8332,25 @@ class Server {
   // (writeError) and epollCompleteWrites acts on it in the same loop turn,
   // on a clean stack: where the uv and uring transports deliver a failed
   // write. Until then the queue only collects what is written to it.
+  // The socket took part of a queued write and no more. The part it took
+  // stays allocated with the rest until the whole write has gone, and for a
+  // peer that has stopped reading that is for as long as the connection
+  // lives: the first buffers of its queue went into the kernel's send
+  // buffer, and the write they were the front of sits at the head with a
+  // few kilobytes left to send (12 KiB a connection, measured under a flood
+  // of pipelined requests nobody read the answers to - as much as the bytes
+  // the budget counted for those queues). So when at least half of a write
+  // has gone and what is left is small, what is left is kept and the rest
+  // given back: one copy of at most 64 KiB, and a write is at most halved
+  // each time. A large remainder is left alone - a body being downloaded is
+  // not moved every time the socket fills.
+  static void epollCompactSent(WriteReq* wr) {
+    const size_t left = wr->data.size() - wr->sent;
+    if (wr->sent < 4096 || left > 65536 || left > wr->sent) return;
+    wr->data.erase(0, wr->sent);
+    shrinkToFit(wr->data);
+    wr->sent = 0;
+  }
   void epollFlush(Connection* c) {
     if (c->ep.state >= 2 || c->ep.inFlush || c->ep.writeError) return;
     c->ep.inFlush = true;
@@ -8049,6 +8374,7 @@ class Server {
       wr->sent += static_cast<size_t>(r);
       c->ep.pendingBytes -= static_cast<size_t>(r) < c->ep.pendingBytes ? static_cast<size_t>(r) : c->ep.pendingBytes;
       if (wr->sent < wr->data.size()) {
+        epollCompactSent(wr);
         epollWantOut(c, true);
         break;
       }
@@ -8296,6 +8622,11 @@ class Server {
   BufferBudget* const mem_ = &threadState().budget;  // the calling thread's buffer budget
   size_t heldSum_ = 0;                 // Connection::held over this server's connections
   bool budgetJoined_ = false;          // counted in mem_->servers
+  uint8_t rcvExp_ = 0;                 // what this server's sockets were last fitted to ("Socket budget"; 0: nothing)
+  uv_timer_t pressTimer_;              // "Unread responses, far over the budget"
+  bool pressInit_ = false;             // ...made (listen), to be closed with the server
+  bool pressOn_ = false;               // ...running
+  std::unordered_map<Connection*, PressSeen> pressSeen_;  // what the last look found, per connection owed more than kHeldFree
   Connection* reading_ = nullptr;      // the connection whose read is on the stack
 
   // HTTP/2 (see the "HTTP/2" section).

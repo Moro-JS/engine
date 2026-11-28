@@ -2401,6 +2401,13 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
   // What all connections hold in buffers together is bounded (the
   // memoryBudget option, probe().bufferBudget).
   setCap("bufferBudget", true);
+  // The receive buffers of a crowded thread's connections are held to a
+  // budget of their own (Server, "Socket budget"; Linux).
+#if defined(__linux__)
+  setCap("socketBudget", true);
+#else
+  setCap("socketBudget", false);
+#endif
   set("capabilities", caps);
   // The TLS library this binary terminates TLS with: "boringssl" (carried in
   // the addon; `version` is the upstream tag it was pinned to) or "openssl"
@@ -2472,6 +2479,14 @@ static void Probe(const FunctionCallbackInfo<Value>& args) {
                                              : static_cast<double>(mem.limit));
     setBudget("shed", static_cast<double>(mem.shed));
     setBudget("evicted", static_cast<double>(mem.evicted));
+    // The socket budget: the thread's open connections, its share for what
+    // the kernel queues for them, and the receive buffer each may have now
+    // (0 while the system's own fits).
+    setBudget("connections", static_cast<double>(mem.conns));
+    setBudget("sockets", mem.sockets == SIZE_MAX ? std::numeric_limits<double>::infinity()
+                                                 : static_cast<double>(mem.sockets));
+    setBudget("receiveBuffer", static_cast<double>(Server::receiveBufferNow(mem)));
+    setBudget("resized", static_cast<double>(mem.resized));
     set("bufferBudget", budget);
     // The calling thread's loop: turns that ran out of their time slice with
     // sockets still to serve, and the sockets waiting for a later turn now.

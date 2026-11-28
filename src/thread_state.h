@@ -43,6 +43,12 @@ struct BufferBudget {
   uint32_t servers = 0;      // listening servers of this thread
   uint64_t shed = 0;         // connections closed because the thread had no room for what they sent
   uint64_t evicted = 0;      // connections closed, while the thread had no room, for holding what they would not move
+  // The socket budget (Server, "Socket budget"): what the kernel may queue for
+  // the thread's connections to read.
+  size_t sockets = SIZE_MAX;     // the thread's share
+  uint32_t roomy = UINT32_MAX;   // the connections that fit in it with the system's receive buffer each
+  uint32_t conns = 0;            // open connections of the thread's servers
+  uint64_t resized = 0;          // times a connection's receive buffer was set for it
 };
 
 struct ThreadState {
